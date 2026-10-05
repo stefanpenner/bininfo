@@ -1,0 +1,10 @@
+[package]
+name = "elf-header"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Read an ELF file header and print it."
+
+[[bin]]
+name = "elf-header"
+path = "src/main.rs"
