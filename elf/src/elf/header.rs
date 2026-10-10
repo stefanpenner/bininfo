@@ -1,79 +1,70 @@
 //! ELF file header. The first 16 bytes choose the struct and the byte order.
 
-use std::fmt;
-
+/// Address width. This is byte 4 of `e_ident`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
-    Elf32,
-    Elf64,
+    Elf32, // 4-byte addresses. The header is 52 bytes.
+    Elf64, // 8-byte addresses. The header is 64 bytes.
 }
 
+/// Byte order of every multi-byte number. This is byte 5 of `e_ident`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Data {
-    Little,
-    Big,
+    Little, // The bytes `3e 00` store the number 62.
+    Big,    // The bytes `00 3e` store the number 62.
 }
 
+/// File type. This is `e_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Type {
-    None,
-    Rel,
-    Exec,
-    Dyn,
-    Core,
-    Other(u16),
+    None,       // 0. The file has no type.
+    Rel,        // 1. A `.o` file. The kernel does not run it.
+    Exec,       // 2. The load address is fixed.
+    Dyn,        // 3. A PIE, a static-PIE, or a shared library.
+    Core,       // 4. A core dump.
+    Other(u16), // Any other value stored in the file.
 }
 
+/// An ELF64 header is 64 bytes. An ELF32 header is 52 bytes.
+pub const HEADER_BYTES: usize = 64;
+
+/// Decoded ELF file header.
+/// `entry` is an assumed address. `phoff` and `shoff` are file offsets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
-    pub ident: [u8; 16],
-    pub class: Class,
-    pub data: Data,
-    pub os_abi: u8,
-    pub abi_version: u8,
-    pub kind: Type,
-    pub machine: u16,
-    pub version: u32,
-    pub entry: u64,
-    pub phoff: u64,
-    pub shoff: u64,
-    pub flags: u32,
-    pub ehsize: u16,
-    pub phentsize: u16,
-    pub phnum: u16,
-    pub shentsize: u16,
-    pub shnum: u16,
-    pub shstrndx: u16,
+    pub ident: [u8; 16], // Bytes 0..16. Magic, class, byte order, and OS ABI.
+    pub class: Class,    // ELF32 or ELF64.
+    pub data: Data,      // Little-endian or big-endian.
+    pub ei_version: u8,  // Byte 6. 1 is the current format.
+    pub os_abi: u8,      // 0 is System V. 3 is Linux.
+    pub abi_version: u8, // OS ABI version. Usually 0.
+    pub kind: Type,      // `e_type`.
+    pub machine: u16,    // `e_machine`. 62 is x86-64. 183 is AArch64.
+    pub version: u32,    // `e_version`. 1 is the current format.
+    pub entry: u64,      // `e_entry`. Assumed address of the first instruction.
+    pub phoff: u64,      // `e_phoff`. File offset of the program headers.
+    pub shoff: u64,      // `e_shoff`. File offset of the section headers.
+    pub flags: u32,      // `e_flags`. CPU flags. Often 0.
+    pub ehsize: u16,     // Byte size of this header.
+    pub phentsize: u16,  // Byte size of one program header.
+    pub phnum: u16,      // Number of program headers.
+    pub shentsize: u16,  // Byte size of one section header.
+    pub shnum: u16,      // Number of section headers.
+    pub shstrndx: u16,   // Index of the section that stores section names.
+}
+
+pub fn is_elf(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[..4] == [0x7f, b'E', b'L', b'F']
 }
 
 pub fn parse(bytes: &[u8]) -> Result<Header, String> {
-    let ident = ident(bytes)?;
+    let ident = read_ident(bytes)?;
     let class = class(ident[4])?;
     let data = data(ident[5])?;
-    let fields = fields(bytes, class, data)?;
-    Ok(Header {
-        ident,
-        class,
-        data,
-        os_abi: ident[7],
-        abi_version: ident[8],
-        kind: fields.kind,
-        machine: fields.machine,
-        version: fields.version,
-        entry: fields.entry,
-        phoff: fields.phoff,
-        shoff: fields.shoff,
-        flags: fields.flags,
-        ehsize: fields.ehsize,
-        phentsize: fields.phentsize,
-        phnum: fields.phnum,
-        shentsize: fields.shentsize,
-        shnum: fields.shnum,
-        shstrndx: fields.shstrndx,
-    })
+    decode(bytes, ident, class, data)
 }
 
-fn ident(bytes: &[u8]) -> Result<[u8; 16], String> {
+fn read_ident(bytes: &[u8]) -> Result<[u8; 16], String> {
     let magic = bytes.get(..4).ok_or("file ends before the ELF header")?;
     if magic != [0x7f, b'E', b'L', b'F'] {
         return Err("not an ELF file".into());
@@ -100,26 +91,10 @@ fn data(byte: u8) -> Result<Data, String> {
     }
 }
 
-struct Fields {
-    kind: Type,
-    machine: u16,
-    version: u32,
-    entry: u64,
-    phoff: u64,
-    shoff: u64,
-    flags: u32,
-    ehsize: u16,
-    phentsize: u16,
-    phnum: u16,
-    shentsize: u16,
-    shnum: u16,
-    shstrndx: u16,
-}
-
-fn fields(bytes: &[u8], class: Class, data: Data) -> Result<Fields, String> {
+fn decode(bytes: &[u8], ident: [u8; 16], class: Class, data: Data) -> Result<Header, String> {
     let need = match class {
         Class::Elf32 => 52,
-        Class::Elf64 => 64,
+        Class::Elf64 => HEADER_BYTES,
     };
     if bytes.len() < need {
         return Err("file ends before the ELF header".into());
@@ -148,7 +123,13 @@ fn fields(bytes: &[u8], class: Class, data: Data) -> Result<Fields, String> {
             48,
         ),
     };
-    Ok(Fields {
+    Ok(Header {
+        ident,
+        class,
+        data,
+        ei_version: ident[6],
+        os_abi: ident[7],
+        abi_version: ident[8],
         kind,
         machine,
         version,
@@ -198,90 +179,29 @@ fn read_u64(bytes: &[u8], at: usize, data: Data) -> Result<u64, String> {
     })
 }
 
-impl fmt::Display for Header {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "ELF header")?;
-        writeln!(f, "  {:<12} {}", "e_ident", hex16(&self.ident))?;
-        writeln!(f, "  {:<12} {}", "class", class_name(self.class))?;
-        writeln!(f, "  {:<12} {}", "data", data_name(self.data))?;
-        writeln!(f, "  {:<12} {}", "ei_version", self.ident[6])?;
-        writeln!(f, "  {:<12} {}", "osabi", osabi_name(self.os_abi))?;
-        writeln!(f, "  {:<12} {}", "abiversion", self.abi_version)?;
-        writeln!(f, "  {:<12} {}", "e_type", type_name(self.kind))?;
-        writeln!(f, "  {:<12} {}", "e_machine", machine_name(self.machine))?;
-        writeln!(f, "  {:<12} {}", "e_version", self.version)?;
-        writeln!(f, "  {:<12} 0x{:x}", "e_entry", self.entry)?;
-        writeln!(f, "  {:<12} {}", "e_phoff", self.phoff)?;
-        writeln!(f, "  {:<12} {}", "e_shoff", self.shoff)?;
-        writeln!(f, "  {:<12} 0x{:x}", "e_flags", self.flags)?;
-        writeln!(f, "  {:<12} {}", "e_ehsize", self.ehsize)?;
-        writeln!(f, "  {:<12} {}", "e_phentsize", self.phentsize)?;
-        writeln!(f, "  {:<12} {}", "e_phnum", self.phnum)?;
-        writeln!(f, "  {:<12} {}", "e_shentsize", self.shentsize)?;
-        writeln!(f, "  {:<12} {}", "e_shnum", self.shnum)?;
-        writeln!(f, "  {:<12} {}", "e_shstrndx", self.shstrndx)?;
-        Ok(())
+#[cfg(test)]
+pub fn sample(class: Class, kind: Type) -> Header {
+    Header {
+        ident: [0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        class,
+        data: Data::Little,
+        ei_version: 1,
+        os_abi: 0,
+        abi_version: 0,
+        kind,
+        machine: 62,
+        version: 1,
+        entry: 0x1000,
+        phoff: 64,
+        shoff: 0,
+        flags: 0,
+        ehsize: if class == Class::Elf32 { 52 } else { 64 },
+        phentsize: 56,
+        phnum: 1,
+        shentsize: 0,
+        shnum: 0,
+        shstrndx: 0,
     }
-}
-
-fn hex16(bytes: &[u8; 16]) -> String {
-    let mut out = String::with_capacity(16 * 3 - 1);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
-
-fn class_name(class: Class) -> &'static str {
-    match class {
-        Class::Elf32 => "ELF32",
-        Class::Elf64 => "ELF64",
-    }
-}
-
-fn data_name(data: Data) -> &'static str {
-    match data {
-        Data::Little => "little-endian",
-        Data::Big => "big-endian",
-    }
-}
-
-fn type_name(kind: Type) -> String {
-    match kind {
-        Type::None => "NONE".into(),
-        Type::Rel => "REL".into(),
-        Type::Exec => "EXEC".into(),
-        Type::Dyn => "DYN".into(),
-        Type::Core => "CORE".into(),
-        Type::Other(n) => n.to_string(),
-    }
-}
-
-fn machine_name(machine: u16) -> String {
-    let name = match machine {
-        3 => "x86",
-        8 => "MIPS",
-        20 => "PowerPC",
-        21 => "PowerPC64",
-        40 => "ARM",
-        62 => "x86-64",
-        183 => "AArch64",
-        243 => "RISC-V",
-        _ => return machine.to_string(),
-    };
-    format!("{name} ({machine})")
-}
-
-fn osabi_name(os_abi: u8) -> String {
-    let name = match os_abi {
-        0 => "System V",
-        3 => "Linux",
-        _ => return os_abi.to_string(),
-    };
-    format!("{name} ({os_abi})")
 }
 
 #[cfg(test)]
@@ -322,7 +242,7 @@ mod tests {
     }
 
     fn elf64(data: Data) -> Vec<u8> {
-        let mut b = vec![0u8; 64];
+        let mut b = vec![0u8; HEADER_BYTES];
         let class_byte = 2;
         let data_byte = match data {
             Data::Little => 1,
@@ -346,6 +266,7 @@ mod tests {
         let h = parse(&elf64(Data::Little)).unwrap();
         assert_eq!(h.class, Class::Elf64);
         assert_eq!(h.data, Data::Little);
+        assert_eq!(h.ei_version, 1);
         assert_eq!(h.kind, Type::Exec);
         assert_eq!(h.machine, 62);
         assert_eq!(h.entry, 0x1000);
@@ -353,11 +274,6 @@ mod tests {
         assert_eq!(h.ehsize, 64);
         assert_eq!(h.phentsize, 56);
         assert_eq!(h.phnum, 1);
-        let text = h.to_string();
-        assert!(text.contains("class        ELF64"), "{text}");
-        assert!(text.contains("e_type       EXEC"), "{text}");
-        assert!(text.contains("e_machine    x86-64 (62)"), "{text}");
-        assert!(text.contains("e_entry      0x1000"), "{text}");
     }
 
     #[test]
@@ -393,10 +309,10 @@ mod tests {
         assert_eq!(parse(&[]).unwrap_err(), "file ends before the ELF header");
         assert_eq!(parse(b"nope").unwrap_err(), "not an ELF file");
         assert_eq!(parse(&[0; 16]).unwrap_err(), "not an ELF file");
-        let mut bad_class = vec![0u8; 64];
+        let mut bad_class = vec![0u8; HEADER_BYTES];
         bad_class[..16].copy_from_slice(&ident(9, 1));
         assert_eq!(parse(&bad_class).unwrap_err(), "unknown ELF class");
-        let mut bad_data = vec![0u8; 64];
+        let mut bad_data = vec![0u8; HEADER_BYTES];
         bad_data[..16].copy_from_slice(&ident(2, 9));
         assert_eq!(parse(&bad_data).unwrap_err(), "unknown ELF data encoding");
         let mut short = elf64(Data::Little);

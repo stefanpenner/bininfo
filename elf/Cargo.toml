@@ -3,7 +3,7 @@ name = "elf-header"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Read an ELF file header and print it."
+description = "Read an ELF, Mach-O, or PE header and check how the file starts."
 
 [[bin]]
 name = "elf-header"
