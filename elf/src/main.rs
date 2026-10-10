@@ -14,8 +14,8 @@ use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-usage: elf-header [--json] [--check] [--expect <claim>] <file>
-usage: elf-header [--json] --claims <file>";
+usage: herman [--json] [--check] [--expect <claim>] <file>
+usage: herman [--json] --claims <file>";
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {

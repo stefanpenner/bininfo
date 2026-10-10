@@ -7,7 +7,6 @@ use super::load::{self, Load};
 use super::words::{class_name, data_name, machine_name, osabi_name, type_name};
 use crate::claim;
 use crate::style;
-use std::fmt::Write;
 
 pub fn render(file: &str, header: &Header, load: &Load, color: bool) -> String {
     let wide = match header.class {
@@ -382,15 +381,14 @@ fn ident_field(out: &mut String, header: &Header, color: bool) {
     let key = style::paint(color, "e_ident:", style::LABEL, false);
     let magic = style::paint(color, &shown[..split], style::GREEN, false);
     let rest = style::paint(color, &shown[split..], style::LABEL, false);
-    let width = 2 + "e_ident: ".len() + shown.chars().count();
-    let pad = " ".repeat(style::COLUMN.saturating_sub(width));
-    let note = style::paint(
+    let plain = 2 + "e_ident: ".len() + shown.chars().count();
+    style::align_note(
+        out,
         color,
-        "# 16 bytes. Magic, class, and byte order.",
-        style::NOTE,
-        false,
+        &format!("  {key} {magic}{rest}"),
+        plain,
+        "16 bytes. Magic, class, and byte order.",
     );
-    let _ = writeln!(out, "  {key} {magic}{rest}{pad}  {note}");
 }
 
 fn ident_text(bytes: &[u8; 16]) -> String {
@@ -493,7 +491,20 @@ mod tests {
         );
         assert_eq!(hash_at(&text, "type:"), hash_at(&text, "  class:"));
         assert_eq!(hash_at(&text, "sizes:"), hash_at(&text, "  e_ehsize:"));
-        assert!(hash_at(&text, "  e_ident:") > hash_at(&text, "  class:"));
+        let column = hash_at(&text, "  class:");
+        let ident = text
+            .lines()
+            .position(|line| line.starts_with("  e_ident:"))
+            .unwrap();
+        let ident_note = text.lines().nth(ident + 1).unwrap();
+        assert!(!text.lines().nth(ident).unwrap().contains('#'), "{text}");
+        assert_eq!(ident_note.find('#'), Some(column), "{ident_note}");
+        let says = text
+            .lines()
+            .position(|line| line.starts_with("  says:"))
+            .unwrap();
+        let says_note = text.lines().nth(says + 1).unwrap();
+        assert_eq!(says_note.find('#'), Some(column), "{says_note}");
         assert!(!text.contains('\u{1b}'), "{text}");
     }
 

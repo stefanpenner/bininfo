@@ -25,10 +25,9 @@ pub fn blank(out: &mut String) {
 
 pub fn rung(out: &mut String, color: bool, title: &str, note: &str, fg: Rgb, bold: bool) {
     let text = format!("{title}:");
-    let pad = " ".repeat(COLUMN.saturating_sub(text.chars().count()));
+    let plain = text.chars().count();
     let title = paint(color, &text, fg, bold);
-    let note = paint(color, &format!("# {note}"), NOTE, false);
-    let _ = writeln!(out, "{title}{pad}  {note}");
+    align_note(out, color, &title, plain, note);
 }
 
 pub fn field(
@@ -127,12 +126,21 @@ fn emit(
     bold: bool,
 ) {
     let plain = indent + key.len() + 2 + width;
-    let pad = " ".repeat(COLUMN.saturating_sub(plain));
     let gap = " ".repeat(indent);
     let key = paint(color, &format!("{key}:"), LABEL, false);
     let value = paint(color, shown, fg, bold);
+    align_note(out, color, &format!("{gap}{key} {value}"), plain, note);
+}
+
+pub(crate) fn align_note(out: &mut String, color: bool, prefix: &str, plain: usize, note: &str) {
     let note = paint(color, &format!("# {note}"), NOTE, false);
-    let _ = writeln!(out, "{gap}{key} {value}{pad}  {note}");
+    if plain <= COLUMN {
+        let pad = " ".repeat(COLUMN - plain);
+        let _ = writeln!(out, "{prefix}{pad}  {note}");
+        return;
+    }
+    let pad = " ".repeat(COLUMN + 2);
+    let _ = writeln!(out, "{prefix}\n{pad}{note}");
 }
 
 fn show(value: &str) -> String {
@@ -277,6 +285,40 @@ impl Json {
         if self.out.len() > 1 {
             self.out.push(',');
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notes_share_one_column() {
+        let mut out = String::new();
+        align_note(&mut out, false, "type:", "type:".chars().count(), "Rung 1.");
+        let class = "  class: ELF64";
+        align_note(&mut out, false, class, class.chars().count(), "1 byte.");
+        let columns: Vec<usize> = out.lines().map(|line| line.find('#').unwrap()).collect();
+        assert_eq!(columns, vec![COLUMN + 2, COLUMN + 2]);
+    }
+
+    #[test]
+    fn a_long_value_puts_the_note_on_the_next_line() {
+        let mut out = String::new();
+        let value = "x".repeat(40);
+        let prefix = format!("  e_ident: {value}");
+        align_note(
+            &mut out,
+            false,
+            &prefix,
+            prefix.chars().count(),
+            "16 bytes.",
+        );
+        let mut lines = out.lines();
+        let first = lines.next().unwrap();
+        let second = lines.next().unwrap();
+        assert!(!first.contains('#'), "{first}");
+        assert_eq!(second.find('#'), Some(COLUMN + 2), "{second}");
     }
 }
 

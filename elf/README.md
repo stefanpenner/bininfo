@@ -1,8 +1,8 @@
 # ELF headers
 
-`elf-header <file>` prints five groups. The groups are type, load, sizes, where, and sections. The file can be ELF, Mach-O, or PE. A `#` note follows each value. A terminal adds color. `NO_COLOR` keeps the page plain.
+`herman <file>` prints five groups. The groups are type, load, sizes, where, and sections. The file can be ELF, Mach-O, or PE. A `#` note follows each value. A terminal adds color. `NO_COLOR` keeps the page plain.
 
-`elf-header --json <file>` prints one JSON object. `format` is `elf`, `macho`, or `pe`. `./show.sh` passes `--json`.
+`herman --json <file>` prints one JSON object. `format` is `elf`, `macho`, or `pe`. `./show.sh` passes `--json`.
 
 Zig writes most files into `samples/out`. Git does not store that directory.
 
@@ -48,7 +48,7 @@ Zig sets `DYNAMIC_BASE` on Windows. `static-x86-64.exe` is `exec-x86-64.exe` wit
 
 # Check a file
 
-`elf-header --check <file>` checks that claim.
+`herman --check <file>` checks that claim.
 
 The check passes when all three facts are true.
 
@@ -64,7 +64,7 @@ This check does not read `dlopen`. It does not open the named libraries.
 
 A dynamic file can still make a hermetic run when you ship each named file. `--check` does not prove that you shipped them.
 
-`elf-header --expect kind=dynamic-pie --expect needed=libtiny.so <file>` checks those claims. `--json` prints one object.
+`herman --expect kind=dynamic-pie --expect needed=libtiny.so <file>` checks those claims. `--json` prints one object.
 
 `claims.txt` records the claim for each sample. `./check.sh` builds the samples and checks that file.
 
