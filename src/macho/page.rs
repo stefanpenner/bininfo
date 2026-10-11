@@ -1032,7 +1032,16 @@ mod tests {
             "{}",
             lines[at]
         );
-        assert_eq!(lines[at + 1], "    - @rpath/libsherpa-onnx-c-api.dylib");
+        assert!(
+            lines[at + 1].contains("@rpath/libsherpa-onnx-c-api.dylib"),
+            "{}",
+            lines[at + 1]
+        );
+        assert!(
+            lines[at + 1].contains("A library from rpath."),
+            "{}",
+            lines[at + 1]
+        );
         assert!(
             lines[at + 2].contains("/usr/lib/libSystem.B.dylib"),
             "{}",

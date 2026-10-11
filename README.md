@@ -42,7 +42,41 @@ Each tool below does one part of that job.
 [`llvm-readobj`](https://llvm.org/docs/CommandGuide/llvm-readobj.html) is the closest reader.
 [`eu-elfclassify`](https://man.archlinux.org/man/eu-elfclassify.1.en) is the closest check.
 
-## How to use it
+## Install the command
+
+Clone this repo. Cargo writes the `bininfo` command.
+
+```
+cargo install --path .
+```
+
+The crate is not on crates.io. `publish` is false.
+
+## Use the library
+
+The same repo is a library. The command calls that library.
+`elf`, `macho`, and `pe` each read one format.
+`claim` checks one claim.
+`open` reads any of the three formats.
+
+A Rust project can depend on a local checkout.
+
+```
+bininfo = { path = "../bininfo" }
+```
+
+```rust
+let bytes = std::fs::read(path)?;
+let file = bininfo::open(&bytes, false)?;
+let page = bininfo::render(path, &file, false, false);
+let facts = bininfo::facts(path, &file, &bininfo::current_host());
+let claims = bininfo::claim::parse(&["hermetic".to_string()])?;
+let misses = bininfo::claim::judge(&facts, &claims);
+```
+
+`rows` on `open` keeps symbol rows. `json` on `render` prints one JSON object.
+
+## How to use the command
 
 Build with Cargo.
 Run the tool from this directory.

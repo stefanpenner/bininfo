@@ -328,6 +328,7 @@ fn read_thin(bytes: &[u8], thin: &Thin, rows: bool) -> Commands {
         commands.symoff,
         commands.nsyms,
         commands.stroff,
+        commands.strsize,
         commands.entry,
     ) {
         commands.extra.entry_name = Some(name);
@@ -400,7 +401,7 @@ fn cmd_name(bytes: &[u8], at: usize, size: u32, data: Data) -> Option<String> {
 }
 
 fn thread_pc(bytes: &[u8], at: usize, size: u32, thin: &Thin) -> Option<u64> {
-    let flavor = header::u32_at(bytes, at + 12, thin.data)?;
+    let flavor = header::u32_at(bytes, at + 8, thin.data)?;
     let state = at + 16;
     let end = at + size as usize;
     let read_u64 = |pos: usize| {
@@ -594,7 +595,8 @@ mod tests {
         bytes.resize(at + 16 + 136, 0);
         put_u32(&mut bytes, at, LC_UNIXTHREAD, Data::Little);
         put_u32(&mut bytes, at + 4, (16 + 136) as u32, Data::Little);
-        put_u32(&mut bytes, at + 12, 4, Data::Little);
+        put_u32(&mut bytes, at + 8, 4, Data::Little);
+        put_u32(&mut bytes, at + 12, 42, Data::Little);
         put_u64(
             &mut bytes,
             at + 16 + 128,
@@ -607,6 +609,51 @@ mod tests {
         assert_eq!(commands.load.kind, Kind::Rel);
         assert!(!commands.entry_is_offset);
         assert_eq!(commands.entry, 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn unixthread_flavor_is_the_word_at_offset_8() {
+        let mut bytes = header(1, 0, Data::Little);
+        let at = bytes.len();
+        bytes.resize(at + 16 + 136, 0);
+        put_u32(&mut bytes, at, LC_UNIXTHREAD, Data::Little);
+        put_u32(&mut bytes, at + 4, (16 + 136) as u32, Data::Little);
+        put_u32(&mut bytes, at + 8, 4, Data::Little);
+        put_u32(&mut bytes, at + 12, 42, Data::Little);
+        put_u64(
+            &mut bytes,
+            at + 16 + 128,
+            0x1122_3344_5566_7788,
+            Data::Little,
+        );
+        finish(&mut bytes, Data::Little, 1);
+        let image = header::parse(&bytes).unwrap();
+        let commands = read(&bytes, &image);
+        assert_eq!(commands.entry, 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn nlist_name_stops_at_strsize() {
+        let mut bytes = header(2, 0, Data::Little);
+        push_main(&mut bytes, 0x1000, Data::Little);
+        let cmd = bytes.len();
+        bytes.resize(cmd + 24, 0);
+        put_u32(&mut bytes, cmd, LC_SYMTAB, Data::Little);
+        put_u32(&mut bytes, cmd + 4, 24, Data::Little);
+        let symoff = (cmd + 24) as u32;
+        put_u32(&mut bytes, cmd + 8, symoff, Data::Little);
+        put_u32(&mut bytes, cmd + 12, 1, Data::Little);
+        put_u32(&mut bytes, cmd + 16, symoff + 16, Data::Little);
+        put_u32(&mut bytes, cmd + 20, 2, Data::Little);
+        finish(&mut bytes, Data::Little, 2);
+        let sym = bytes.len();
+        bytes.resize(sym + 16, 0);
+        put_u32(&mut bytes, sym, 0, Data::Little);
+        put_u64(&mut bytes, sym + 8, 0x1000, Data::Little);
+        bytes.extend_from_slice(b"hiXX\0");
+        let image = header::parse(&bytes).unwrap();
+        let commands = read(&bytes, &image);
+        assert_eq!(commands.extra.entry_name.as_deref(), Some("hi"));
     }
 
     #[test]

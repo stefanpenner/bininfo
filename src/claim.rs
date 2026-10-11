@@ -834,7 +834,12 @@ mod tests {
             "{}",
             lines[at + 1]
         );
-        assert_eq!(lines[at + 2], "  - liba.so");
+        assert!(lines[at + 2].contains("liba.so"), "{}", lines[at + 2]);
+        assert!(
+            lines[at + 2].contains("A shared library."),
+            "{}",
+            lines[at + 2]
+        );
         assert!(lines[at + 3].starts_with("hermetic:"), "{}", lines[at + 3]);
     }
 

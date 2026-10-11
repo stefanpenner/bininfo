@@ -602,8 +602,18 @@ mod tests {
             "{}",
             lines[at]
         );
-        assert_eq!(lines[at + 1], "    - b.dll");
-        assert_eq!(lines[at + 2], "    - \"a#b.dll\"");
+        assert!(lines[at + 1].contains("b.dll"), "{}", lines[at + 1]);
+        assert!(
+            lines[at + 1].contains("A Windows library."),
+            "{}",
+            lines[at + 1]
+        );
+        assert!(lines[at + 2].contains("a#b.dll"), "{}", lines[at + 2]);
+        assert!(
+            lines[at + 2].contains("A Windows library."),
+            "{}",
+            lines[at + 2]
+        );
         assert!(
             lines[at + 3].starts_with("  runpath: []"),
             "{}",
@@ -643,8 +653,18 @@ mod tests {
             "{}",
             lines[at]
         );
-        assert_eq!(lines[at + 1], "    - late.dll");
-        assert_eq!(lines[at + 2], "    - other.dll");
+        assert!(lines[at + 1].contains("late.dll"), "{}", lines[at + 1]);
+        assert!(
+            lines[at + 1].contains("A Windows library."),
+            "{}",
+            lines[at + 1]
+        );
+        assert!(lines[at + 2].contains("other.dll"), "{}", lines[at + 2]);
+        assert!(
+            lines[at + 2].contains("A Windows library."),
+            "{}",
+            lines[at + 2]
+        );
         assert!(
             lines[at + 3].starts_with("  dlopen: null"),
             "{}",
@@ -668,7 +688,12 @@ mod tests {
             "{}",
             lines[at + 1]
         );
-        assert_eq!(lines[at + 2], "    - tiny.dll");
+        assert!(lines[at + 2].contains("tiny.dll"), "{}", lines[at + 2]);
+        assert!(
+            lines[at + 2].contains("A Windows library."),
+            "{}",
+            lines[at + 2]
+        );
     }
 
     #[test]

@@ -1,3 +1,12 @@
+/*
+---
+why: This file reads Mach-O symbol records.
+uses: bininfo
+how: bininfo calls this file to count imports and exports.
+This file does not print the page.
+---
+*/
+
 //! Mach-O build version, dylib versions, and loader symbol records.
 //! This module does not print.
 
@@ -161,10 +170,21 @@ pub fn chained(
             else {
                 break;
             };
-            let Some(word) = header::u32_at(bytes, at, data) else {
-                break;
+            let (ordinal, name_off, weak) = if format == 3 {
+                let Some(wide) = header::u64_at(bytes, at, data) else {
+                    break;
+                };
+                (
+                    (wide & 0xffff) as u32,
+                    (wide >> 32) as u32,
+                    (wide >> 16) & 1 == 1,
+                )
+            } else {
+                let Some(word) = header::u32_at(bytes, at, data) else {
+                    break;
+                };
+                (word & 0xff, word >> 9, (word >> 8) & 1 == 1)
             };
-            let name_off = word >> 9;
             let name = cstring(
                 bytes,
                 start
@@ -173,9 +193,9 @@ pub fn chained(
                 end,
             );
             found.push(ChainedImport {
-                ordinal: word & 0xff,
+                ordinal,
                 name,
-                weak: (word >> 8) & 1 == 1,
+                weak,
             });
         }
     }
@@ -240,7 +260,7 @@ pub fn bind(bytes: &[u8], off: u32, size: u32, _data: Data, rows: bool) -> (u32,
                 };
                 at = next;
                 let room = SYM_CAP - count;
-                let add = (times as u32).min(room);
+                let add = u32::try_from(times).unwrap_or(u32::MAX).min(room);
                 if rows {
                     for _ in 0..add.min(64) {
                         found.push(BindImport {
@@ -283,10 +303,12 @@ pub fn exports(bytes: &[u8], off: u32, size: u32, rows: bool) -> (u32, Vec<Strin
     let mut names = Vec::new();
     let mut stack = vec![(start, String::new(), 0u32)];
     let mut seen = 0u32;
+    let mut visited = Vec::new();
     while let Some((node, prefix, depth)) = stack.pop() {
-        if seen >= NODE_CAP || depth > 32 || node >= end {
+        if seen >= NODE_CAP || depth > 32 || node >= end || visited.contains(&node) {
             continue;
         }
+        visited.push(node);
         seen += 1;
         let Some((terminal, mut at)) = uleb(bytes, node, end) else {
             continue;
@@ -335,6 +357,7 @@ pub fn nlist_entry(
     symoff: u32,
     nsyms: u32,
     stroff: u32,
+    strsize: u32,
     entry: u64,
 ) -> Option<String> {
     if nsyms == 0 || symoff == 0 {
@@ -360,7 +383,9 @@ pub fn nlist_entry(
         if value != entry {
             continue;
         }
-        let name = cstring(bytes, stroff as usize + strx as usize, bytes.len());
+        let table = stroff as usize;
+        let end = table.saturating_add(strsize as usize).min(bytes.len());
+        let name = cstring(bytes, table.saturating_add(strx as usize), end);
         if !name.is_empty() {
             return Some(name);
         }
@@ -434,4 +459,52 @@ fn cstring_span(bytes: &[u8], at: usize, end: usize) -> (String, usize) {
         String::from_utf8_lossy(&slice[..n]).into_owned(),
         next.min(end),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::header::Data;
+    use super::*;
+
+    fn put_u32(buf: &mut [u8], at: usize, v: u32) {
+        buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u64(buf: &mut [u8], at: usize, v: u64) {
+        buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn chained_format3_uses_wide_ordinal_and_name() {
+        let mut bytes = vec![0u8; 64];
+        put_u32(&mut bytes, 8, 32);
+        put_u32(&mut bytes, 12, 48);
+        put_u32(&mut bytes, 16, 1);
+        put_u32(&mut bytes, 20, 3);
+        put_u64(&mut bytes, 32, 256 | (4u64 << 32));
+        bytes[48..51].copy_from_slice(b"no\0");
+        bytes[52..55].copy_from_slice(b"ok\0");
+        let (count, rows) = chained(&bytes, 0, bytes.len() as u32, Data::Little, true);
+        assert_eq!(count, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ordinal, 256);
+        assert_eq!(rows[0].name, "ok");
+    }
+
+    #[test]
+    fn export_trie_cycle_counts_each_node_once() {
+        let bytes = [
+            0x01, 0x00, 0x01, b'a', 0x00, 0x06, 0x01, 0x00, 0x01, b'b', 0x00, 0x00,
+        ];
+        let (count, _) = exports(&bytes, 0, bytes.len() as u32, false);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn bind_repeat_count_saturates_at_sym_cap() {
+        let bytes = [0xc0, 0x80, 0x80, 0x80, 0x80, 0x10, 0x00];
+        let (count, rows) = bind(&bytes, 0, bytes.len() as u32, Data::Little, false);
+        assert_eq!(count, 16384);
+        assert!(rows.is_empty());
+    }
 }

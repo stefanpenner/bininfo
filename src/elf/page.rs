@@ -765,7 +765,12 @@ mod tests {
             "{}",
             lines[at + 1]
         );
-        assert_eq!(lines[at + 2], "    - \"liba:b.so\"");
+        assert!(lines[at + 2].contains("liba:b.so"), "{}", lines[at + 2]);
+        assert!(
+            lines[at + 2].contains("A shared library."),
+            "{}",
+            lines[at + 2]
+        );
         assert!(
             lines[at + 3].starts_with("  runpath: []"),
             "{}",
@@ -863,6 +868,11 @@ mod tests {
             "{}",
             lines[at + 1]
         );
-        assert_eq!(lines[at + 2], "    - libtiny.so");
+        assert!(lines[at + 2].contains("libtiny.so"), "{}", lines[at + 2]);
+        assert!(
+            lines[at + 2].contains("A shared library."),
+            "{}",
+            lines[at + 2]
+        );
     }
 }

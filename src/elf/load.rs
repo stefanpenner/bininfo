@@ -25,6 +25,7 @@ const DT_RUNPATH: u64 = 29;
 const DT_FLAGS_1: u64 = 0x6fff_fffb;
 const DF_1_PIE: u64 = 0x0800_0000;
 const NAME_CAP: usize = 4096;
+const IMPORT_CAP: usize = 256;
 
 /// Facts from the program headers and from `PT_DYNAMIC`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +179,7 @@ fn dynamic_facts(
 
 fn names_at(bytes: &[u8], base: u64, offs: &[u64]) -> Vec<String> {
     offs.iter()
+        .take(IMPORT_CAP)
         .filter_map(|off| base.checked_add(*off))
         .map(|at| read_text(bytes, at, NAME_CAP as u64))
         .filter(|name| !name.is_empty())
@@ -188,9 +190,13 @@ fn split_dirs(raws: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for raw in raws {
         for part in raw.split(':') {
-            if !part.is_empty() {
-                out.push(part.to_string());
+            if part.is_empty() {
+                continue;
             }
+            if out.len() == IMPORT_CAP {
+                return out;
+            }
+            out.push(part.to_string());
         }
     }
     out
@@ -384,6 +390,17 @@ mod tests {
         assert_eq!(header.data, Data::Big);
         assert_eq!(load.kind, Kind::StaticPie);
         assert!(load.pie);
+    }
+
+    #[test]
+    fn needed_list_is_capped() {
+        let names: Vec<String> = (0..300).map(|index| format!("l{index}.so")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let bytes = elf_with_dynamic(Type::Dyn, 0, None, &refs);
+        let header = header::parse(&bytes).unwrap();
+        let load = read(&bytes, &header);
+        assert!(load.needed.len() <= 256, "{}", load.needed.len());
+        assert_eq!(load.needed.len(), 256);
     }
 
     #[test]

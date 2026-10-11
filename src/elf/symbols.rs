@@ -214,11 +214,11 @@ fn tags_of(bytes: &[u8], header: &Header, phdrs: &[Phdr]) -> Tags {
 }
 
 fn symbol_count(bytes: &[u8], header: &Header, phdrs: &[Phdr], tags: &Tags) -> u32 {
-    let Some(sym_at) = file_at(phdrs, tags.symtab) else {
+    let Some(sym_at) = file_at(bytes, phdrs, tags.symtab) else {
         return 0;
     };
     if let Some(hash) = tags.hash {
-        let str_at = file_at(phdrs, tags.strtab);
+        let str_at = file_at(bytes, phdrs, tags.strtab);
         if let Some(n) = sysv_nchain(bytes, header.data, phdrs, hash, sym_at, str_at, tags.syment) {
             return n;
         }
@@ -240,7 +240,7 @@ fn sysv_nchain(
     str_at: Option<usize>,
     syment: u64,
 ) -> Option<u32> {
-    let at = file_at(phdrs, Some(hash))?;
+    let at = file_at(bytes, phdrs, Some(hash))?;
     let nchain = u32_at(bytes, at + 4, data)?;
     let step = syment.max(1) as usize;
     let mut end = bytes.len();
@@ -254,7 +254,7 @@ fn sysv_nchain(
 }
 
 fn gnu_count(bytes: &[u8], header: &Header, phdrs: &[Phdr], gnu: u64) -> Option<u32> {
-    let at = file_at(phdrs, Some(gnu))?;
+    let at = file_at(bytes, phdrs, Some(gnu))?;
     let nbuckets = u32_at(bytes, at, header.data)?;
     let symoff = u32_at(bytes, at + 4, header.data)?;
     let bloom_size = u32_at(bytes, at + 8, header.data)?;
@@ -262,7 +262,7 @@ fn gnu_count(bytes: &[u8], header: &Header, phdrs: &[Phdr], gnu: u64) -> Option<
         Class::Elf64 => 8usize,
         Class::Elf32 => 4,
     };
-    let bloom_bytes = (bloom_size as usize).min(4096).saturating_mul(bloom_ent);
+    let bloom_bytes = (bloom_size as usize).checked_mul(bloom_ent)?;
     let buckets = at.checked_add(16)?.checked_add(bloom_bytes)?;
     let nb = (nbuckets as usize).min(SYM_CAP as usize);
     let chains = buckets.checked_add(nb.saturating_mul(4))?;
@@ -303,7 +303,7 @@ fn tally(
     versions: &[(u16, String)],
     rows: bool,
 ) -> (u32, u32, Vec<Undef>) {
-    let Some(sym_at) = file_at(phdrs, tags.symtab) else {
+    let Some(sym_at) = file_at(bytes, phdrs, tags.symtab) else {
         return (0, 0, Vec::new());
     };
     let step = tags.syment as usize;
@@ -337,7 +337,7 @@ fn tally(
 
 fn version_index(bytes: &[u8], header: &Header, phdrs: &[Phdr], tags: &Tags) -> Vec<(u16, String)> {
     let mut out = Vec::new();
-    let Some(base) = file_at(phdrs, tags.verneed) else {
+    let Some(base) = file_at(bytes, phdrs, tags.verneed) else {
         return out;
     };
     let Some(str_base) = file_off(phdrs, tags.strtab) else {
@@ -409,7 +409,7 @@ fn verneed_rows(
     str_base: Option<u64>,
     tags: &Tags,
 ) -> Vec<VerNeed> {
-    let Some(base) = file_at(phdrs, tags.verneed) else {
+    let Some(base) = file_at(bytes, phdrs, tags.verneed) else {
         return Vec::new();
     };
     let Some(str_base) = str_base else {
@@ -488,7 +488,7 @@ fn versym_at(
     tags: &Tags,
     index: u32,
 ) -> Option<u16> {
-    let at = file_at(phdrs, tags.versym)?;
+    let at = file_at(bytes, phdrs, tags.versym)?;
     let pos = at.checked_add(index as usize * 2)?;
     u16_at(bytes, pos, header.data)
 }
@@ -510,7 +510,7 @@ fn entry_of(
     count: u32,
     sections: &[Sec],
 ) -> (Option<String>, &'static str) {
-    if let Some(sym_at) = file_at(phdrs, tags.symtab) {
+    if let Some(sym_at) = file_at(bytes, phdrs, tags.symtab) {
         if let Some(name) = find_value(
             bytes,
             header,
@@ -847,9 +847,14 @@ fn sec_count(size: u64, step: usize) -> u32 {
     (size / step as u64).min(SYM_CAP as u64) as u32
 }
 
-fn file_at(phdrs: &[Phdr], vaddr: Option<u64>) -> Option<usize> {
+fn file_at(bytes: &[u8], phdrs: &[Phdr], vaddr: Option<u64>) -> Option<usize> {
     let off = load::vaddr_to_offset(phdrs, vaddr?)?;
-    usize::try_from(off).ok()
+    let at = usize::try_from(off).ok()?;
+    if at < bytes.len() {
+        Some(at)
+    } else {
+        None
+    }
 }
 
 fn file_off(phdrs: &[Phdr], vaddr: Option<u64>) -> Option<u64> {
@@ -1134,5 +1139,83 @@ mod tests {
         assert!(!symbols.has_abi());
         assert!(symbols.entry_name.is_none());
         assert!(!symbols.symtab);
+    }
+
+    #[test]
+    fn huge_hash_vaddr_does_not_panic() {
+        let mut bytes = dyn_file(false);
+        put_u64(&mut bytes, 64 + 32, u64::MAX);
+        let dyn_off = 64 + 56 * 2;
+        for index in 0..9 {
+            let at = dyn_off + index * 16;
+            let tag = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            if tag == 4 {
+                put_u64(&mut bytes, at + 8, u64::MAX - 3);
+            }
+        }
+        let header = header::parse(&bytes).unwrap();
+        let parsed = std::panic::catch_unwind(|| read(&bytes, &header, false));
+        assert!(parsed.is_ok(), "a huge DT_HASH vaddr panicked");
+        let symbols = parsed.unwrap();
+        assert_eq!(symbols.undef, 0);
+    }
+
+    #[test]
+    fn gnu_hash_bloom_cap_does_not_shift_buckets() {
+        let bloom_n = 4097usize;
+        let header_len = 64usize;
+        let ph_bytes = 112usize;
+        let dyn_bytes = 4 * 16;
+        let gnu_off = header_len + ph_bytes + dyn_bytes;
+        let bucket_off = gnu_off + 16 + bloom_n * 8;
+        let chain_off = bucket_off + 4;
+        let sym_off = chain_off + 4;
+        let mut bytes = vec![0u8; sym_off + 48];
+        bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        put_u16(&mut bytes, 16, 3);
+        put_u16(&mut bytes, 18, 62);
+        put_u32(&mut bytes, 20, 1);
+        put_u64(&mut bytes, 32, header_len as u64);
+        put_u16(&mut bytes, 52, 64);
+        put_u16(&mut bytes, 54, 56);
+        put_u16(&mut bytes, 56, 2);
+        let filesz = bytes.len() as u64;
+        phdr(&mut bytes, 64, 1, 0, filesz, 8);
+        phdr(
+            &mut bytes,
+            64 + 56,
+            2,
+            (header_len + ph_bytes) as u64,
+            dyn_bytes as u64,
+            8,
+        );
+        let dyn_off = header_len + ph_bytes;
+        let tags = [
+            (6u64, sym_off as u64),
+            (11, 24),
+            (0x6fff_fef5, gnu_off as u64),
+            (0, 0),
+        ];
+        for (index, (tag, val)) in tags.iter().enumerate() {
+            let at = dyn_off + index * 16;
+            put_u64(&mut bytes, at, *tag);
+            put_u64(&mut bytes, at + 8, *val);
+        }
+        put_u32(&mut bytes, gnu_off, 1);
+        put_u32(&mut bytes, gnu_off + 4, 1);
+        put_u32(&mut bytes, gnu_off + 8, bloom_n as u32);
+        put_u32(&mut bytes, bucket_off, 1);
+        put_u32(&mut bytes, chain_off, 1);
+        bytes[sym_off + 24 + 4] = 0x10;
+        put_u16(&mut bytes, sym_off + 24 + 6, 1);
+        let header = header::parse(&bytes).unwrap();
+        let symbols = read(&bytes, &header, false);
+        assert_eq!(
+            symbols.defined, 1,
+            "bloom size 4097 must not move the buckets"
+        );
     }
 }

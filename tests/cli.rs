@@ -239,6 +239,44 @@ fn check_accepts_a_closed_file_and_rejects_a_miss() {
 }
 
 #[test]
+fn flags_after_the_file_and_a_bom_comment_fail_closed() {
+    let late = bin().arg("missing-binary").arg("--check").output().unwrap();
+    let late_err = String::from_utf8_lossy(&late.stderr);
+    assert!(!late.status.success());
+    assert!(late_err.contains("usage: bininfo"), "{late_err}");
+    assert!(!late_err.contains("cannot read"), "{late_err}");
+
+    let after = bin()
+        .arg("--claims")
+        .arg("claims.txt")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let after_err = String::from_utf8_lossy(&after.stderr);
+    assert!(!after.status.success());
+    assert!(after_err.contains("usage: bininfo"), "{after_err}");
+
+    let symbols = bin()
+        .arg("--symbols")
+        .arg("--claims")
+        .arg("claims.txt")
+        .output()
+        .unwrap();
+    let symbols_err = String::from_utf8_lossy(&symbols.stderr);
+    assert!(!symbols.status.success());
+    assert!(symbols_err.contains("usage: bininfo"), "{symbols_err}");
+
+    let bom = std::env::temp_dir().join(format!("bininfo-bom-{}", std::process::id()));
+    fs::write(&bom, "\u{feff}# only a comment\n\u{200b}\n").unwrap();
+    let comments = bin().arg("--claims").arg(&bom).output().unwrap();
+    let comments_err = String::from_utf8_lossy(&comments.stderr);
+    assert!(!comments.status.success());
+    assert!(comments_err.contains("no file"), "{comments_err}");
+    assert!(!comments_err.contains("unknown claim"), "{comments_err}");
+    let _ = fs::remove_file(bom);
+}
+
+#[test]
 fn a_fat_macho_opens_each_slice() {
     let path = std::env::temp_dir().join(format!("elf-header-fat-{}", std::process::id()));
     let mut x86 = vec![0u8; 32];

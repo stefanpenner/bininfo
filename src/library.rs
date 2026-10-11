@@ -3,14 +3,19 @@
 why: This file names what a common library provides.
 uses: bininfo
 how: The needed list calls this file for each library name.
-An unknown name gets no note.
+A known name gets a role note.
+Another library name gets a short place note.
 ---
 */
 
-//! Notes for common library names. An unknown name returns none.
+//! Notes for common library names. Another library name gets a short place note.
 
 pub fn note(name: &str) -> Option<&'static str> {
-    match stem(name).as_str() {
+    role(&stem(name)).or_else(|| place(name))
+}
+
+fn role(name: &str) -> Option<&'static str> {
+    match name {
         "libc" => Some(
             "The C library. It provides stdio, memory, and system calls. https://man7.org/linux/man-pages/man7/libc.7.html",
         ),
@@ -58,6 +63,23 @@ pub fn note(name: &str) -> Option<&'static str> {
         ),
         "coregraphics" => Some("2D drawing on Apple platforms."),
         "cfnetwork" => Some("Network transfers on Apple platforms."),
+        "iokit" => Some("Hardware drivers. https://developer.apple.com/documentation/iokit"),
+        "corewlan" => Some("Wi-Fi on macOS. https://developer.apple.com/documentation/corewlan"),
+        "storekit" => {
+            Some("In-app purchases. https://developer.apple.com/documentation/storekit")
+        }
+        "systemconfiguration" => Some(
+            "Network setup and reachability. https://developer.apple.com/documentation/systemconfiguration",
+        ),
+        "mediaplayer" => {
+            Some("Media playback. https://developer.apple.com/documentation/mediaplayer")
+        }
+        "webkit" => Some("Web page display. https://developer.apple.com/documentation/webkit"),
+        "applicationservices" => Some("Drawing, type, and color services on macOS."),
+        "coreservices" => Some(
+            "File types and launch services. https://developer.apple.com/documentation/coreservices",
+        ),
+        "libiconv" => Some("Character encoding conversion."),
         "kernel32" => Some(
             "Base Windows functions for files, processes, and memory. https://learn.microsoft.com/en-us/windows/win32/api/winbase/",
         ),
@@ -88,6 +110,41 @@ pub fn note(name: &str) -> Option<&'static str> {
     }
 }
 
+fn place(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    let framework = lower.contains(".framework");
+    let beside = lower.contains("@executable_path") || lower.contains("@loader_path");
+    let rpath = lower.contains("@rpath");
+    if framework && beside {
+        return Some("A framework next to this file.");
+    }
+    if framework && rpath {
+        return Some("A framework from rpath.");
+    }
+    if framework && lower.contains("/system/library/") {
+        return Some("An Apple system framework.");
+    }
+    if framework {
+        return Some("A framework.");
+    }
+    if beside {
+        return Some("A library next to this file.");
+    }
+    if rpath {
+        return Some("A library from rpath.");
+    }
+    if lower.ends_with(".dylib") {
+        return Some("A macOS dynamic library.");
+    }
+    if lower.ends_with(".dll") {
+        return Some("A Windows library.");
+    }
+    if lower.ends_with(".so") || lower.contains(".so.") {
+        return Some("A shared library.");
+    }
+    None
+}
+
 fn stem(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let lower = base.to_ascii_lowercase();
@@ -99,6 +156,9 @@ fn stem(name: &str) -> String {
     }
     if let Some(rest) = lower.strip_suffix(".dylib") {
         return strip_dylib_version(rest).to_string();
+    }
+    if let Some(rest) = lower.strip_suffix(".framework") {
+        return rest.to_string();
     }
     lower
 }
@@ -135,9 +195,20 @@ mod tests {
             "{libc}"
         );
         assert!(note("libdl.so.2").unwrap().contains("dlopen"));
-        assert!(note("libdl2.so").is_none());
-        assert!(note("libtiny.so").is_none());
+        let other = note("libdl2.so").unwrap();
+        assert!(other.contains("A shared library."), "{other}");
+        assert!(!other.contains("dlopen"), "{other}");
+        assert!(note("libtiny.so").unwrap().contains("A shared library."));
         assert!(note("my.socket").is_none());
+        let iokit = note("/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit").unwrap();
+        assert!(iokit.contains("Hardware drivers."), "{iokit}");
+        let local =
+            note("@executable_path/../Frameworks/AgKernel.framework/Versions/A/AgKernel").unwrap();
+        assert!(local.contains("A framework next to this file."), "{local}");
+        let shipped = note("@rpath/BranchIOToolKit.framework/Versions/A/BranchIOToolKit").unwrap();
+        assert!(shipped.contains("A framework from rpath."), "{shipped}");
+        let apple = note("/System/Library/Frameworks/Foo.framework/Versions/A/Foo").unwrap();
+        assert!(apple.contains("An Apple system framework."), "{apple}");
         let system = note("/usr/lib/libSystem.B.dylib").unwrap();
         assert!(system.contains("libc, libm, and pthread."), "{system}");
         let cxx = note("@rpath/libc++.1.dylib").unwrap();
@@ -148,7 +219,7 @@ mod tests {
             kernel.contains("https://learn.microsoft.com/en-us/windows/win32/api/winbase/"),
             "{kernel}"
         );
-        assert!(note("tiny.dll").is_none());
+        assert!(note("tiny.dll").unwrap().contains("A Windows library."));
         assert!(note("CoreFoundation")
             .unwrap()
             .contains("strings, and collections."));

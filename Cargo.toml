@@ -5,6 +5,10 @@ edition = "2021"
 publish = false
 description = "Read an ELF, Mach-O, or PE header and check how the file starts."
 
+[lib]
+name = "bininfo"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bininfo"
 path = "src/main.rs"
