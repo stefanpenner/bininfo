@@ -144,7 +144,7 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
             format: "macho",
             kind: commands.load.kind,
             interp: commands.load.interp.clone(),
-            needed: commands.load.needed.clone(),
+            needed: commands.load.names(),
             pie: commands.load.pie,
             fat_hermetic: macho::load::fat_hermetic(slices),
             host: claim::host_marks(&macho::symbols::floors(image, commands, slices), host),

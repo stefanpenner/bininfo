@@ -3,12 +3,18 @@
 why: This file is the bininfo command.
 uses: bininfo
 how: The command reads arguments and one file.
+A terminal folds the page.
+A pipe prints the full page.
 It calls the bininfo library to print a page or check a claim.
 ---
 */
 
 //! Read an ELF, Mach-O, or PE header and print it.
+//! A terminal folds the page. A pipe prints the full page.
 //! `--check` asks whether the header names no other file.
+
+mod fold;
+mod tui;
 
 use std::env;
 use std::fs::{self, File};
@@ -17,7 +23,8 @@ use std::process::ExitCode;
 
 const USAGE: &str = "\
 usage: bininfo [--json] [--symbols] [--check] [--expect <claim>] <file>
-usage: bininfo [--json] --claims <file>";
+usage: bininfo [--json] --claims <file>
+A terminal folds the page. A pipe prints the full page.";
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -55,7 +62,12 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
         } => {
             let bytes = read_file(&path)?;
             let file = bininfo::open(&bytes, symbols)?;
-            print!("{}", bininfo::render(&path, &file, json, color_stdout()));
+            let text = bininfo::render(&path, &file, json, color_stdout());
+            if fold::interactive(io::stdout().is_terminal(), json) {
+                tui::run(&text).map_err(|err| err.to_string())?;
+            } else {
+                print!("{text}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Job::Check { path, json, expect } => {

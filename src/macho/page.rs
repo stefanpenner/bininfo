@@ -65,6 +65,7 @@ fn thin_page(out: &mut String, thin: &Thin, commands: &Commands, color: bool) {
         commands,
         color,
         "How this file starts, and which files it must open.",
+        false,
     );
     style::blank(out);
     write_extra(out, commands, color, 0, false);
@@ -172,7 +173,13 @@ fn fat_page(out: &mut String, fat: &Fat, commands: &Commands, slices: &[Slice], 
     }
     if shared {
         style::blank(out);
-        load_rung(out, commands, color, "Every slice has these load facts.");
+        load_rung(
+            out,
+            commands,
+            color,
+            "Every slice has these load facts.",
+            true,
+        );
     }
 }
 
@@ -290,7 +297,7 @@ fn write_slice(out: &mut String, slice: &Slice, color: bool) {
             );
         }
     }
-    write_load_fields(out, &slice.commands, color, 4);
+    write_load_fields(out, &slice.commands, color, 4, false);
     write_extra(out, &slice.commands, color, 4, true);
 }
 
@@ -422,12 +429,20 @@ fn type_rung(out: &mut String, thin: &Thin, color: bool) {
     );
 }
 
-fn load_rung(out: &mut String, commands: &Commands, color: bool, note: &str) {
+fn load_rung(out: &mut String, commands: &Commands, color: bool, note: &str, names_only: bool) {
     style::rung(out, color, "load", note, style::FG, true);
-    write_load_fields(out, commands, color, 2);
+    write_load_fields(out, commands, color, 2, names_only);
 }
 
-fn write_load_fields(out: &mut String, commands: &Commands, color: bool, indent: usize) {
+const NEEDED_NOTE: &str = "[LC_LOAD_DYLIB] One row is one load command. No cmd means load.";
+
+fn write_load_fields(
+    out: &mut String,
+    commands: &Commands,
+    color: bool,
+    indent: usize,
+    names_only: bool,
+) {
     let (fg, bold) = style::kind_tone(commands.load.kind);
     style::field(
         out,
@@ -455,21 +470,8 @@ fn write_load_fields(out: &mut String, commands: &Commands, color: bool, indent:
         fg,
         bold,
     );
-    style::noted_list(
-        out,
-        color,
-        indent,
-        "needed",
-        &commands.load.needed,
-        claim::needed_note("macho"),
-        if commands.load.needed.is_empty() {
-            style::LABEL
-        } else {
-            style::WHITE
-        },
-        false,
-        crate::library::note,
-    );
+    let names = commands.load.names();
+    write_needed(out, commands, &names, color, indent, names_only);
     claim::write_search(
         out,
         color,
@@ -479,7 +481,7 @@ fn write_load_fields(out: &mut String, commands: &Commands, color: bool, indent:
         &commands.load.rpath,
     );
     claim::write_delay(out, color, indent, "macho", &commands.load.delay);
-    claim::write_dlopen(out, color, indent, "macho", &commands.load.needed);
+    claim::write_dlopen(out, color, indent, "macho", &names);
     style::field(
         out,
         color,
@@ -494,6 +496,65 @@ fn write_load_fields(out: &mut String, commands: &Commands, color: bool, indent:
         },
         commands.load.pie,
     );
+}
+
+fn write_needed(
+    out: &mut String,
+    commands: &Commands,
+    names: &[String],
+    color: bool,
+    indent: usize,
+    names_only: bool,
+) {
+    let rows = &commands.load.needed;
+    let note = if names_only {
+        claim::needed_note("macho")
+    } else {
+        NEEDED_NOTE
+    };
+    let fg = if rows.is_empty() {
+        style::LABEL
+    } else {
+        style::WHITE
+    };
+    if names_only || rows.is_empty() {
+        style::noted_list(
+            out,
+            color,
+            indent,
+            "needed",
+            names,
+            note,
+            fg,
+            false,
+            crate::library::note,
+        );
+        return;
+    }
+    let gap = " ".repeat(indent);
+    let painted = style::paint(color, "needed:", style::LABEL, false);
+    let plain = indent + "needed:".len();
+    style::align_note(out, color, &format!("{gap}{painted}"), plain, note);
+    let item_gap = " ".repeat(indent + 2);
+    let child_gap = " ".repeat(indent + 4);
+    for row in rows {
+        let shown_plain = style::yaml_scalar(&row.name);
+        let shown = style::file_text(color, &row.name);
+        let dash = style::paint(color, "-", style::LABEL, false);
+        let prefix = format!("{item_gap}{dash} {shown}");
+        let plain_len = item_gap.len() + 2 + shown_plain.chars().count();
+        match crate::library::note(&row.name) {
+            Some(item) => style::align_note(out, color, &prefix, plain_len, item),
+            None => {
+                let _ = writeln!(out, "{prefix}");
+            }
+        }
+        if let Some(word) = row.cmd.word() {
+            let _ = writeln!(out, "{child_gap}cmd: {word}");
+        }
+        let _ = writeln!(out, "{child_gap}compat: {}", row.compat);
+        let _ = writeln!(out, "{child_gap}current: {}", row.current);
+    }
 }
 
 fn size_rung(out: &mut String, thin: &Thin, color: bool) {
@@ -690,30 +751,6 @@ fn write_extra(out: &mut String, commands: &Commands, color: bool, indent: usize
             style::WHITE,
             false,
         );
-        saw = true;
-    }
-    if !extra.dylibs.is_empty() {
-        if saw {
-            style::blank(out);
-        }
-        group(
-            out,
-            color,
-            indent,
-            "dylib",
-            "[LC_LOAD_DYLIB] compatibility_version and current_version. Same order as needed.",
-        );
-        let dash = " ".repeat(field);
-        let sub = " ".repeat(field + 2);
-        for dylib in &extra.dylibs {
-            let _ = writeln!(
-                out,
-                "{dash}- name: {}",
-                style::file_text(color, &dylib.name)
-            );
-            let _ = writeln!(out, "{sub}compat: {}", dylib.compat);
-            let _ = writeln!(out, "{sub}current: {}", dylib.current);
-        }
         saw = true;
     }
     if saw {
@@ -1009,8 +1046,18 @@ mod tests {
     fn needed_names_are_a_block_list_in_file_order() {
         let mut commands = still();
         commands.load.needed = vec![
-            "@rpath/libsherpa-onnx-c-api.dylib".into(),
-            "/usr/lib/libSystem.B.dylib".into(),
+            load::Dylib {
+                cmd: load::DylibCmd::Load,
+                name: "@rpath/libsherpa-onnx-c-api.dylib".into(),
+                compat: "1.0.0".into(),
+                current: "2.0.0".into(),
+            },
+            load::Dylib {
+                cmd: load::DylibCmd::Weak,
+                name: "/usr/lib/libSystem.B.dylib".into(),
+                compat: "1.0.0".into(),
+                current: "1351.0.0".into(),
+            },
         ];
         let text = render("exec", &exec64(), &commands, &[], false);
         assert!(!text.contains("needed: ["), "{text}");
@@ -1026,9 +1073,7 @@ mod tests {
             lines[at]
         );
         assert!(
-            lines[at].contains(
-                "[LC_LOAD_DYLIB] Library names the loader opens. Also weak, reexport, and upward."
-            ),
+            lines[at].contains("[LC_LOAD_DYLIB] One row is one load command. No cmd means load."),
             "{}",
             lines[at]
         );
@@ -1042,43 +1087,49 @@ mod tests {
             "{}",
             lines[at + 1]
         );
+        assert_eq!(lines[at + 2], "      compat: 1.0.0");
+        assert_eq!(lines[at + 3], "      current: 2.0.0");
         assert!(
-            lines[at + 2].contains("/usr/lib/libSystem.B.dylib"),
-            "{}",
-            lines[at + 2]
-        );
-        assert!(
-            lines[at + 2].contains("libc, libm, and pthread."),
-            "{}",
-            lines[at + 2]
-        );
-        assert_eq!(
-            lines[at + 2].find('#'),
-            Some(style::COLUMN + 2),
-            "{}",
-            lines[at + 2]
-        );
-        assert!(
-            lines[at + 3].starts_with("  runpath: []"),
-            "{}",
-            lines[at + 3]
-        );
-        assert!(
-            lines[at + 4].starts_with("  rpath: []"),
+            lines[at + 4].contains("/usr/lib/libSystem.B.dylib"),
             "{}",
             lines[at + 4]
         );
         assert!(
-            lines[at + 5].starts_with("  delay: []"),
+            lines[at + 4].contains("libc, libm, and pthread."),
             "{}",
-            lines[at + 5]
+            lines[at + 4]
+        );
+        assert_eq!(
+            lines[at + 4].find('#'),
+            Some(style::COLUMN + 2),
+            "{}",
+            lines[at + 4]
+        );
+        assert_eq!(lines[at + 5], "      cmd: weak");
+        assert_eq!(lines[at + 6], "      compat: 1.0.0");
+        assert_eq!(lines[at + 7], "      current: 1351.0.0");
+        assert!(!text.contains("dylib:"), "{text}");
+        assert!(
+            lines[at + 8].starts_with("  runpath: []"),
+            "{}",
+            lines[at + 8]
         );
         assert!(
-            lines[at + 6].starts_with("  dlopen: null"),
+            lines[at + 9].starts_with("  rpath: []"),
             "{}",
-            lines[at + 6]
+            lines[at + 9]
         );
-        assert!(lines[at + 7].starts_with("  pie:"), "{}", lines[at + 7]);
+        assert!(
+            lines[at + 10].starts_with("  delay: []"),
+            "{}",
+            lines[at + 10]
+        );
+        assert!(
+            lines[at + 11].starts_with("  dlopen: null"),
+            "{}",
+            lines[at + 11]
+        );
+        assert!(lines[at + 12].starts_with("  pie:"), "{}", lines[at + 12]);
     }
 
     #[test]
@@ -1139,7 +1190,7 @@ mod tests {
                 load: Load {
                     kind: Kind::DynamicPie,
                     interp: Some("/usr/lib/dyld".into()),
-                    needed: vec![needed.into()],
+                    needed: vec![load::link(needed)],
                     runpath: Vec::new(),
                     rpath: vec![rpath.into()],
                     delay: Vec::new(),

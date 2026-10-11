@@ -7,7 +7,7 @@ This file does not print the page.
 ---
 */
 
-//! Mach-O build version, dylib versions, and loader symbol records.
+//! Mach-O build version, dylib version fields, and loader symbol records.
 //! This module does not print.
 
 use super::header::{self, Class, Data, Image, Thin};
@@ -18,14 +18,6 @@ use crate::claim::{CpuFloor, Version};
 const SYM_CAP: u32 = 16384;
 const NODE_CAP: u32 = 10000;
 const NAME_CAP: usize = 4096;
-
-/// compatibility_version and current_version for one linked dylib.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Dylib {
-    pub name: String,
-    pub compat: String,
-    pub current: String,
-}
 
 /// LC_BUILD_VERSION, or LC_VERSION_MIN_MACOSX when that is the only record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +47,6 @@ pub struct BindImport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Extra {
     pub build: Option<Build>,
-    pub dylibs: Vec<Dylib>,
     pub chained: Option<u32>,
     pub chained_rows: Vec<ChainedImport>,
     pub bind: Option<u32>,
@@ -73,7 +64,6 @@ impl Extra {
     pub fn empty() -> Self {
         Self {
             build: None,
-            dylibs: Vec::new(),
             chained: None,
             chained_rows: Vec::new(),
             bind: None,

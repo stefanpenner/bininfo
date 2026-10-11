@@ -16,6 +16,41 @@ pub use super::symbols::Extra;
 pub(crate) use crate::kind::name as kind_name;
 pub use crate::kind::Kind;
 
+/// The load command for one linked library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DylibCmd {
+    /// LC_LOAD_DYLIB.
+    Load,
+    /// LC_LOAD_WEAK_DYLIB.
+    Weak,
+    /// LC_REEXPORT_DYLIB.
+    Reexport,
+    /// LC_LOAD_UPWARD_DYLIB.
+    Upward,
+}
+
+impl DylibCmd {
+    /// Page word. `Load` has no word.
+    pub(crate) fn word(self) -> Option<&'static str> {
+        match self {
+            Self::Load => None,
+            Self::Weak => Some("weak"),
+            Self::Reexport => Some("reexport"),
+            Self::Upward => Some("upward"),
+        }
+    }
+}
+
+/// One linked library.
+/// `compat` is compatibility_version. `current` is current_version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dylib {
+    pub cmd: DylibCmd,
+    pub name: String,
+    pub compat: String,
+    pub current: String,
+}
+
 const LC_SYMTAB: u32 = 0x2;
 const LC_UNIXTHREAD: u32 = 0x5;
 const LC_LOAD_DYLIB: u32 = 0xc;
@@ -39,11 +74,28 @@ const NAME_CAP: usize = 4096;
 pub struct Load {
     pub kind: Kind,
     pub interp: Option<String>, // LC_LOAD_DYLINKER path. None means this file starts itself.
-    pub needed: Vec<String>,    // Dylib names the loader opens.
+    pub needed: Vec<Dylib>,     // One row is one load command.
     pub runpath: Vec<String>,   // Always empty. Mach-O has no RUNPATH record.
     pub rpath: Vec<String>,     // LC_RPATH directories, in file order.
     pub delay: Vec<String>,     // Always empty. Mach-O has no delay-import record.
     pub pie: bool,              // MH_PIE bit in the header flags.
+}
+
+impl Load {
+    /// Library names in file order. Claims read this list.
+    pub fn names(&self) -> Vec<String> {
+        self.needed.iter().map(|row| row.name.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn link(name: &str) -> Dylib {
+    Dylib {
+        cmd: DylibCmd::Load,
+        name: name.to_string(),
+        compat: "0.0.0".into(),
+        current: "0.0.0".into(),
+    }
 }
 
 /// Load-command facts. `entry` is not in the Mach-O header.
@@ -56,7 +108,7 @@ pub struct Commands {
     pub nsyms: u32,
     pub stroff: u32,
     pub strsize: u32,
-    pub extra: Extra, // Build version, dylib versions, and loader symbols.
+    pub extra: Extra, // Build version and loader symbols.
 }
 
 /// One fat slice. `thin` is absent when those bytes are not a thin Mach-O.
@@ -164,7 +216,7 @@ pub fn fat_hermetic(slices: &[Slice]) -> Option<bool> {
             && crate::claim::is_hermetic(
                 slice.commands.load.kind,
                 slice.commands.load.interp.as_deref(),
-                &slice.commands.load.needed,
+                &slice.commands.load.names(),
             )
     }))
 }
@@ -183,10 +235,14 @@ pub fn commands_for(slices: &[Slice]) -> Commands {
     commands
 }
 
+fn same_names(left: &[Dylib], right: &[Dylib]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(a, b)| a.name == b.name)
+}
+
 fn same_load(left: &Load, right: &Load) -> bool {
     left.kind == right.kind
         && left.interp == right.interp
-        && left.needed == right.needed
+        && same_names(&left.needed, &right.needed)
         && left.runpath == right.runpath
         && left.rpath == right.rpath
         && left.delay == right.delay
@@ -232,12 +288,18 @@ fn read_thin(bytes: &[u8], thin: &Thin, rows: bool) -> Commands {
             LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB | LC_LOAD_UPWARD_DYLIB => {
                 if let Some(name) = cmd_name(bytes, at, size, thin.data) {
                     let (compat, current) = symbols::dylib_versions(bytes, at, size, thin.data);
-                    commands.extra.dylibs.push(symbols::Dylib {
-                        name: name.clone(),
+                    let cmd = match cmd & !LC_REQ {
+                        LC_LOAD_WEAK_DYLIB => DylibCmd::Weak,
+                        LC_REEXPORT_DYLIB => DylibCmd::Reexport,
+                        LC_LOAD_UPWARD_DYLIB => DylibCmd::Upward,
+                        _ => DylibCmd::Load,
+                    };
+                    commands.load.needed.push(Dylib {
+                        cmd,
+                        name,
                         compat,
                         current,
                     });
-                    commands.load.needed.push(name);
                 }
             }
             LC_RPATH => {
@@ -529,7 +591,12 @@ mod tests {
         let commands = read(&bytes, &image);
         assert_eq!(commands.load.kind, Kind::DynamicPie);
         assert_eq!(commands.load.interp.as_deref(), Some("/usr/lib/dyld"));
-        assert_eq!(commands.load.needed, ["liba.dylib", "libb.dylib"]);
+        assert_eq!(commands.load.names(), ["liba.dylib", "libb.dylib"]);
+        assert!(commands
+            .load
+            .needed
+            .iter()
+            .all(|row| row.cmd == DylibCmd::Load));
         assert!(commands.load.pie);
         assert!(commands.entry_is_offset);
         assert_eq!(commands.entry, 0x1000);
@@ -567,7 +634,7 @@ mod tests {
         let commands = read(&bytes, &image);
         assert_eq!(commands.load.kind, Kind::Shared);
         assert!(commands.load.interp.is_none());
-        assert_eq!(commands.load.needed, ["/usr/lib/libSystem.B.dylib"]);
+        assert_eq!(commands.load.names(), ["/usr/lib/libSystem.B.dylib"]);
     }
 
     #[test]
@@ -738,14 +805,14 @@ mod tests {
             slices[0].commands.load.interp.as_deref(),
             Some("/usr/lib/dyld")
         );
-        assert_eq!(slices[0].commands.load.needed, ["libx.dylib"]);
+        assert_eq!(slices[0].commands.load.names(), ["libx.dylib"]);
         assert_eq!(slices[0].commands.load.rpath, ["@executable_path/x:y"]);
         assert!(slices[0].commands.load.runpath.is_empty());
         assert!(slices[0].commands.load.pie);
         assert!(slices[0].thin.is_some());
         assert_eq!(slices[1].cputype, 0x0100_000c);
         assert_eq!(slices[1].cpusubtype, 2);
-        assert_eq!(slices[1].commands.load.needed, ["liba.dylib"]);
+        assert_eq!(slices[1].commands.load.names(), ["liba.dylib"]);
         assert_eq!(slices[1].commands.load.rpath, ["@executable_path/a"]);
         assert!(shared_load(&slices).is_none());
     }
@@ -762,10 +829,85 @@ mod tests {
         let slices = open_slices(&bytes, fat);
         let shared = shared_load(&slices).expect("same load");
         assert_eq!(shared.kind, Kind::DynamicPie);
-        assert_eq!(shared.needed, ["liba.dylib"]);
+        assert_eq!(shared.names(), ["liba.dylib"]);
         assert_eq!(shared.rpath, ["@executable_path/../Frameworks"]);
         assert!(fat_hermetic(&slices).is_none());
         assert_eq!(commands_for(&slices).load, shared);
+    }
+
+    #[test]
+    fn shared_load_compares_names_not_versions() {
+        let mut left = blank(Kind::DynamicPie);
+        let mut right = blank(Kind::DynamicPie);
+        left.load.needed.push(Dylib {
+            cmd: DylibCmd::Load,
+            name: "liba.dylib".into(),
+            compat: "1.0.0".into(),
+            current: "2.0.0".into(),
+        });
+        right.load.needed.push(Dylib {
+            cmd: DylibCmd::Weak,
+            name: "liba.dylib".into(),
+            compat: "9.0.0".into(),
+            current: "9.0.0".into(),
+        });
+        let slices = [named_slice(left), named_slice(right)];
+        let shared = shared_load(&slices).expect("names match");
+        assert_eq!(shared.names(), ["liba.dylib"]);
+        assert_eq!(shared.needed[0].current, "2.0.0");
+    }
+
+    fn named_slice(commands: Commands) -> Slice {
+        Slice {
+            cputype: 0,
+            cpusubtype: 0,
+            offset: 0,
+            size: 0,
+            thin: None,
+            commands,
+        }
+    }
+
+    #[test]
+    fn weak_reexport_and_upward_keep_one_row() {
+        let mut bytes = header(2, 0, Data::Little);
+        push_text(
+            &mut bytes,
+            LC_LOAD_WEAK_DYLIB | LC_REQ,
+            24,
+            "weak.dylib",
+            Data::Little,
+        );
+        push_text(
+            &mut bytes,
+            LC_REEXPORT_DYLIB | LC_REQ,
+            24,
+            "re.dylib",
+            Data::Little,
+        );
+        push_text(
+            &mut bytes,
+            LC_LOAD_UPWARD_DYLIB | LC_REQ,
+            24,
+            "up.dylib",
+            Data::Little,
+        );
+        finish(&mut bytes, Data::Little, 3);
+        let image = header::parse(&bytes).unwrap();
+        let commands = read(&bytes, &image);
+        assert_eq!(
+            commands.load.names(),
+            ["weak.dylib", "re.dylib", "up.dylib"]
+        );
+        assert_eq!(
+            commands
+                .load
+                .needed
+                .iter()
+                .map(|row| row.cmd)
+                .collect::<Vec<_>>(),
+            [DylibCmd::Weak, DylibCmd::Reexport, DylibCmd::Upward]
+        );
     }
 
     #[test]
@@ -781,7 +923,7 @@ mod tests {
         let slices = std::panic::catch_unwind(|| open_slices(&bytes, fat)).unwrap();
         assert_eq!(slices.len(), 2);
         assert!(slices[0].thin.is_some());
-        assert_eq!(slices[0].commands.load.needed, ["liba.dylib"]);
+        assert_eq!(slices[0].commands.load.names(), ["liba.dylib"]);
         assert!(slices[1].thin.is_none());
         assert_eq!(slices[1].commands.load.kind, Kind::Other);
         assert!(shared_load(&slices).is_none());
@@ -799,7 +941,7 @@ mod tests {
             panic!("thin")
         };
         let slices = open_slices(&bytes, fat);
-        assert_eq!(slices[0].commands.load.needed, ["liba.dylib"]);
+        assert_eq!(slices[0].commands.load.names(), ["liba.dylib"]);
         assert!(slices[0].size > image.len() as u64);
     }
 
@@ -839,7 +981,7 @@ mod tests {
         let slices = open_slices(&bytes, fat);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].cpusubtype, 2);
-        assert_eq!(slices[0].commands.load.needed, ["liba.dylib"]);
+        assert_eq!(slices[0].commands.load.names(), ["liba.dylib"]);
         assert_eq!(slices[0].commands.load.rpath, ["/opt/lib"]);
 
         let nested = fat_of(&[(0x0100_0007, 3, image)]);
@@ -868,7 +1010,7 @@ mod tests {
             panic!("thin")
         };
         let slices = open_slices(&bytes, fat);
-        assert_eq!(slices[0].commands.load.needed, ["liba.dylib"]);
+        assert_eq!(slices[0].commands.load.names(), ["liba.dylib"]);
         assert_eq!(slices[0].commands.load.rpath, ["/opt/lib"]);
         assert_eq!(fat.data, Data::Little);
     }
@@ -878,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn build_version_beats_version_min_and_dylibs_keep_order() {
+    fn build_version_beats_version_min_and_needed_rows_keep_order() {
         let mut bytes = header(2, 0, Data::Little);
         let build = bytes.len();
         bytes.resize(build + 32, 0);
@@ -915,19 +1057,26 @@ mod tests {
             (build.sdk.major, build.sdk.minor, build.sdk.patch),
             (15, 0, 0)
         );
-        assert_eq!(commands.load.needed, ["liba.dylib", "libb.dylib"]);
-        assert_eq!(commands.extra.dylibs[0].compat, "1.0.0");
-        assert_eq!(commands.extra.dylibs[0].current, "2.0.0");
-        assert_eq!(commands.extra.dylibs[1].compat, "3.1.0");
-        assert_eq!(commands.extra.dylibs[1].current, "4.2.1");
+        assert_eq!(commands.load.names(), ["liba.dylib", "libb.dylib"]);
+        assert_eq!(commands.load.needed[0].cmd, DylibCmd::Load);
+        assert_eq!(commands.load.needed[0].compat, "1.0.0");
+        assert_eq!(commands.load.needed[0].current, "2.0.0");
+        assert_eq!(commands.load.needed[1].compat, "3.1.0");
+        assert_eq!(commands.load.needed[1].current, "4.2.1");
         let text = super::super::page::render("a", &image, &commands, &[], false);
         assert!(text.contains("platform: macos (1)"), "{text}");
         assert!(text.contains("minos: 14.0.0"), "{text}");
         assert!(text.contains("sdk: 15.0.0"), "{text}");
         assert!(text.contains("[LC_BUILD_VERSION]"), "{text}");
+        assert!(!text.contains("dylib:"), "{text}");
         let a = text.find("liba.dylib").expect("liba");
         let b = text.find("libb.dylib").expect("libb");
         assert!(a < b, "{text}");
+        let between = &text[a..b];
+        let compat = between.find("compat: 1.0.0").expect("compat");
+        let current = between.find("current: 2.0.0").expect("current");
+        assert!(compat < current, "{text}");
+        assert!(!between.contains("cmd:"), "{text}");
 
         let mut only = header(2, 0, Data::Little);
         let at = only.len();

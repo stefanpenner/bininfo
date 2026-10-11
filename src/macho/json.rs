@@ -1,3 +1,12 @@
+/*
+---
+why: This file writes one Mach-O header as one JSON object.
+uses: bininfo
+how: bininfo calls this file after it reads the header.
+This file does not read Mach-O bytes.
+---
+*/
+
 //! One JSON object for one Mach-O header.
 //! This file does not read Mach-O bytes.
 
@@ -43,7 +52,7 @@ fn thin_json(file: &str, thin: &Thin, commands: &Commands) -> String {
     out.u64("nsyms", commands.nsyms as u64);
     out.u64("stroff", commands.stroff as u64);
     out.u64("strsize", commands.strsize as u64);
-    write_load(&mut out, commands);
+    write_load(&mut out, commands, false);
     write_records(&mut out, commands);
     out.finish()
 }
@@ -65,7 +74,7 @@ fn fat_json(file: &str, fat: &Fat, commands: &Commands, slices: &[Slice]) -> Str
     let objects: Vec<String> = slices.iter().map(slice_json).collect();
     out.raw_array("slices", &objects);
     if load::shared_load(slices).is_some() {
-        write_load(&mut out, commands);
+        write_load(&mut out, commands, true);
     }
     out.finish()
 }
@@ -92,7 +101,7 @@ fn slice_json(slice: &Slice) -> String {
         }
     }
     out.opt("entry_name", slice.commands.extra.entry_name.as_deref());
-    write_load(&mut out, &slice.commands);
+    write_load(&mut out, &slice.commands, false);
     write_records(&mut out, &slice.commands);
     out.finish_inline()
 }
@@ -107,20 +116,6 @@ fn write_records(out: &mut Json, commands: &Commands) {
         obj.str("sdk", &symbols::dotted(build.sdk));
         obj.str("source", build.source);
         out.raw("build", &obj.finish_inline());
-    }
-    if !extra.dylibs.is_empty() {
-        let rows: Vec<String> = extra
-            .dylibs
-            .iter()
-            .map(|dylib| {
-                let mut one = Json::new();
-                one.str("name", &dylib.name);
-                one.str("compat", &dylib.compat);
-                one.str("current", &dylib.current);
-                one.finish_inline()
-            })
-            .collect();
-        out.raw_array("dylib", &rows);
     }
     let mut symbols_out = Json::new();
     if let Some(count) = extra.chained {
@@ -163,18 +158,37 @@ fn bind_json(row: &BindImport) -> String {
     one.finish_inline()
 }
 
-fn write_load(out: &mut Json, commands: &Commands) {
-    claim::write_load(
-        out,
-        commands.load.kind,
-        commands.load.interp.as_deref(),
-        &commands.load.needed,
-        &commands.load.runpath,
-        &commands.load.rpath,
-        &commands.load.delay,
-        "macho",
-        commands.load.pie,
-    );
+fn write_load(out: &mut Json, commands: &Commands, names_only: bool) {
+    let names = commands.load.names();
+    let mut one = Json::new();
+    one.str("kind", load::kind_name(commands.load.kind));
+    one.opt("interp", commands.load.interp.as_deref());
+    if names_only {
+        one.strings("needed", &names);
+    } else {
+        let rows: Vec<String> = commands.load.needed.iter().map(needed_json).collect();
+        one.raw_array("needed", &rows);
+    }
+    one.strings("runpath", &commands.load.runpath);
+    one.strings("rpath", &commands.load.rpath);
+    one.strings("delay", &commands.load.delay);
+    match claim::dlopen_fact("macho", &names) {
+        Some(value) => one.flag("dlopen", value),
+        None => one.raw("dlopen", "null"),
+    }
+    one.flag("pie", commands.load.pie);
+    out.raw("load", &one.finish_inline());
+}
+
+fn needed_json(row: &load::Dylib) -> String {
+    let mut one = Json::new();
+    one.str("name", &row.name);
+    if let Some(word) = row.cmd.word() {
+        one.str("cmd", word);
+    }
+    one.str("compat", &row.compat);
+    one.str("current", &row.current);
+    one.finish_inline()
 }
 
 #[cfg(test)]
@@ -229,6 +243,34 @@ mod tests {
         assert_eq!(text.matches('{').count(), 3, "{text}");
     }
 
+    #[test]
+    fn needed_rows_keep_versions_and_omit_a_load_cmd() {
+        let mut commands = still();
+        commands.load.needed = vec![
+            load::Dylib {
+                cmd: load::DylibCmd::Load,
+                name: "liba.dylib".into(),
+                compat: "1.0.0".into(),
+                current: "2.0.0".into(),
+            },
+            load::Dylib {
+                cmd: load::DylibCmd::Reexport,
+                name: "libb.dylib".into(),
+                compat: "3.1.0".into(),
+                current: "4.2.1".into(),
+            },
+        ];
+        let text = render("exec", &exec64(), &commands, &[]);
+        assert!(
+            text.contains(
+                r#""needed":[{"name":"liba.dylib","compat":"1.0.0","current":"2.0.0"},{"name":"libb.dylib","cmd":"reexport","compat":"3.1.0","current":"4.2.1"}]"#
+            ),
+            "{text}"
+        );
+        assert!(!text.contains(r#""dylib""#), "{text}");
+        assert!(!text.contains(r#""cmd":"load""#), "{text}");
+    }
+
     fn pie_slice(cpu: u32, sub: u32, needed: &str) -> Slice {
         use super::super::header::{Class, Data, FileType, Thin};
         Slice {
@@ -251,7 +293,7 @@ mod tests {
                 load: Load {
                     kind: Kind::DynamicPie,
                     interp: Some("/usr/lib/dyld".into()),
-                    needed: vec![needed.into()],
+                    needed: vec![load::link(needed)],
                     runpath: Vec::new(),
                     rpath: vec!["@executable_path/../Frameworks".into()],
                     delay: Vec::new(),
@@ -306,8 +348,14 @@ mod tests {
         assert!(text.contains(r#""cpusubtype_name":"X86_64_ALL""#), "{text}");
         assert!(text.contains(r#""cputype_name":"AArch64""#), "{text}");
         assert!(text.contains(r#""cpusubtype_name":"ARM64E""#), "{text}");
-        assert!(text.contains(r#""needed":["libx.dylib"]"#), "{text}");
-        assert!(text.contains(r#""needed":["liba.dylib"]"#), "{text}");
+        assert!(
+            text.contains(r#""needed":[{"name":"libx.dylib","compat":"0.0.0","current":"0.0.0"}]"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""needed":[{"name":"liba.dylib","compat":"0.0.0","current":"0.0.0"}]"#),
+            "{text}"
+        );
         let x = text.find("libx.dylib").expect("libx");
         let a = text.find("liba.dylib").expect("liba");
         assert!(x < a, "{text}");
@@ -329,7 +377,13 @@ mod tests {
         let text = render("Photo", &fat_image(), &commands, &slices);
         assert_eq!(
             text.matches(r#""needed":["liba.dylib"]"#).count(),
-            3,
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches(r#""name":"liba.dylib","compat":"0.0.0","current":"0.0.0""#)
+                .count(),
+            2,
             "{text}"
         );
         assert!(text.contains(r#""kind":"dynamic-pie""#), "{text}");
