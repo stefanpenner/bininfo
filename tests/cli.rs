@@ -2,7 +2,7 @@ use std::fs;
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_binvet"))
+    Command::new(env!("CARGO_BIN_EXE_bininfo"))
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn rejects_a_missing_path_and_a_non_elf() {
     assert!(!missing.status.success());
     let usage = String::from_utf8_lossy(&missing.stderr);
     assert!(
-        usage.contains("usage: binvet [--json] [--symbols] [--check] [--expect <claim>] <file>"),
+        usage.contains("usage: bininfo [--json] [--symbols] [--check] [--expect <claim>] <file>"),
         "{usage}"
     );
     assert!(usage.contains("--claims"), "{usage}");

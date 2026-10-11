@@ -14,8 +14,8 @@ use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-usage: binvet [--json] [--symbols] [--check] [--expect <claim>] <file>
-usage: binvet [--json] --claims <file>";
+usage: bininfo [--json] [--symbols] [--check] [--expect <claim>] <file>
+usage: bininfo [--json] --claims <file>";
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
