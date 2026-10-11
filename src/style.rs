@@ -3,7 +3,9 @@
 why: This file writes one page line and one JSON token.
 uses: bininfo
 how: Each page file calls this file to align a field and a note.
-A file list paints the directory gray and the file name white.
+A long value keeps its note on the same line.
+A file list paints the directory gray and the library name white.
+A note is a light blue.
 ---
 */
 
@@ -18,7 +20,7 @@ pub const COLUMN: usize = 32;
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 pub const FG: Rgb = Rgb(0xf2, 0xf4, 0xf8);
-pub const NOTE: Rgb = Rgb(0xb6, 0xb8, 0xbb);
+pub const NOTE: Rgb = Rgb(0x9d, 0xc8, 0xe6);
 pub const LABEL: Rgb = Rgb(0x7b, 0x7c, 0x7e);
 pub const GREEN: Rgb = Rgb(0x25, 0xbe, 0x6a);
 pub const TEAL: Rgb = Rgb(0x08, 0xbd, 0xba);
@@ -187,7 +189,7 @@ fn write_list(
     }
 }
 
-/// The directory is gray. The file name is white and bold. An @ token is magenta.
+/// The directory is gray. The library name is white and bold.
 pub fn paint_path(on: bool, text: &str) -> String {
     if !on {
         return text.to_string();
@@ -210,26 +212,41 @@ pub(crate) fn file_text(color: bool, name: &str) -> String {
 }
 
 fn paint_parts(text: &str, escape: bool) -> String {
+    let (start, end) = library_range(text);
     let mut out = String::new();
-    let mut rest = text;
-    if let Some(token) = at_token(rest) {
-        out.push_str(&paint_piece(token, MAGENTA, true, escape));
-        rest = &rest[token.len()..];
+    if start > 0 {
+        out.push_str(&paint_piece(&text[..start], LABEL, false, escape));
     }
-    if rest.is_empty() {
-        return out;
+    if start < end {
+        out.push_str(&paint_piece(&text[start..end], FG, true, escape));
     }
-    match rest.rfind(['/', '\\']) {
-        Some(at) => {
-            out.push_str(&paint_piece(&rest[..=at], LABEL, false, escape));
-            let file = &rest[at + 1..];
-            if !file.is_empty() {
-                out.push_str(&paint_piece(file, FG, true, escape));
-            }
-        }
-        None => out.push_str(&paint_piece(rest, FG, true, escape)),
+    if end < text.len() {
+        out.push_str(&paint_piece(&text[end..], LABEL, false, escape));
     }
     out
+}
+
+/// Byte range of the library name. A `.framework` component wins. Otherwise the last component wins.
+fn library_range(text: &str) -> (usize, usize) {
+    let bytes = text.as_bytes();
+    let mut last = None;
+    let mut framework = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'/' || bytes[index] == b'\\' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index] != b'/' && bytes[index] != b'\\' {
+            index += 1;
+        }
+        last = Some((start, index));
+        if text[start..index].ends_with(".framework") {
+            framework = Some((start, index));
+        }
+    }
+    framework.or(last).unwrap_or((0, 0))
 }
 
 fn paint_piece(text: &str, color: Rgb, bold: bool, escape: bool) -> String {
@@ -246,17 +263,6 @@ fn paint_piece(text: &str, color: Rgb, bold: bool, escape: bool) -> String {
         }
     }
     paint(true, &shown, color, bold)
-}
-
-fn at_token(text: &str) -> Option<&str> {
-    for token in ["@executable_path", "@loader_path", "@rpath"] {
-        if text == token
-            || text.starts_with(token) && text.as_bytes().get(token.len()) == Some(&b'/')
-        {
-            return Some(token);
-        }
-    }
-    None
 }
 
 pub fn kind_tone(kind: Kind) -> (Rgb, bool) {
@@ -326,13 +332,13 @@ fn emit(
 
 pub(crate) fn align_note(out: &mut String, color: bool, prefix: &str, plain: usize, note: &str) {
     let note = paint(color, &format!("# {note}"), NOTE, false);
-    if plain <= COLUMN {
-        let pad = " ".repeat(COLUMN - plain);
-        let _ = writeln!(out, "{prefix}{pad}  {note}");
-        return;
-    }
-    let pad = " ".repeat(COLUMN + 2);
-    let _ = writeln!(out, "{prefix}\n{pad}{note}");
+    let gap = if plain <= COLUMN {
+        COLUMN - plain + 2
+    } else {
+        2
+    };
+    let pad = " ".repeat(gap);
+    let _ = writeln!(out, "{prefix}{pad}{note}");
 }
 
 pub(crate) fn yaml_scalar(value: &str) -> String {
@@ -551,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_value_puts_the_note_on_the_next_line() {
+    fn a_long_value_keeps_the_note_on_its_line() {
         let mut out = String::new();
         let value = "x".repeat(40);
         let prefix = format!("  e_ident: {value}");
@@ -562,11 +568,10 @@ mod tests {
             prefix.chars().count(),
             "16 bytes.",
         );
-        let mut lines = out.lines();
-        let first = lines.next().unwrap();
-        let second = lines.next().unwrap();
-        assert!(!first.contains('#'), "{first}");
-        assert_eq!(second.find('#'), Some(COLUMN + 2), "{second}");
+        let line = out.lines().next().unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(line.contains(&value), "{line}");
+        assert!(line.ends_with("  # 16 bytes."), "{line}");
     }
 
     #[test]
@@ -645,11 +650,13 @@ mod tests {
     }
 
     #[test]
-    fn a_file_list_paints_the_directory_gray_and_the_file_name_white() {
+    fn a_file_list_paints_the_library_name_white() {
         let names = vec![
             "/usr/lib/libSystem.B.dylib".into(),
             "@rpath/libtiny.dylib".into(),
             "@loader_path/../lib".into(),
+            "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit".into(),
+            "@executable_path/../Frameworks/AgUI.framework/Versions/A/AgUI".into(),
             r"C:\Windows\System32\kernel32.dll".into(),
             "a:b/c".into(),
         ];
@@ -666,23 +673,31 @@ mod tests {
         );
         let gray = "\u{1b}[38;2;123;124;126m";
         let file = "\u{1b}[1;38;2;242;244;248m";
-        let token = "\u{1b}[1;38;2;190;149;255m";
         assert!(
             out.contains(&format!("{gray}/usr/lib/\u{1b}[0m{file}libSystem.B.dylib")),
             "{out}"
         );
         assert!(
+            out.contains(&format!("{gray}@rpath/\u{1b}[0m{file}libtiny.dylib")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("{gray}@loader_path/../\u{1b}[0m{file}lib")),
+            "{out}"
+        );
+        assert!(
             out.contains(&format!(
-                "{token}@rpath\u{1b}[0m{gray}/\u{1b}[0m{file}libtiny.dylib"
+                "{gray}/System/Library/Frameworks/\u{1b}[0m{file}AppKit.framework\u{1b}[0m{gray}/Versions/C/AppKit"
             )),
             "{out}"
         );
         assert!(
             out.contains(&format!(
-                "{token}@loader_path\u{1b}[0m{gray}/../\u{1b}[0m{file}lib"
+                "{gray}@executable_path/../Frameworks/\u{1b}[0m{file}AgUI.framework\u{1b}[0m{gray}/Versions/A/AgUI"
             )),
             "{out}"
         );
+        assert!(!out.contains("\u{1b}[1;38;2;190;149;255m"), "{out}");
         assert!(
             out.contains(&format!(
                 "{gray}\"\u{1b}[0m{gray}C:\\\\Windows\\\\System32\\\\\u{1b}[0m{file}kernel32.dll\u{1b}[0m{gray}\""

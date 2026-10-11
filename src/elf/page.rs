@@ -679,14 +679,13 @@ mod tests {
         );
         assert_eq!(hash_at(&text, "type:"), hash_at(&text, "  class:"));
         assert_eq!(hash_at(&text, "sizes:"), hash_at(&text, "  e_ehsize:"));
-        let column = hash_at(&text, "  class:");
         let ident = text
             .lines()
             .position(|line| line.starts_with("  e_ident:"))
             .unwrap();
-        let ident_note = text.lines().nth(ident + 1).unwrap();
-        assert!(!text.lines().nth(ident).unwrap().contains('#'), "{text}");
-        assert_eq!(ident_note.find('#'), Some(column), "{ident_note}");
+        let ident_line = text.lines().nth(ident).unwrap();
+        assert!(ident_line.contains('#'), "{ident_line}");
+        assert!(ident_line.contains("16 bytes. Magic[4]"), "{ident_line}");
         assert!(!text.contains('\u{1b}'), "{text}");
     }
 
@@ -733,7 +732,7 @@ mod tests {
             text.contains("\u{1b}[38;2;37;190;106m[127, 69, 76, 70"),
             "{text}"
         );
-        assert!(text.contains("38;2;182;184;187m# "), "{text}");
+        assert!(text.contains("38;2;157;200;230m# "), "{text}");
         assert!(text.contains("\u{1b}[38;2;123;124;126msections"), "{text}");
         assert!(!text.contains("\u{1b}[2m"), "{text}");
     }
