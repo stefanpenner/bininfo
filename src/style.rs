@@ -67,12 +67,43 @@ pub fn raw_field(
     );
 }
 
+/// Header hex. Digits are `A` through `F`, as in `0xCAFEBABE`.
+pub fn hex(value: u64) -> String {
+    format!("0x{value:X}")
+}
+
 pub fn yaml_list(names: &[String]) -> String {
     if names.is_empty() {
         return "[]".to_string();
     }
     let items: Vec<String> = names.iter().map(|name| show(name)).collect();
     format!("[{}]", items.join(", "))
+}
+
+// The note stays on the key line. A long flow value would push it down.
+pub fn list_field(
+    out: &mut String,
+    color: bool,
+    indent: usize,
+    key: &str,
+    names: &[String],
+    note: &str,
+    fg: Rgb,
+    bold: bool,
+) {
+    if names.is_empty() {
+        raw_field(out, color, indent, key, "[]", note, fg, bold);
+        return;
+    }
+    let gap = " ".repeat(indent);
+    let painted = paint(color, &format!("{key}:"), LABEL, false);
+    let plain = indent + key.len() + 1;
+    align_note(out, color, &format!("{gap}{painted}"), plain, note);
+    let item_gap = " ".repeat(indent + 2);
+    for name in names {
+        let shown = paint(color, &yaml_scalar(name), fg, bold);
+        let _ = writeln!(out, "{item_gap}- {shown}");
+    }
 }
 
 pub fn kind_tone(kind: Kind) -> (Rgb, bool) {
@@ -99,6 +130,14 @@ pub fn word_tone(name: Option<&str>, fg: Rgb, bold: bool) -> (Rgb, bool) {
         (LABEL, false)
     } else {
         (fg, bold)
+    }
+}
+
+// None stays "null". Do not append the raw number.
+pub fn named(word: Option<&str>, raw: u64) -> String {
+    match word {
+        Some(word) => format!("{word} ({raw})"),
+        None => "null".to_string(),
     }
 }
 
@@ -141,6 +180,24 @@ pub(crate) fn align_note(out: &mut String, color: bool, prefix: &str, plain: usi
     }
     let pad = " ".repeat(COLUMN + 2);
     let _ = writeln!(out, "{prefix}\n{pad}{note}");
+}
+
+pub(crate) fn yaml_scalar(value: &str) -> String {
+    if !value.chars().any(|c| matches!(c, ':' | '#' | '\n' | '"')) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn show(value: &str) -> String {
@@ -201,6 +258,19 @@ impl Json {
         self.out.push(']');
     }
 
+    pub fn raw_array(&mut self, key: &str, values: &[String]) {
+        self.comma();
+        self.out.push_str(&json_str(key));
+        self.out.push_str(":[");
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                self.out.push(',');
+            }
+            self.out.push_str(value);
+        }
+        self.out.push(']');
+    }
+
     pub fn strings(&mut self, key: &str, values: &[String]) {
         self.comma();
         self.out.push_str(&json_str(key));
@@ -212,6 +282,13 @@ impl Json {
             self.out.push_str(&json_str(value));
         }
         self.out.push(']');
+    }
+
+    pub fn raw(&mut self, key: &str, value: &str) {
+        self.comma();
+        self.out.push_str(&json_str(key));
+        self.out.push(':');
+        self.out.push_str(value);
     }
 
     pub fn flag(&mut self, key: &str, value: bool) {
@@ -247,9 +324,11 @@ impl Json {
         kind: &str,
         interp: Option<&str>,
         needed: &[String],
+        runpath: &[String],
+        rpath: &[String],
+        delay: &[String],
+        dlopen: Option<bool>,
         pie: bool,
-        hermetic: bool,
-        says: &str,
     ) {
         self.comma();
         self.out.push_str("\"load\":{\"kind\":");
@@ -260,19 +339,27 @@ impl Json {
             None => self.out.push_str("null"),
         }
         self.out.push_str(",\"needed\":[");
-        for (index, name) in needed.iter().enumerate() {
-            if index > 0 {
-                self.out.push(',');
-            }
-            self.out.push_str(&json_str(name));
+        append_strings(&mut self.out, needed);
+        self.out.push_str("],\"runpath\":[");
+        append_strings(&mut self.out, runpath);
+        self.out.push_str("],\"rpath\":[");
+        append_strings(&mut self.out, rpath);
+        self.out.push_str("],\"delay\":[");
+        append_strings(&mut self.out, delay);
+        self.out.push_str("],\"dlopen\":");
+        match dlopen {
+            Some(true) => self.out.push_str("true"),
+            Some(false) => self.out.push_str("false"),
+            None => self.out.push_str("null"),
         }
-        self.out.push_str("],\"pie\":");
+        self.out.push_str(",\"pie\":");
         self.out.push_str(if pie { "true" } else { "false" });
-        self.out.push_str(",\"hermetic\":");
-        self.out.push_str(if hermetic { "true" } else { "false" });
-        self.out.push_str(",\"says\":");
-        self.out.push_str(&json_str(says));
         self.out.push('}');
+    }
+
+    pub fn finish_inline(mut self) -> String {
+        self.out.push('}');
+        self.out
     }
 
     pub fn finish(mut self) -> String {
@@ -291,6 +378,14 @@ impl Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_uses_uppercase_digits() {
+        assert_eq!(hex(0xcafe_babe), "0xCAFEBABE");
+        assert_eq!(hex(0xfeed_facf), "0xFEEDFACF");
+        assert_eq!(hex(0), "0x0");
+        assert_eq!(hex(0x1000), "0x1000");
+    }
 
     #[test]
     fn notes_share_one_column() {
@@ -319,6 +414,90 @@ mod tests {
         let second = lines.next().unwrap();
         assert!(!first.contains('#'), "{first}");
         assert_eq!(second.find('#'), Some(COLUMN + 2), "{second}");
+    }
+
+    #[test]
+    fn an_empty_list_stays_on_one_line() {
+        let mut out = String::new();
+        list_field(
+            &mut out,
+            false,
+            2,
+            "needed",
+            &[],
+            "Library names the loader opens.",
+            LABEL,
+            false,
+        );
+        let line = out.lines().next().unwrap();
+        assert!(line.contains("needed: []"), "{out}");
+        assert_eq!(line.find('#'), Some(COLUMN + 2), "{line}");
+        assert_eq!(out.lines().count(), 1, "{out}");
+    }
+
+    #[test]
+    fn a_list_of_names_is_a_block_in_vec_order() {
+        let names = vec![
+            "@rpath/libsherpa-onnx-c-api.dylib".into(),
+            "/usr/lib/libSystem.B.dylib".into(),
+        ];
+        let mut out = String::new();
+        list_field(
+            &mut out,
+            false,
+            2,
+            "needed",
+            &names,
+            "Library names the loader opens.",
+            WHITE,
+            false,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].starts_with("  needed:"), "{out}");
+        assert!(!lines[0].contains('['), "{out}");
+        assert_eq!(lines[0].find('#'), Some(COLUMN + 2), "{}", lines[0]);
+        assert_eq!(lines[1], "    - @rpath/libsherpa-onnx-c-api.dylib");
+        assert_eq!(lines[2], "    - /usr/lib/libSystem.B.dylib");
+    }
+
+    #[test]
+    fn a_list_quotes_only_a_broken_scalar() {
+        let names = vec![
+            "a:b".into(),
+            "a#b".into(),
+            "a\"b".into(),
+            "a\nb".into(),
+            "a\\b".into(),
+            "@rpath/ok.dylib".into(),
+        ];
+        let mut out = String::new();
+        list_field(
+            &mut out,
+            false,
+            2,
+            "needed",
+            &names,
+            "Library names the loader opens.",
+            WHITE,
+            false,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[1], "    - \"a:b\"");
+        assert_eq!(lines[2], "    - \"a#b\"");
+        assert_eq!(lines[3], "    - \"a\\\"b\"");
+        assert_eq!(lines[4], "    - \"a\\nb\"");
+        assert_eq!(lines[5], "    - a\\b");
+        assert_eq!(lines[6], "    - @rpath/ok.dylib");
+    }
+}
+
+fn append_strings(out: &mut String, items: &[String]) {
+    for (index, name) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_str(name));
     }
 }
 

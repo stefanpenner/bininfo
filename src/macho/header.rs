@@ -71,7 +71,7 @@ pub struct Arch {
     pub size: u64,   // Byte size of that Mach-O.
 }
 
-/// A fat wrapper. This page does not open a slice.
+/// A fat wrapper. Each slice opens on its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fat {
     pub class: Class,

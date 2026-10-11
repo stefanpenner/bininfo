@@ -4,11 +4,23 @@
 
 use super::header::{Class, Data, Header, Type};
 use super::load::{self, Load};
+use super::symbols::Symbols;
 use super::words::{class_name, data_name, machine_name, osabi_name, type_name};
 use crate::claim;
 use crate::style;
+use std::fmt::Write;
 
 pub fn render(file: &str, header: &Header, load: &Load, color: bool) -> String {
+    render_with(file, header, load, &Symbols::empty(), color)
+}
+
+pub fn render_with(
+    file: &str,
+    header: &Header,
+    load: &Load,
+    symbols: &Symbols,
+    color: bool,
+) -> String {
     let wide = match header.class {
         Class::Elf32 => "4 bytes.",
         Class::Elf64 => "8 bytes.",
@@ -42,10 +54,17 @@ pub fn render(file: &str, header: &Header, load: &Load, color: bool) -> String {
     load_rung(&mut out, load, color);
 
     style::blank(&mut out);
+    write_symbols(&mut out, symbols, color);
+    if symbols.has_abi() {
+        style::blank(&mut out);
+        write_abi(&mut out, symbols, color);
+    }
+
+    style::blank(&mut out);
     size_rung(&mut out, header, color);
 
     style::blank(&mut out);
-    where_rung(&mut out, header, wide, color);
+    where_rung(&mut out, header, symbols, wide, color);
 
     style::blank(&mut out);
     section_rung(&mut out, header, wide, color);
@@ -107,13 +126,14 @@ fn type_rung(out: &mut String, header: &Header, color: bool) {
         false,
     );
     let osabi = osabi_name(header.os_abi);
+    let osabi_text = style::named(osabi, u64::from(header.os_abi));
     let (fg, bold) = style::word_tone(osabi, style::WHITE, false);
     style::field(
         out,
         color,
         2,
         "osabi_name",
-        osabi.unwrap_or("null"),
+        &osabi_text,
         "Word for the osabi number.",
         fg,
         bold,
@@ -135,7 +155,7 @@ fn type_rung(out: &mut String, header: &Header, color: bool) {
         2,
         "e_type",
         &type_name(header.kind),
-        "2 bytes. The kernel runs EXEC and DYN.",
+        "2 bytes. NONE, REL, EXEC, DYN, or CORE. The kernel runs EXEC and DYN.",
         fg,
         bold,
     );
@@ -150,13 +170,14 @@ fn type_rung(out: &mut String, header: &Header, color: bool) {
         true,
     );
     let machine = machine_name(header.machine);
+    let machine_text = style::named(machine, u64::from(header.machine));
     let (fg, bold) = style::word_tone(machine, style::BLUE, true);
     style::field(
         out,
         color,
         2,
         "e_machine_name",
-        machine.unwrap_or("null"),
+        &machine_text,
         "Word for the CPU number.",
         fg,
         bold,
@@ -177,7 +198,7 @@ fn type_rung(out: &mut String, header: &Header, color: bool) {
         color,
         2,
         "e_flags",
-        &format!("0x{:x}", header.flags),
+        &style::hex(u64::from(header.flags)),
         "4 bytes. CPU flags. Often 0.",
         fg,
         bold,
@@ -220,13 +241,13 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
         fg,
         bold,
     );
-    style::raw_field(
+    style::list_field(
         out,
         color,
         2,
         "needed",
-        &style::yaml_list(&load.needed),
-        "Library names the loader opens.",
+        &load.needed,
+        claim::needed_note("elf"),
         if load.needed.is_empty() {
             style::LABEL
         } else {
@@ -234,6 +255,9 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
         },
         false,
     );
+    claim::write_search(out, color, 2, "elf", &load.runpath, &load.rpath);
+    claim::write_delay(out, color, 2, "elf", &load.delay);
+    claim::write_dlopen(out, color, 2, "elf", &load.needed);
     style::field(
         out,
         color,
@@ -244,7 +268,6 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
         if load.pie { style::GREEN } else { style::LABEL },
         load.pie,
     );
-    claim::write_tail(out, color, load.kind, load.interp.as_deref(), &load.needed);
 }
 
 fn size_rung(out: &mut String, header: &Header, color: bool) {
@@ -290,7 +313,7 @@ fn size_rung(out: &mut String, header: &Header, color: bool) {
     );
 }
 
-fn where_rung(out: &mut String, header: &Header, wide: &str, color: bool) {
+fn where_rung(out: &mut String, header: &Header, symbols: &Symbols, wide: &str, color: bool) {
     style::rung(
         out,
         color,
@@ -305,8 +328,20 @@ fn where_rung(out: &mut String, header: &Header, wide: &str, color: bool) {
         color,
         2,
         "e_entry",
-        &format!("0x{:x}", header.entry),
+        &style::hex(header.entry),
         &format!("{wide} Assumed address of the first instruction."),
+        fg,
+        bold,
+    );
+    let shown = symbols.entry_name.as_deref().unwrap_or("null");
+    let (fg, bold) = style::word_tone(symbols.entry_name.as_deref(), style::FG, true);
+    style::field(
+        out,
+        color,
+        2,
+        "entry_name",
+        shown,
+        symbols.entry_note,
         fg,
         bold,
     );
@@ -375,6 +410,137 @@ fn section_rung(out: &mut String, header: &Header, wide: &str, color: bool) {
     );
 }
 
+fn write_symbols(out: &mut String, symbols: &Symbols, color: bool) {
+    style::rung(
+        out,
+        color,
+        "symbols",
+        "Counts from the dynamic symbol table.",
+        style::FG,
+        true,
+    );
+    let undef_note = "[SHT_DYNSYM] Undefined symbols. The loader binds these.";
+    if symbols.rows {
+        if symbols.undef_rows.is_empty() {
+            style::field(
+                out,
+                color,
+                2,
+                "undef",
+                "[]",
+                undef_note,
+                style::LABEL,
+                false,
+            );
+        } else {
+            key_line(out, color, 2, "undef", undef_note);
+            for row in &symbols.undef_rows {
+                let _ = writeln!(out, "    - name: {}", style::yaml_scalar(&row.name));
+                let version = row.version.as_deref().unwrap_or("null");
+                let _ = writeln!(out, "      version: {}", style::yaml_scalar(version));
+                let _ = writeln!(out, "      binding: {}", row.binding);
+            }
+        }
+    } else {
+        let (fg, bold) = style::number_tone(u64::from(symbols.undef), style::WHITE, false);
+        style::field(
+            out,
+            color,
+            2,
+            "undef",
+            &symbols.undef.to_string(),
+            undef_note,
+            fg,
+            bold,
+        );
+    }
+    let (fg, bold) = style::number_tone(u64::from(symbols.defined), style::WHITE, false);
+    style::field(
+        out,
+        color,
+        2,
+        "defined",
+        &symbols.defined.to_string(),
+        "[SHT_DYNSYM] Defined symbols that are not local.",
+        fg,
+        bold,
+    );
+    if !symbols.verneed.is_empty() {
+        key_line(
+            out,
+            color,
+            2,
+            "verneed",
+            "[DT_VERNEED] Version nodes this file requires.",
+        );
+        for need in &symbols.verneed {
+            let _ = writeln!(out, "    - file: {}", style::yaml_scalar(&need.file));
+            let _ = writeln!(out, "      need: {}", style::yaml_scalar(&need.need));
+        }
+    }
+    let symtab_note = if symbols.symtab {
+        ".symtab is present. The loader does not read it."
+    } else {
+        ".symtab is absent. The loader does not read it."
+    };
+    style::field(
+        out,
+        color,
+        2,
+        "symtab",
+        if symbols.symtab { "true" } else { "false" },
+        symtab_note,
+        if symbols.symtab {
+            style::WHITE
+        } else {
+            style::LABEL
+        },
+        false,
+    );
+}
+
+fn write_abi(out: &mut String, symbols: &Symbols, color: bool) {
+    style::rung(
+        out,
+        color,
+        "abi",
+        "GNU notes in this file.",
+        style::FG,
+        true,
+    );
+    if let Some(tag) = symbols.abi_tag {
+        style::field(
+            out,
+            color,
+            2,
+            "tag",
+            &tag.text(),
+            "[NT_GNU_ABI_TAG]",
+            style::WHITE,
+            false,
+        );
+    }
+    if !symbols.property.is_empty() {
+        style::list_field(
+            out,
+            color,
+            2,
+            "property",
+            &symbols.property,
+            "[.note.gnu.property]",
+            style::WHITE,
+            false,
+        );
+    }
+}
+
+fn key_line(out: &mut String, color: bool, indent: usize, key: &str, note: &str) {
+    let gap = " ".repeat(indent);
+    let painted = style::paint(color, &format!("{key}:"), style::LABEL, false);
+    let plain = indent + key.len() + 1;
+    style::align_note(out, color, &format!("{gap}{painted}"), plain, note);
+}
+
 fn ident_field(out: &mut String, header: &Header, color: bool) {
     let shown = ident_text(&header.ident);
     let split = magic_end(&shown);
@@ -387,7 +553,7 @@ fn ident_field(out: &mut String, header: &Header, color: bool) {
         color,
         &format!("  {key} {magic}{rest}"),
         plain,
-        "16 bytes. Magic, class, and byte order.",
+        "16 bytes. Magic[4] Class[1] Data[1] Version[1] OSABI[1] ABI[1] Pad[7].",
     );
 }
 
@@ -438,6 +604,9 @@ mod tests {
             kind: Kind::Static,
             interp: None,
             needed: Vec::new(),
+            runpath: Vec::new(),
+            rpath: Vec::new(),
+            delay: Vec::new(),
             pie: false,
         }
     }
@@ -474,16 +643,23 @@ mod tests {
         assert!(text.contains("# Rung 1. Magic, word size, byte order, CPU, and file type."));
         assert!(text.contains("# Rung 2. Size of this header and size of one program header."));
         assert!(text.contains("e_type: EXEC"), "{text}");
+        assert!(text.contains("e_machine_name: x86-64 (62)"), "{text}");
+        assert!(text.contains("osabi_name: System V (0)"), "{text}");
         assert!(text.lines().any(|line| line.starts_with("load:")), "{text}");
         assert!(text.contains("format: elf"), "{text}");
         assert!(text.contains("kind: static"), "{text}");
         assert!(text.contains("needed: []"), "{text}");
-        assert!(text.contains("pie: false"), "{text}");
-        assert!(text.contains("hermetic: true"), "{text}");
         assert!(
-            text.contains("says: This program starts itself and names no other file."),
+            text.contains("[DT_RUNPATH] Directories the loader searches."),
             "{text}"
         );
+        assert!(
+            text.contains("[DT_RPATH] Old search directories."),
+            "{text}"
+        );
+        assert!(text.contains("pie: false"), "{text}");
+        assert!(!text.contains("hermetic:"), "{text}");
+        assert!(!text.contains("says:"), "{text}");
         assert!(text.contains("e_entry: 0x1000"), "{text}");
         assert!(
             text.contains("# 8 bytes. Assumed address of the first instruction."),
@@ -499,12 +675,6 @@ mod tests {
         let ident_note = text.lines().nth(ident + 1).unwrap();
         assert!(!text.lines().nth(ident).unwrap().contains('#'), "{text}");
         assert_eq!(ident_note.find('#'), Some(column), "{ident_note}");
-        let says = text
-            .lines()
-            .position(|line| line.starts_with("  says:"))
-            .unwrap();
-        let says_note = text.lines().nth(says + 1).unwrap();
-        assert_eq!(says_note.find('#'), Some(column), "{says_note}");
         assert!(!text.contains('\u{1b}'), "{text}");
     }
 
@@ -531,6 +701,7 @@ mod tests {
         let text = render("a#b", &header, &still(), false);
         assert!(text.contains("data: big-endian"), "{text}");
         assert!(text.contains("e_machine_name: null"), "{text}");
+        assert!(!text.contains("e_machine_name: null ("), "{text}");
         assert!(text.contains("file: \"a#b\""), "{text}");
         assert!(text.contains("# Path of this file."), "{text}");
     }
@@ -553,5 +724,104 @@ mod tests {
         assert!(text.contains("38;2;182;184;187m# "), "{text}");
         assert!(text.contains("\u{1b}[38;2;123;124;126msections"), "{text}");
         assert!(!text.contains("\u{1b}[2m"), "{text}");
+    }
+
+    #[test]
+    fn needed_names_are_a_block_list_in_file_order() {
+        let mut load = still();
+        load.needed = vec!["libz.so".into(), "liba:b.so".into()];
+        let text = render("dyn", &sample(Class::Elf64, Type::Dyn), &load, false);
+        assert!(!text.contains("needed: ["), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("  needed:"))
+            .unwrap();
+        assert_eq!(
+            lines[at].find('#'),
+            Some(style::COLUMN + 2),
+            "{}",
+            lines[at]
+        );
+        assert!(
+            lines[at].contains("[DT_NEEDED] Library names the loader opens."),
+            "{}",
+            lines[at]
+        );
+        assert_eq!(lines[at + 1], "    - libz.so");
+        assert_eq!(lines[at + 2], "    - \"liba:b.so\"");
+        assert!(
+            lines[at + 3].starts_with("  runpath: []"),
+            "{}",
+            lines[at + 3]
+        );
+        assert!(
+            lines[at + 4].starts_with("  rpath: []"),
+            "{}",
+            lines[at + 4]
+        );
+        assert!(
+            lines[at + 5].starts_with("  delay: []"),
+            "{}",
+            lines[at + 5]
+        );
+        assert!(
+            lines[at + 6].starts_with("  dlopen: false"),
+            "{}",
+            lines[at + 6]
+        );
+        assert!(lines[at + 7].starts_with("  pie:"), "{}", lines[at + 7]);
+    }
+
+    #[test]
+    fn search_paths_are_block_lists_in_file_order() {
+        let mut load = still();
+        load.runpath = vec!["$ORIGIN/../lib".into(), "/opt/lib".into()];
+        load.rpath = vec!["/old".into()];
+        let text = render("dyn", &sample(Class::Elf64, Type::Dyn), &load, false);
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("  runpath:"))
+            .unwrap();
+        assert!(
+            lines[at].contains("[DT_RUNPATH] Directories the loader searches."),
+            "{}",
+            lines[at]
+        );
+        assert_eq!(lines[at + 1], "    - $ORIGIN/../lib");
+        assert_eq!(lines[at + 2], "    - /opt/lib");
+        assert!(
+            lines[at + 3].contains("[DT_RPATH] Old search directories."),
+            "{}",
+            lines[at + 3]
+        );
+        assert_eq!(lines[at + 4], "    - /old");
+        assert!(
+            lines[at + 5].starts_with("  delay: []"),
+            "{}",
+            lines[at + 5]
+        );
+        assert!(
+            lines[at + 6].starts_with("  dlopen: false"),
+            "{}",
+            lines[at + 6]
+        );
+        assert!(lines[at + 7].starts_with("  pie:"), "{}", lines[at + 7]);
+    }
+
+    #[test]
+    fn libdl_marks_dlopen() {
+        let mut load = still();
+        load.needed = vec!["/lib/libdl.so.2".into()];
+        let text = render("dyn", &sample(Class::Elf64, Type::Dyn), &load, false);
+        assert!(text.contains("dlopen: true"), "{text}");
+        assert!(
+            text.contains("[DT_NEEDED] A libdl soname is present. This file can call dlopen. The call names the library later."),
+            "{text}"
+        );
+        load.needed = vec!["libc.so.6".into()];
+        let plain = render("dyn", &sample(Class::Elf64, Type::Dyn), &load, false);
+        assert!(plain.contains("dlopen: false"), "{plain}");
     }
 }

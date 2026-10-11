@@ -4,4 +4,5 @@ pub mod header;
 pub mod json;
 pub mod load;
 pub mod page;
+pub(crate) mod symbols;
 mod words;

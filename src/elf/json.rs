@@ -3,11 +3,16 @@
 
 use super::header::Header;
 use super::load::Load;
+use super::symbols::Symbols;
 use super::words::{class_name, data_name, machine_name, osabi_name, type_name};
 use crate::claim;
 use crate::style::Json;
 
 pub fn render(file: &str, header: &Header, load: &Load) -> String {
+    render_with(file, header, load, &Symbols::empty())
+}
+
+pub fn render_with(file: &str, header: &Header, load: &Load, symbols: &Symbols) -> String {
     let mut out = Json::new();
     out.str("file", file);
     out.str("format", "elf");
@@ -23,6 +28,7 @@ pub fn render(file: &str, header: &Header, load: &Load) -> String {
     out.opt("e_machine_name", machine_name(header.machine));
     out.u64("e_version", header.version as u64);
     out.u64("e_entry", header.entry);
+    out.opt("entry_name", symbols.entry_name.as_deref());
     out.u64("e_phoff", header.phoff);
     out.u64("e_shoff", header.shoff);
     out.u64("e_flags", header.flags as u64);
@@ -37,9 +43,64 @@ pub fn render(file: &str, header: &Header, load: &Load) -> String {
         load.kind,
         load.interp.as_deref(),
         &load.needed,
+        &load.runpath,
+        &load.rpath,
+        &load.delay,
+        "elf",
         load.pie,
     );
+    out.raw("symbols", &symbols_json(symbols));
+    if symbols.has_abi() {
+        out.raw("abi", &abi_json(symbols));
+    }
     out.finish()
+}
+
+fn symbols_json(symbols: &Symbols) -> String {
+    let mut out = Json::new();
+    if symbols.rows {
+        let rows: Vec<String> = symbols
+            .undef_rows
+            .iter()
+            .map(|row| {
+                let mut one = Json::new();
+                one.str("name", &row.name);
+                one.opt("version", row.version.as_deref());
+                one.str("binding", row.binding);
+                one.finish_inline()
+            })
+            .collect();
+        out.raw_array("undef", &rows);
+    } else {
+        out.u64("undef", u64::from(symbols.undef));
+    }
+    out.u64("defined", u64::from(symbols.defined));
+    if !symbols.verneed.is_empty() {
+        let rows: Vec<String> = symbols
+            .verneed
+            .iter()
+            .map(|need| {
+                let mut one = Json::new();
+                one.str("file", &need.file);
+                one.str("need", &need.need);
+                one.finish_inline()
+            })
+            .collect();
+        out.raw_array("verneed", &rows);
+    }
+    out.flag("symtab", symbols.symtab);
+    out.finish_inline()
+}
+
+fn abi_json(symbols: &Symbols) -> String {
+    let mut out = Json::new();
+    if let Some(tag) = symbols.abi_tag {
+        out.str("tag", &tag.text());
+    }
+    if !symbols.property.is_empty() {
+        out.strings("property", &symbols.property);
+    }
+    out.finish_inline()
 }
 
 #[cfg(test)]
@@ -53,6 +114,9 @@ mod tests {
             kind: Kind::Static,
             interp: None,
             needed: Vec::new(),
+            runpath: Vec::new(),
+            rpath: Vec::new(),
+            delay: Vec::new(),
             pie: false,
         }
     }
@@ -66,10 +130,11 @@ mod tests {
                 r#"{"file":"exec-x86-64","format":"elf","e_ident":[127,69,76,70,2,1,1,0,0,0,0,0,0,0,0,0],"#,
                 r#""class":"ELF64","data":"little-endian","ei_version":1,"osabi":0,"#,
                 r#""osabi_name":"System V","abi_version":0,"e_type":"EXEC","e_machine":62,"#,
-                r#""e_machine_name":"x86-64","e_version":1,"e_entry":4096,"e_phoff":64,"#,
+                r#""e_machine_name":"x86-64","e_version":1,"e_entry":4096,"entry_name":null,"e_phoff":64,"#,
                 r#""e_shoff":0,"e_flags":0,"e_ehsize":64,"e_phentsize":56,"e_phnum":1,"#,
                 r#""e_shentsize":0,"e_shnum":0,"e_shstrndx":0,"#,
-                r#""load":{"kind":"static","interp":null,"needed":[],"pie":false,"hermetic":true,"says":"This program starts itself and names no other file."}}"#,
+                r#""load":{"kind":"static","interp":null,"needed":[],"runpath":[],"rpath":[],"delay":[],"dlopen":false,"pie":false},"#,
+                r#""symbols":{"undef":0,"defined":0,"symtab":false}}"#,
                 "\n"
             )
         );

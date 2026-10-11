@@ -11,6 +11,8 @@ const PT_INTERP: u32 = 3;
 const DT_NULL: u64 = 0;
 const DT_NEEDED: u64 = 1;
 const DT_STRTAB: u64 = 5;
+const DT_RPATH: u64 = 15;
+const DT_RUNPATH: u64 = 29;
 const DT_FLAGS_1: u64 = 0x6fff_fffb;
 const DF_1_PIE: u64 = 0x0800_0000;
 const NAME_CAP: usize = 4096;
@@ -21,21 +23,27 @@ pub struct Load {
     pub kind: Kind,             // static, dynamic-pie, static-pie, or shared.
     pub interp: Option<String>, // Path of the loader. None means this file starts itself.
     pub needed: Vec<String>,    // Library names the loader opens.
+    pub runpath: Vec<String>,   // DT_RUNPATH directories. A colon splits one string.
+    pub rpath: Vec<String>,     // DT_RPATH directories. A colon splits one string.
+    pub delay: Vec<String>,     // Always empty. ELF has no delay-import record.
     pub pie: bool,              // PIE bit in DT_FLAGS_1.
 }
 
 pub fn read(bytes: &[u8], header: &Header) -> Load {
     let rows = program_headers(bytes, header);
     let interp = rows.iter().find_map(|row| interp_path(bytes, row));
-    let (pie, needed) = rows
+    let (pie, needed, runpath, rpath) = rows
         .iter()
         .find(|row| row.ty == PT_DYNAMIC)
         .map(|row| dynamic_facts(bytes, header, &rows, row))
-        .unwrap_or((false, Vec::new()));
+        .unwrap_or((false, Vec::new(), Vec::new(), Vec::new()));
     Load {
         kind: classify(header.kind, interp.is_some(), pie),
         interp,
         needed,
+        runpath,
+        rpath,
+        delay: Vec::new(),
         pie,
     }
 }
@@ -64,14 +72,15 @@ fn classify(ty: Type, interp: bool, pie: bool) -> Kind {
     }
 }
 
-struct Phdr {
-    ty: u32,
-    offset: u64,
-    vaddr: u64,
-    filesz: u64,
+pub(crate) struct Phdr {
+    pub(crate) ty: u32,
+    pub(crate) offset: u64,
+    pub(crate) vaddr: u64,
+    pub(crate) filesz: u64,
+    pub(crate) align: u64,
 }
 
-fn program_headers(bytes: &[u8], header: &Header) -> Vec<Phdr> {
+pub(crate) fn program_headers(bytes: &[u8], header: &Header) -> Vec<Phdr> {
     let need = match header.class {
         Class::Elf32 => 32,
         Class::Elf64 => 56,
@@ -105,12 +114,14 @@ fn decode_phdr(bytes: &[u8], at: usize, header: &Header) -> Phdr {
             offset: u64_at(bytes, at + 8, header.data),
             vaddr: u64_at(bytes, at + 16, header.data),
             filesz: u64_at(bytes, at + 32, header.data),
+            align: u64_at(bytes, at + 48, header.data),
         },
         Class::Elf32 => Phdr {
             ty: u32_at(bytes, at, header.data),
             offset: u32_at(bytes, at + 4, header.data) as u64,
             vaddr: u32_at(bytes, at + 8, header.data) as u64,
             filesz: u32_at(bytes, at + 16, header.data) as u64,
+            align: u32_at(bytes, at + 28, header.data) as u64,
         },
     }
 }
@@ -122,33 +133,61 @@ fn interp_path(bytes: &[u8], row: &Phdr) -> Option<String> {
     Some(read_text(bytes, row.offset, row.filesz))
 }
 
-fn dynamic_facts(bytes: &[u8], header: &Header, rows: &[Phdr], row: &Phdr) -> (bool, Vec<String>) {
+fn dynamic_facts(
+    bytes: &[u8],
+    header: &Header,
+    rows: &[Phdr],
+    row: &Phdr,
+) -> (bool, Vec<String>, Vec<String>, Vec<String>) {
     let mut strtab = None;
     let mut flags1 = 0u64;
     let mut needed_at = Vec::new();
+    let mut runpath_at = Vec::new();
+    let mut rpath_at = Vec::new();
     for (tag, val) in dyn_pairs(bytes, header, row) {
         match tag {
             DT_NULL => break,
             DT_STRTAB => strtab = Some(val),
             DT_FLAGS_1 => flags1 = val,
             DT_NEEDED => needed_at.push(val),
+            DT_RUNPATH => runpath_at.push(val),
+            DT_RPATH => rpath_at.push(val),
             _ => {}
         }
     }
     let pie = flags1 & DF_1_PIE != 0;
     let Some(base) = strtab.and_then(|vaddr| vaddr_to_offset(rows, vaddr)) else {
-        return (pie, Vec::new());
+        return (pie, Vec::new(), Vec::new(), Vec::new());
     };
-    let needed = needed_at
-        .into_iter()
-        .filter_map(|off| base.checked_add(off))
-        .map(|at| read_text(bytes, at, NAME_CAP as u64))
-        .filter(|name| !name.is_empty())
-        .collect();
-    (pie, needed)
+    (
+        pie,
+        names_at(bytes, base, &needed_at),
+        split_dirs(names_at(bytes, base, &runpath_at)),
+        split_dirs(names_at(bytes, base, &rpath_at)),
+    )
 }
 
-fn dyn_pairs(bytes: &[u8], header: &Header, row: &Phdr) -> Vec<(u64, u64)> {
+fn names_at(bytes: &[u8], base: u64, offs: &[u64]) -> Vec<String> {
+    offs.iter()
+        .filter_map(|off| base.checked_add(*off))
+        .map(|at| read_text(bytes, at, NAME_CAP as u64))
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn split_dirs(raws: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in raws {
+        for part in raw.split(':') {
+            if !part.is_empty() {
+                out.push(part.to_string());
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn dyn_pairs(bytes: &[u8], header: &Header, row: &Phdr) -> Vec<(u64, u64)> {
     let step = match header.class {
         Class::Elf32 => 8,
         Class::Elf64 => 16,
@@ -183,7 +222,7 @@ fn dyn_pairs(bytes: &[u8], header: &Header, row: &Phdr) -> Vec<(u64, u64)> {
     pairs
 }
 
-fn vaddr_to_offset(rows: &[Phdr], vaddr: u64) -> Option<u64> {
+pub(crate) fn vaddr_to_offset(rows: &[Phdr], vaddr: u64) -> Option<u64> {
     rows.iter().find_map(|row| {
         if row.ty != PT_LOAD || vaddr < row.vaddr {
             return None;
@@ -197,7 +236,7 @@ fn vaddr_to_offset(rows: &[Phdr], vaddr: u64) -> Option<u64> {
     })
 }
 
-fn read_text(bytes: &[u8], offset: u64, limit: u64) -> String {
+pub(crate) fn read_text(bytes: &[u8], offset: u64, limit: u64) -> String {
     let Ok(start) = usize::try_from(offset) else {
         return String::new();
     };
@@ -266,6 +305,8 @@ mod tests {
         assert_eq!(load.kind, Kind::Static);
         assert_eq!(load.interp, None);
         assert!(load.needed.is_empty());
+        assert!(load.runpath.is_empty());
+        assert!(load.rpath.is_empty());
         assert!(!load.pie);
     }
 
@@ -300,6 +341,24 @@ mod tests {
     }
 
     #[test]
+    fn search_paths_keep_tag_order_and_split_on_colon() {
+        let bytes = elf_with_dynamic_endian(
+            Data::Little,
+            Type::Dyn,
+            0,
+            Some("/lib/ld.so"),
+            &["libc.so.6"],
+            Some("$ORIGIN/../lib:/opt/lib"),
+            Some("/old"),
+        );
+        let header = header::parse(&bytes).unwrap();
+        let load = read(&bytes, &header);
+        assert_eq!(load.needed, ["libc.so.6"]);
+        assert_eq!(load.runpath, ["$ORIGIN/../lib", "/opt/lib"]);
+        assert_eq!(load.rpath, ["/old"]);
+    }
+
+    #[test]
     fn shared_library_has_no_pie_bit() {
         let bytes = elf_with_dynamic(Type::Dyn, 0, None, &[]);
         let header = header::parse(&bytes).unwrap();
@@ -310,7 +369,7 @@ mod tests {
 
     #[test]
     fn big_endian_dynamic_keeps_the_pie_bit() {
-        let bytes = elf_with_dynamic_endian(Data::Big, Type::Dyn, DF_1_PIE, None, &[]);
+        let bytes = elf_with_dynamic_endian(Data::Big, Type::Dyn, DF_1_PIE, None, &[], None, None);
         let header = header::parse(&bytes).unwrap();
         let load = read(&bytes, &header);
         assert_eq!(header.data, Data::Big);
@@ -356,7 +415,7 @@ mod tests {
     }
 
     fn elf_with_dynamic(ty: Type, flags1: u64, interp: Option<&str>, needed: &[&str]) -> Vec<u8> {
-        elf_with_dynamic_endian(Data::Little, ty, flags1, interp, needed)
+        elf_with_dynamic_endian(Data::Little, ty, flags1, interp, needed, None, None)
     }
 
     fn elf_with_dynamic_endian(
@@ -365,12 +424,18 @@ mod tests {
         flags1: u64,
         interp: Option<&str>,
         needed: &[&str],
+        runpath: Option<&str>,
+        rpath: Option<&str>,
     ) -> Vec<u8> {
         let mut names = Vec::new();
+        let mut needed_at = Vec::new();
         for name in needed {
+            needed_at.push(names.len() as u64);
             names.extend(name.as_bytes());
             names.push(0);
         }
+        let run_at = runpath.map(|text| push_name(&mut names, text));
+        let r_at = rpath.map(|text| push_name(&mut names, text));
         if names.is_empty() {
             names.push(0);
         }
@@ -381,7 +446,8 @@ mod tests {
         });
         let phnum: u16 = if interp_bytes.is_some() { 3 } else { 2 };
         let ph_bytes = phnum as usize * 56;
-        let dyn_entries = 3 + needed.len();
+        let extra = run_at.is_some() as usize + r_at.is_some() as usize;
+        let dyn_entries = 3 + needed.len() + extra;
         let dyn_bytes = dyn_entries * 16;
         let header_len = 64;
         let dyn_off = header_len + ph_bytes;
@@ -417,13 +483,16 @@ mod tests {
                 data,
             );
         }
-        let mut name_at = Vec::new();
-        let mut cursor = 0u64;
-        for name in needed {
-            name_at.push(cursor);
-            cursor += name.len() as u64 + 1;
-        }
-        write_dyn_table(&mut bytes, dyn_off, str_off as u64, flags1, &name_at, data);
+        write_dyn_table(
+            &mut bytes,
+            dyn_off,
+            str_off as u64,
+            flags1,
+            &needed_at,
+            run_at,
+            r_at,
+            data,
+        );
         bytes[str_off..str_off + names.len()].copy_from_slice(&names);
         if let Some(text) = interp_bytes {
             bytes[interp_off..interp_off + text.len()].copy_from_slice(&text);
@@ -452,25 +521,44 @@ mod tests {
         put_u64(bytes, at + 32, filesz, data);
     }
 
+    fn push_name(names: &mut Vec<u8>, text: &str) -> u64 {
+        let off = names.len() as u64;
+        names.extend(text.as_bytes());
+        names.push(0);
+        off
+    }
+
     fn write_dyn_table(
         bytes: &mut [u8],
         at: usize,
         strtab: u64,
         flags1: u64,
         needed_at: &[u64],
+        run_at: Option<u64>,
+        r_at: Option<u64>,
         data: Data,
     ) {
         put_u64(bytes, at, DT_STRTAB, data);
         put_u64(bytes, at + 8, strtab, data);
         put_u64(bytes, at + 16, DT_FLAGS_1, data);
         put_u64(bytes, at + 24, flags1, data);
-        for (index, name_at) in needed_at.iter().enumerate() {
-            let slot = at + 32 + index * 16;
+        let mut slot = at + 32;
+        for name_at in needed_at {
             put_u64(bytes, slot, DT_NEEDED, data);
             put_u64(bytes, slot + 8, *name_at, data);
+            slot += 16;
         }
-        let end = at + 32 + needed_at.len() * 16;
-        put_u64(bytes, end, DT_NULL, data);
+        if let Some(name_at) = run_at {
+            put_u64(bytes, slot, DT_RUNPATH, data);
+            put_u64(bytes, slot + 8, name_at, data);
+            slot += 16;
+        }
+        if let Some(name_at) = r_at {
+            put_u64(bytes, slot, DT_RPATH, data);
+            put_u64(bytes, slot + 8, name_at, data);
+            slot += 16;
+        }
+        put_u64(bytes, slot, DT_NULL, data);
     }
 
     fn type_byte(ty: Type) -> u16 {

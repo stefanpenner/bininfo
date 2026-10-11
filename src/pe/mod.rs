@@ -4,4 +4,5 @@ pub mod header;
 pub mod json;
 pub mod load;
 pub mod page;
+pub mod symbols;
 mod words;

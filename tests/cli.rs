@@ -2,7 +2,7 @@ use std::fs;
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_herman"))
+    Command::new(env!("CARGO_BIN_EXE_binvet"))
 }
 
 #[test]
@@ -27,16 +27,16 @@ fn prints_a_header() {
     assert!(text.contains("e_type: EXEC"), "{text}");
     assert!(text.contains("kind: static"), "{text}");
     assert!(text.contains("needed: []"), "{text}");
-    assert!(text.contains("hermetic: true"), "{text}");
-    assert!(
-        text.contains("says: This program starts itself and names no other file."),
-        "{text}"
-    );
+    assert!(!text.contains("hermetic:"), "{text}");
+    assert!(!text.contains("says:"), "{text}");
+    assert!(text.contains("undef: 0"), "{text}");
+    assert!(text.contains("symtab: false"), "{text}");
+    assert!(text.contains("entry_name: null"), "{text}");
     assert!(text.contains("\ntype:"), "{text}");
     assert!(text.contains("\nsizes:"), "{text}");
     assert!(!text.contains('\u{1b}'), "{text}");
     assert!(
-        text.contains("# 2 bytes. The kernel runs EXEC and DYN."),
+        text.contains("# 2 bytes. NONE, REL, EXEC, DYN, or CORE. The kernel runs EXEC and DYN."),
         "{text}"
     );
     assert!(!text.contains(r#""e_type""#), "{text}");
@@ -47,17 +47,28 @@ fn prints_a_header() {
     assert!(json_text.contains(r#""e_type":"EXEC""#), "{json_text}");
     assert!(json_text.contains(r#""kind":"static""#), "{json_text}");
     assert!(json_text.contains(r#""needed":[]"#), "{json_text}");
-    assert!(json_text.contains(r#""hermetic":true"#), "{json_text}");
-    assert!(
-        json_text.contains(r#""says":"This program starts itself and names no other file.""#),
-        "{json_text}"
-    );
+    assert!(!json_text.contains(r#""hermetic""#), "{json_text}");
+    assert!(!json_text.contains(r#""says""#), "{json_text}");
     assert!(json_text.contains(r#""e_machine":62"#), "{json_text}");
     assert!(
         json_text.contains(r#""e_machine_name":"x86-64""#),
         "{json_text}"
     );
-    assert_eq!(json_text.matches('{').count(), 2, "{json_text}");
+    assert!(json_text.contains(r#""entry_name":null"#), "{json_text}");
+    assert!(
+        json_text.contains(r#""symbols":{"undef":0,"defined":0,"symtab":false}"#),
+        "{json_text}"
+    );
+    assert_eq!(json_text.matches('{').count(), 3, "{json_text}");
+
+    let rows = bin().arg("--symbols").arg(&path).output().unwrap();
+    let rows_text = String::from_utf8(rows.stdout).unwrap();
+    assert!(
+        rows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rows.stderr)
+    );
+    assert!(rows_text.contains("undef: []"), "{rows_text}");
 
     let _ = fs::remove_file(path);
 }
@@ -68,7 +79,7 @@ fn rejects_a_missing_path_and_a_non_elf() {
     assert!(!missing.status.success());
     let usage = String::from_utf8_lossy(&missing.stderr);
     assert!(
-        usage.contains("usage: herman [--json] [--check] [--expect <claim>] <file>"),
+        usage.contains("usage: binvet [--json] [--symbols] [--check] [--expect <claim>] <file>"),
         "{usage}"
     );
     assert!(usage.contains("--claims"), "{usage}");
@@ -107,7 +118,8 @@ fn prints_macho_and_pe_with_the_same_shape() {
     let json_text = String::from_utf8(json.stdout).unwrap();
     assert!(json_text.contains(r#""format":"macho""#), "{json_text}");
     assert!(json_text.contains(r#""kind":"static""#), "{json_text}");
-    assert_eq!(json_text.matches('{').count(), 2, "{json_text}");
+    assert!(json_text.contains(r#""entry_name":null"#), "{json_text}");
+    assert_eq!(json_text.matches('{').count(), 3, "{json_text}");
     let _ = fs::remove_file(macho);
 
     let pe = std::env::temp_dir().join(format!("elf-header-pe-{}", std::process::id()));
@@ -138,7 +150,9 @@ fn prints_macho_and_pe_with_the_same_shape() {
     let json_text = String::from_utf8(json.stdout).unwrap();
     assert!(json_text.contains(r#""format":"pe""#), "{json_text}");
     assert!(json_text.contains(r#""kind":"static""#), "{json_text}");
-    assert_eq!(json_text.matches('{').count(), 2, "{json_text}");
+    assert!(text.contains("os_version: 0.0"), "{text}");
+    assert!(text.contains("subsystem_version: 0.0"), "{text}");
+    assert_eq!(json_text.matches('{').count(), 3, "{json_text}");
     let _ = fs::remove_file(pe);
 }
 
@@ -159,6 +173,8 @@ fn check_accepts_a_closed_file_and_rejects_a_miss() {
     assert!(pass.status.success(), "{text}");
     assert!(text.contains("result: pass"), "{text}");
     assert!(text.contains("hermetic: true"), "{text}");
+    assert!(text.contains("host:"), "{text}");
+    assert!(text.contains("verneed: skip"), "{text}");
     assert!(text.contains("format: elf"), "{text}");
     assert!(!text.contains('\u{1b}'), "{text}");
 
@@ -173,6 +189,7 @@ fn check_accepts_a_closed_file_and_rejects_a_miss() {
     assert!(json_text.contains(r#""result":"pass""#), "{json_text}");
     assert!(json_text.contains(r#""hermetic":true"#), "{json_text}");
     assert!(json_text.contains(r#""miss":[]"#), "{json_text}");
+    assert!(json_text.contains(r#""verneed":"skip""#), "{json_text}");
 
     let fail = bin()
         .arg("--expect")
@@ -219,4 +236,84 @@ fn check_accepts_a_closed_file_and_rejects_a_miss() {
 
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(claims);
+}
+
+#[test]
+fn a_fat_macho_opens_each_slice() {
+    let path = std::env::temp_dir().join(format!("elf-header-fat-{}", std::process::id()));
+    let mut x86 = vec![0u8; 32];
+    x86[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+    x86[4] = 0x07;
+    x86[7] = 0x01;
+    x86[12] = 2;
+    let mut arm = vec![0u8; 32];
+    arm[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+    arm[4] = 0x0c;
+    arm[7] = 0x01;
+    arm[12] = 2;
+    arm[24] = 0x00;
+    arm[25] = 0x00;
+    arm[26] = 0x20;
+    let mut bytes = vec![0u8; 48];
+    bytes[..4].copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
+    bytes[7] = 2;
+    bytes[8..12].copy_from_slice(&0x0100_0007u32.to_be_bytes());
+    bytes[11] = 0x07;
+    bytes[15] = 3;
+    bytes[16..20].copy_from_slice(&48u32.to_be_bytes());
+    bytes[20..24].copy_from_slice(&32u32.to_be_bytes());
+    bytes[28..32].copy_from_slice(&0x0100_000cu32.to_be_bytes());
+    bytes[35] = 2;
+    bytes[36..40].copy_from_slice(&80u32.to_be_bytes());
+    bytes[40..44].copy_from_slice(&32u32.to_be_bytes());
+    bytes.extend_from_slice(&x86);
+    bytes.extend_from_slice(&arm);
+    fs::write(&path, &bytes).unwrap();
+
+    let out = bin().arg(&path).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("magic: 0xCAFEBABE"), "{text}");
+    assert!(text.contains("universal: universal2"), "{text}");
+    assert!(text.contains("cputype_name: x86-64 (16777223)"), "{text}");
+    assert!(text.contains("cpusubtype_name: ARM64E (2)"), "{text}");
+    assert!(text.contains("kind: static"), "{text}");
+    assert!(text.contains("kind: static-pie"), "{text}");
+    assert!(!text.contains("This page does not open a slice."), "{text}");
+    assert!(
+        text.contains("These slices do not share one load."),
+        "{text}"
+    );
+
+    let json = bin().arg("--json").arg(&path).output().unwrap();
+    let json_text = String::from_utf8(json.stdout).unwrap();
+    assert!(
+        json_text.contains(r#""universal":"universal2""#),
+        "{json_text}"
+    );
+    assert!(
+        json_text.contains(r#""cputype_name":"x86-64""#),
+        "{json_text}"
+    );
+    assert!(
+        json_text.contains(r#""cpusubtype_name":"ARM64E""#),
+        "{json_text}"
+    );
+    assert!(json_text.contains(r#""kind":"static""#), "{json_text}");
+    assert!(json_text.contains(r#""kind":"static-pie""#), "{json_text}");
+    assert!(
+        !json_text.contains(r#""load":{"kind":"other""#),
+        "{json_text}"
+    );
+
+    let check = bin().arg("--check").arg(&path).output().unwrap();
+    let check_text = String::from_utf8(check.stdout).unwrap();
+    assert!(check.status.success(), "{check_text}");
+    assert!(check_text.contains("hermetic: true"), "{check_text}");
+    assert!(!check_text.contains("says:"), "{check_text}");
+    let _ = fs::remove_file(path);
 }

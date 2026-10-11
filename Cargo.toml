@@ -1,10 +1,10 @@
 [package]
-name = "herman"
+name = "binvet"
 version = "0.1.0"
 edition = "2021"
 publish = false
 description = "Read an ELF, Mach-O, or PE header and check how the file starts."
 
 [[bin]]
-name = "herman"
+name = "binvet"
 path = "src/main.rs"
