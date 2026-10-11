@@ -1,3 +1,11 @@
+/*
+---
+why: This file checks one start claim against header facts.
+uses: bininfo
+how: bininfo calls this file to judge hermetic, kind, pie, interp, and needed.
+---
+*/
+
 //! The claim a header makes about how a file starts.
 //! A hermetic header names no other file.
 //! This file does not read ELF, Mach-O, or PE bytes.
@@ -57,6 +65,7 @@ pub struct HostMarks {
 }
 
 impl HostMarks {
+    #[cfg(test)]
     pub fn skip() -> Self {
         Self {
             cpu: "skip",
@@ -150,7 +159,22 @@ fn is_libdl(name: &str) -> bool {
 }
 
 pub fn write_delay(out: &mut String, color: bool, indent: usize, format: &str, delay: &[String]) {
-    search_field(out, color, indent, "delay", delay, delay_note(format));
+    let fg = if delay.is_empty() {
+        style::LABEL
+    } else {
+        style::WHITE
+    };
+    style::noted_list(
+        out,
+        color,
+        indent,
+        "delay",
+        delay,
+        delay_note(format),
+        fg,
+        false,
+        crate::library::note,
+    );
 }
 
 pub fn write_dlopen(out: &mut String, color: bool, indent: usize, format: &str, needed: &[String]) {
@@ -202,7 +226,7 @@ fn search_field(
     } else {
         style::WHITE
     };
-    style::list_field(out, color, indent, key, items, note, fg, false);
+    style::path_list(out, color, indent, key, items, note, fg, false);
 }
 
 pub fn hermetic_note(kind: Kind, yes: bool) -> &'static str {
@@ -528,7 +552,7 @@ pub fn report(facts: &Facts, misses: &[Miss], color: bool) -> String {
         },
         false,
     );
-    style::list_field(
+    style::noted_list(
         &mut out,
         color,
         0,
@@ -541,6 +565,7 @@ pub fn report(facts: &Facts, misses: &[Miss], color: bool) -> String {
             style::WHITE
         },
         false,
+        crate::library::note,
     );
     let (fg, bold) = if yes {
         (style::GREEN, true)
@@ -803,7 +828,12 @@ mod tests {
             "{}",
             lines[at]
         );
-        assert_eq!(lines[at + 1], "  - libz.so");
+        assert!(lines[at + 1].contains("  - libz.so"), "{}", lines[at + 1]);
+        assert!(
+            lines[at + 1].contains("zlib compression."),
+            "{}",
+            lines[at + 1]
+        );
         assert_eq!(lines[at + 2], "  - liba.so");
         assert!(lines[at + 3].starts_with("hermetic:"), "{}", lines[at + 3]);
     }

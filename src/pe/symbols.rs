@@ -1,3 +1,12 @@
+/*
+---
+why: This file reads PE versions and import rows.
+uses: bininfo
+how: bininfo calls this file to count imports and name the entry.
+This file does not print the page.
+---
+*/
+
 //! PE versions and import rows.
 //! `needed` stays the DLL name list. This module reads the thunks.
 //! This module does not print.
@@ -35,6 +44,7 @@ pub struct Symbols {
 }
 
 impl Symbols {
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             os: None,

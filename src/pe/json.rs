@@ -1,3 +1,12 @@
+/*
+---
+why: This file writes one PE header as one JSON object.
+uses: bininfo
+how: bininfo calls this file after it reads the header.
+This file does not read PE bytes.
+---
+*/
+
 //! One JSON object for one PE header.
 //! This file does not read PE bytes.
 
@@ -8,6 +17,7 @@ use super::words::{class_name, machine_name, magic_name, subsystem_name};
 use crate::claim;
 use crate::style::Json;
 
+#[cfg(test)]
 pub fn render(file: &str, header: &Header, load: &Load) -> String {
     render_with(file, header, load, &Symbols::empty())
 }

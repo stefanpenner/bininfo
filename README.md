@@ -1,3 +1,11 @@
+<!--
+---
+why: This file tells a reader what bininfo prints and how to run it.
+uses: a reader
+how: The reader opens this file in the repo.
+---
+-->
+
 # bininfo
 
 ## What is this?
@@ -49,6 +57,11 @@ Put each flag before the file name.
 cargo run --quiet -- [--json] [--symbols] [--check] [--expect <claim>] <file>
 cargo run --quiet -- [--json] --claims <file>
 ```
+
+A common `needed` name has a trailing note.
+The note names what that library provides.
+An unknown name has no note.
+`delay` uses the same notes.
 
 `--json` prints one JSON object.
 `--symbols` prints each symbol row.

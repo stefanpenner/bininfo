@@ -1,3 +1,12 @@
+/*
+---
+why: This file reads how a Mach-O file starts.
+uses: bininfo
+how: bininfo calls this file to read load commands.
+This file does not print the page.
+---
+*/
+
 //! How a Mach-O file starts, and which files it must open.
 //! This module reads load commands. It does not print them.
 
@@ -61,6 +70,7 @@ pub struct Slice {
     pub commands: Commands,
 }
 
+#[cfg(test)]
 pub fn read(bytes: &[u8], image: &Image) -> Commands {
     read_at(bytes, image, false)
 }
@@ -72,10 +82,6 @@ pub fn read_at(bytes: &[u8], image: &Image, rows: bool) -> Commands {
     }
 }
 
-pub fn slices_of(bytes: &[u8], image: &Image) -> Vec<Slice> {
-    slices_rows(bytes, image, false)
-}
-
 pub fn slices_rows(bytes: &[u8], image: &Image, rows: bool) -> Vec<Slice> {
     match image {
         Image::Thin(_) => Vec::new(),
@@ -84,6 +90,7 @@ pub fn slices_rows(bytes: &[u8], image: &Image, rows: bool) -> Vec<Slice> {
 }
 
 /// Open each slice. The window is a borrow. A large slice is not copied.
+#[cfg(test)]
 pub fn open_slices(bytes: &[u8], fat: &Fat) -> Vec<Slice> {
     open_at(bytes, fat, false)
 }

@@ -1,3 +1,13 @@
+/*
+---
+why: This file writes one PE header as one text page.
+uses: bininfo
+how: bininfo calls this file after it reads the header.
+Each line has one field and one note.
+This file does not read PE bytes.
+---
+*/
+
 //! One page for one PE header. Fields sit under the same rungs as ELF.
 //! This file does not read PE bytes.
 
@@ -9,6 +19,7 @@ use crate::claim;
 use crate::style;
 use std::fmt::Write;
 
+#[cfg(test)]
 pub fn render(file: &str, header: &Header, load: &Load, color: bool) -> String {
     render_with(file, header, load, &Symbols::empty(), color)
 }
@@ -245,7 +256,7 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
         style::LABEL,
         false,
     );
-    style::list_field(
+    style::noted_list(
         out,
         color,
         2,
@@ -258,6 +269,7 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
             style::WHITE
         },
         false,
+        crate::library::note,
     );
     claim::write_search(out, color, 2, "pe", &load.runpath, &load.rpath);
     claim::write_delay(out, color, 2, "pe", &load.delay);
@@ -638,5 +650,32 @@ mod tests {
             "{}",
             lines[at + 3]
         );
+    }
+
+    #[test]
+    fn a_common_needed_dll_has_a_note() {
+        let mut load = still();
+        load.needed = vec!["KERNEL32.dll".into(), "tiny.dll".into()];
+        let text = render("dyn.exe", &exe(), &load, false);
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("  needed:"))
+            .unwrap();
+        assert!(lines[at + 1].contains("KERNEL32.dll"), "{}", lines[at + 1]);
+        assert!(
+            lines[at + 1].contains("files, processes, and memory."),
+            "{}",
+            lines[at + 1]
+        );
+        assert_eq!(lines[at + 2], "    - tiny.dll");
+    }
+
+    #[test]
+    fn a_common_delay_dll_has_the_same_note() {
+        let mut load = still();
+        load.delay = vec!["KERNEL32.dll".into()];
+        let text = render("dyn.exe", &exe(), &load, false);
+        assert!(text.contains("files, processes, and memory."), "{text}");
     }
 }

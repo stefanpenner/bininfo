@@ -1,3 +1,12 @@
+/*
+---
+why: This file reads ELF dynamic symbols and GNU notes.
+uses: bininfo
+how: bininfo calls this file to count symbols and name the entry.
+This file does not print the page.
+---
+*/
+
 //! Dynamic symbols, version needs, and GNU notes.
 //! Counts come from PT_DYNAMIC. Section headers only mark .symtab and notes.
 //! This module does not print.
@@ -82,6 +91,7 @@ pub struct Symbols {
 }
 
 impl Symbols {
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             undef: 0,

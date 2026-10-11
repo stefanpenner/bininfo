@@ -1,3 +1,12 @@
+/*
+---
+why: This file reads how an ELF file starts.
+uses: bininfo
+how: bininfo calls this file to read program headers.
+This file does not print the page.
+---
+*/
+
 //! How an ELF file starts, and which files it must open.
 //! This module reads program headers. It does not print them.
 
@@ -280,7 +289,7 @@ fn u64_at(bytes: &[u8], at: usize, data: Data) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::header::{self, Class, Data, Type};
+    use super::super::header::{self, Data, Type};
     use super::*;
 
     fn classify_of(ty: Type, interp: bool, pie: bool) -> Kind {

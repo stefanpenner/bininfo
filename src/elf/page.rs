@@ -1,3 +1,13 @@
+/*
+---
+why: This file writes one ELF header as one text page.
+uses: bininfo
+how: bininfo calls this file after it reads the header.
+Each line has one field and one note.
+This file does not read ELF bytes.
+---
+*/
+
 //! One page for one ELF header. Fields sit under the ladder rungs.
 //! Each line is `key: value  # note`. This file does not read ELF bytes.
 //! Color is Carbonfox, and only when the caller asks for it.
@@ -10,6 +20,7 @@ use crate::claim;
 use crate::style;
 use std::fmt::Write;
 
+#[cfg(test)]
 pub fn render(file: &str, header: &Header, load: &Load, color: bool) -> String {
     render_with(file, header, load, &Symbols::empty(), color)
 }
@@ -241,7 +252,7 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
         fg,
         bold,
     );
-    style::list_field(
+    style::noted_list(
         out,
         color,
         2,
@@ -254,6 +265,7 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
             style::WHITE
         },
         false,
+        crate::library::note,
     );
     claim::write_search(out, color, 2, "elf", &load.runpath, &load.rpath);
     claim::write_delay(out, color, 2, "elf", &load.delay);
@@ -748,7 +760,12 @@ mod tests {
             "{}",
             lines[at]
         );
-        assert_eq!(lines[at + 1], "    - libz.so");
+        assert!(lines[at + 1].contains("    - libz.so"), "{}", lines[at + 1]);
+        assert!(
+            lines[at + 1].contains("zlib compression."),
+            "{}",
+            lines[at + 1]
+        );
         assert_eq!(lines[at + 2], "    - \"liba:b.so\"");
         assert!(
             lines[at + 3].starts_with("  runpath: []"),
@@ -823,5 +840,30 @@ mod tests {
         load.needed = vec!["libc.so.6".into()];
         let plain = render("dyn", &sample(Class::Elf64, Type::Dyn), &load, false);
         assert!(plain.contains("dlopen: false"), "{plain}");
+    }
+
+    #[test]
+    fn a_common_needed_name_has_a_note() {
+        let mut load = still();
+        load.needed = vec!["libc.so.6".into(), "libtiny.so".into()];
+        let text = render("dyn", &sample(Class::Elf64, Type::Dyn), &load, false);
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("  needed:"))
+            .unwrap();
+        assert!(lines[at + 1].contains("libc.so.6"), "{}", lines[at + 1]);
+        assert!(
+            lines[at + 1].contains("The C library."),
+            "{}",
+            lines[at + 1]
+        );
+        assert_eq!(
+            lines[at + 1].find('#'),
+            Some(style::COLUMN + 2),
+            "{}",
+            lines[at + 1]
+        );
+        assert_eq!(lines[at + 2], "    - libtiny.so");
     }
 }

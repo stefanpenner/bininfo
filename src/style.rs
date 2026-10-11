@@ -1,3 +1,12 @@
+/*
+---
+why: This file writes one page line and one JSON token.
+uses: bininfo
+how: Each page file calls this file to align a field and a note.
+A file list paints the directory gray and the file name white.
+---
+*/
+
 //! Page lines and JSON tokens. No file format lives here.
 
 use crate::kind::Kind;
@@ -91,6 +100,59 @@ pub fn list_field(
     fg: Rgb,
     bold: bool,
 ) {
+    write_list(out, color, indent, key, names, note, fg, bold, None, false);
+}
+
+pub fn path_list(
+    out: &mut String,
+    color: bool,
+    indent: usize,
+    key: &str,
+    names: &[String],
+    note: &str,
+    fg: Rgb,
+    bold: bool,
+) {
+    write_list(out, color, indent, key, names, note, fg, bold, None, true);
+}
+
+pub fn noted_list(
+    out: &mut String,
+    color: bool,
+    indent: usize,
+    key: &str,
+    names: &[String],
+    note: &str,
+    fg: Rgb,
+    bold: bool,
+    note_of: fn(&str) -> Option<&'static str>,
+) {
+    write_list(
+        out,
+        color,
+        indent,
+        key,
+        names,
+        note,
+        fg,
+        bold,
+        Some(note_of),
+        true,
+    );
+}
+
+fn write_list(
+    out: &mut String,
+    color: bool,
+    indent: usize,
+    key: &str,
+    names: &[String],
+    note: &str,
+    fg: Rgb,
+    bold: bool,
+    note_of: Option<fn(&str) -> Option<&'static str>>,
+    paths: bool,
+) {
     if names.is_empty() {
         raw_field(out, color, indent, key, "[]", note, fg, bold);
         return;
@@ -101,9 +163,100 @@ pub fn list_field(
     align_note(out, color, &format!("{gap}{painted}"), plain, note);
     let item_gap = " ".repeat(indent + 2);
     for name in names {
-        let shown = paint(color, &yaml_scalar(name), fg, bold);
-        let _ = writeln!(out, "{item_gap}- {shown}");
+        let shown_plain = yaml_scalar(name);
+        let shown = if paths {
+            file_text(color, name)
+        } else {
+            paint(color, &shown_plain, fg, bold)
+        };
+        let dash = if paths {
+            paint(color, "-", LABEL, false)
+        } else {
+            "-".to_string()
+        };
+        let prefix = format!("{item_gap}{dash} {shown}");
+        match note_of.and_then(|note_of| note_of(name)) {
+            Some(item) => {
+                let plain = item_gap.len() + 2 + shown_plain.len();
+                align_note(out, color, &prefix, plain, item);
+            }
+            None => {
+                let _ = writeln!(out, "{prefix}");
+            }
+        }
     }
+}
+
+/// The directory is gray. The file name is white and bold. An @ token is magenta.
+pub fn paint_path(on: bool, text: &str) -> String {
+    if !on {
+        return text.to_string();
+    }
+    paint_parts(text, false)
+}
+
+pub(crate) fn file_text(color: bool, name: &str) -> String {
+    let plain = yaml_scalar(name);
+    if !color {
+        return plain;
+    }
+    if plain == name {
+        return paint_path(true, name);
+    }
+    let mut out = paint(true, "\"", LABEL, false);
+    out.push_str(&paint_parts(name, true));
+    out.push_str(&paint(true, "\"", LABEL, false));
+    out
+}
+
+fn paint_parts(text: &str, escape: bool) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    if let Some(token) = at_token(rest) {
+        out.push_str(&paint_piece(token, MAGENTA, true, escape));
+        rest = &rest[token.len()..];
+    }
+    if rest.is_empty() {
+        return out;
+    }
+    match rest.rfind(['/', '\\']) {
+        Some(at) => {
+            out.push_str(&paint_piece(&rest[..=at], LABEL, false, escape));
+            let file = &rest[at + 1..];
+            if !file.is_empty() {
+                out.push_str(&paint_piece(file, FG, true, escape));
+            }
+        }
+        None => out.push_str(&paint_piece(rest, FG, true, escape)),
+    }
+    out
+}
+
+fn paint_piece(text: &str, color: Rgb, bold: bool, escape: bool) -> String {
+    if !escape {
+        return paint(true, text, color, bold);
+    }
+    let mut shown = String::new();
+    for c in text.chars() {
+        match c {
+            '\\' => shown.push_str("\\\\"),
+            '"' => shown.push_str("\\\""),
+            '\n' => shown.push_str("\\n"),
+            c => shown.push(c),
+        }
+    }
+    paint(true, &shown, color, bold)
+}
+
+fn at_token(text: &str) -> Option<&str> {
+    for token in ["@executable_path", "@loader_path", "@rpath"] {
+        if text == token
+            || text.starts_with(token) && text.as_bytes().get(token.len()) == Some(&b'/')
+        {
+            return Some(token);
+        }
+    }
+    None
 }
 
 pub fn kind_tone(kind: Kind) -> (Rgb, bool) {
@@ -489,6 +642,113 @@ mod tests {
         assert_eq!(lines[4], "    - \"a\\nb\"");
         assert_eq!(lines[5], "    - a\\b");
         assert_eq!(lines[6], "    - @rpath/ok.dylib");
+    }
+
+    #[test]
+    fn a_file_list_paints_the_directory_gray_and_the_file_name_white() {
+        let names = vec![
+            "/usr/lib/libSystem.B.dylib".into(),
+            "@rpath/libtiny.dylib".into(),
+            "@loader_path/../lib".into(),
+            r"C:\Windows\System32\kernel32.dll".into(),
+            "a:b/c".into(),
+        ];
+        let mut out = String::new();
+        path_list(
+            &mut out,
+            true,
+            2,
+            "needed",
+            &names,
+            "Library names the loader opens.",
+            LABEL,
+            false,
+        );
+        let gray = "\u{1b}[38;2;123;124;126m";
+        let file = "\u{1b}[1;38;2;242;244;248m";
+        let token = "\u{1b}[1;38;2;190;149;255m";
+        assert!(
+            out.contains(&format!("{gray}/usr/lib/\u{1b}[0m{file}libSystem.B.dylib")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "{token}@rpath\u{1b}[0m{gray}/\u{1b}[0m{file}libtiny.dylib"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "{token}@loader_path\u{1b}[0m{gray}/../\u{1b}[0m{file}lib"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "{gray}\"\u{1b}[0m{gray}C:\\\\Windows\\\\System32\\\\\u{1b}[0m{file}kernel32.dll\u{1b}[0m{gray}\""
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "{gray}\"\u{1b}[0m{gray}a:b/\u{1b}[0m{file}c\u{1b}[0m{gray}\""
+            )),
+            "{out}"
+        );
+        let visible: String = strip_color(out.lines().nth(1).unwrap());
+        assert_eq!(visible, "    - /usr/lib/libSystem.B.dylib");
+        let key = strip_color(out.lines().next().unwrap());
+        assert_eq!(key.find('#'), Some(COLUMN + 2), "{key}");
+
+        let mut plain = String::new();
+        path_list(
+            &mut plain,
+            false,
+            2,
+            "needed",
+            &names[..1],
+            "Library names the loader opens.",
+            WHITE,
+            false,
+        );
+        assert!(
+            plain.contains("    - /usr/lib/libSystem.B.dylib"),
+            "{plain}"
+        );
+
+        let mut property = String::new();
+        list_field(
+            &mut property,
+            true,
+            2,
+            "property",
+            &["x86-64-v2".to_string()],
+            "[.note.gnu.property]",
+            WHITE,
+            false,
+        );
+        assert!(
+            property.contains("\u{1b}[38;2;223;223;224mx86-64-v2"),
+            "{property}"
+        );
+        assert!(!property.contains(file), "{property}");
+    }
+
+    fn strip_color(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for n in chars.by_ref() {
+                    if n == 'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
     }
 }
 

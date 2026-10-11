@@ -1,3 +1,13 @@
+/*
+---
+why: This file writes one Mach-O header as one text page.
+uses: bininfo
+how: bininfo calls this file after it reads the header.
+Each line has one field and one note.
+This file does not read Mach-O bytes.
+---
+*/
+
 //! One page for one Mach-O header. Fields sit under the same rungs as ELF.
 //! This file does not read Mach-O bytes.
 
@@ -445,7 +455,7 @@ fn write_load_fields(out: &mut String, commands: &Commands, color: bool, indent:
         fg,
         bold,
     );
-    style::list_field(
+    style::noted_list(
         out,
         color,
         indent,
@@ -458,6 +468,7 @@ fn write_load_fields(out: &mut String, commands: &Commands, color: bool, indent:
             style::WHITE
         },
         false,
+        crate::library::note,
     );
     claim::write_search(
         out,
@@ -695,7 +706,11 @@ fn write_extra(out: &mut String, commands: &Commands, color: bool, indent: usize
         let dash = " ".repeat(field);
         let sub = " ".repeat(field + 2);
         for dylib in &extra.dylibs {
-            let _ = writeln!(out, "{dash}- name: {}", style::yaml_scalar(&dylib.name));
+            let _ = writeln!(
+                out,
+                "{dash}- name: {}",
+                style::file_text(color, &dylib.name)
+            );
             let _ = writeln!(out, "{sub}compat: {}", dylib.compat);
             let _ = writeln!(out, "{sub}current: {}", dylib.current);
         }
@@ -1018,7 +1033,22 @@ mod tests {
             lines[at]
         );
         assert_eq!(lines[at + 1], "    - @rpath/libsherpa-onnx-c-api.dylib");
-        assert_eq!(lines[at + 2], "    - /usr/lib/libSystem.B.dylib");
+        assert!(
+            lines[at + 2].contains("/usr/lib/libSystem.B.dylib"),
+            "{}",
+            lines[at + 2]
+        );
+        assert!(
+            lines[at + 2].contains("libc, libm, and pthread."),
+            "{}",
+            lines[at + 2]
+        );
+        assert_eq!(
+            lines[at + 2].find('#'),
+            Some(style::COLUMN + 2),
+            "{}",
+            lines[at + 2]
+        );
         assert!(
             lines[at + 3].starts_with("  runpath: []"),
             "{}",

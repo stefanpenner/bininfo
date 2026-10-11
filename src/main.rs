@@ -4,6 +4,7 @@
 mod claim;
 mod elf;
 mod kind;
+mod library;
 mod macho;
 mod pe;
 mod style;
