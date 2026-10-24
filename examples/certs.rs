@@ -7,8 +7,10 @@ The example prints hit counts.
 ---
 */
 
+use bininfo::certs::Container;
 use bininfo::certs::Encoding;
 use bininfo::certs::Kind;
+use bininfo::certs::Role;
 
 const EMSIGN: [u8; 32] = [
     0x86, 0xa1, 0xec, 0xba, 0x08, 0x9c, 0x4a, 0x8d, 0x3b, 0xbe, 0x27, 0x34, 0xc6, 0x12, 0xba, 0x34,
@@ -38,9 +40,15 @@ fn main() {
         let mut full = 0;
         let mut anchor = 0;
         let mut body = 0;
+        let mut pin = 0;
         let mut der = 0;
         let mut pem = 0;
         let mut base64 = 0;
+        let mut gzip = 0;
+        let mut zlib = 0;
+        let mut zip = 0;
+        let mut sea = 0;
+        let mut signer = 0;
         let mut emsign = 0;
         let mut emsign_spki = 0;
         for hit in &hits {
@@ -48,21 +56,32 @@ fn main() {
                 Kind::Full => full += 1,
                 Kind::Anchor => anchor += 1,
                 Kind::Body => body += 1,
+                Kind::Pin => pin += 1,
             }
             match hit.encoding {
                 Encoding::Der => der += 1,
                 Encoding::Pem => pem += 1,
                 Encoding::Base64 => base64 += 1,
             }
-            if hit.sha256 == EMSIGN {
+            match hit.container {
+                Container::File => {}
+                Container::Gzip => gzip += 1,
+                Container::Zlib => zlib += 1,
+                Container::Zip => zip += 1,
+                Container::Sea => sea += 1,
+            }
+            if hit.role == Role::Signer {
+                signer += 1;
+            }
+            if hit.kind != Kind::Pin && hit.sha256 == EMSIGN {
                 emsign += 1;
             }
-            if hit.spki_sha256 == EMSIGN_SPKI {
+            if hit.kind != Kind::Pin && hit.spki_sha256 == EMSIGN_SPKI {
                 emsign_spki += 1;
             }
         }
         println!(
-            "{path} full={full} anchor={anchor} body={body} der={der} pem={pem} base64={base64} emsign={emsign} emsign_spki={emsign_spki} bytes={}",
+            "{path} full={full} anchor={anchor} body={body} pin={pin} der={der} pem={pem} base64={base64} gzip={gzip} zlib={zlib} zip={zip} sea={sea} signer={signer} emsign={emsign} emsign_spki={emsign_spki} bytes={}",
             bytes.len()
         );
     }

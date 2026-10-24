@@ -3,19 +3,22 @@
 why: This file finds embedded certificates and trust anchors in a binary.
 uses: bininfo
 how: bininfo calls this file to scan read-only bytes.
-The scan reads DER, PEM, and bare base64.
-The scan does not inflate gzip or zlib.
+The scan reads DER, PEM, bare base64, gzip, zlib, and zip.
 The scan rejects BER indefinite length.
 ---
 */
 
-//! Scan a byte slice for certificates and trust anchors.
+//! Scan a byte slice for certificates, trust anchors, and pins.
 //! A full certificate has an X.509 body, a signature algorithm, and a signature.
 //! An anchor is a public key or trust-anchor info with a known key.
 //! A body is a bare certificate body.
-//! The scan reads DER, PEM, and bare base64.
-//! The scan does not inflate gzip or zlib.
+//! The scan reads DER, PEM, bare base64, gzip, zlib, and zip.
 //! The scan rejects BER indefinite length.
+
+mod inflate;
+mod place;
+
+use std::collections::HashMap;
 
 /// One hit in the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,9 +26,9 @@ pub struct Hit {
     /// File offset of the DER object or the encoded text.
     pub offset: usize,
     /// DER length includes the tag and the length bytes.
-    /// PEM length and base64 length are the text span.
+    /// PEM, base64, gzip, zlib, and zip length are that span.
     pub length: usize,
-    /// Full certificate, trust anchor, or bare certificate body.
+    /// Full certificate, trust anchor, bare body, or pin.
     pub kind: Kind,
     /// DER, PEM, or bare base64.
     pub encoding: Encoding,
@@ -35,9 +38,15 @@ pub struct Hit {
     pub spki_sha256: [u8; 32],
     /// Subject common name. An anchor has none.
     pub subject_cn: Option<String>,
+    /// Section name, segment name, overlay, header, or file.
+    pub place: String,
+    /// Trust material or a code-signature certificate.
+    pub role: Role,
+    /// File bytes, or the container that held the hit.
+    pub container: Container,
 }
 
-/// Full X.509 certificate, trust anchor, or bare certificate body.
+/// Full X.509 certificate, trust anchor, bare certificate body, or pin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     /// The bytes have the X.509 certificate shape.
@@ -46,6 +55,32 @@ pub enum Kind {
     Anchor,
     /// The bytes are a bare certificate body.
     Body,
+    /// The bytes are a certificate pin or a key pin.
+    Pin,
+}
+
+/// Trust material, or a certificate from a code signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    /// The hit is trust material.
+    Trust,
+    /// The hit is a signer certificate.
+    Signer,
+}
+
+/// Container that held the hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Container {
+    /// The hit is in the file bytes.
+    File,
+    /// The hit is inside a gzip member.
+    Gzip,
+    /// The hit is inside a zlib stream.
+    Zlib,
+    /// The hit is inside a zip entry.
+    Zip,
+    /// The hit is inside a Node SEA blob.
+    Sea,
 }
 
 /// Wire form of one hit.
@@ -62,16 +97,41 @@ pub enum Encoding {
 /// Scan `bytes` for embedded certificates and trust anchors.
 ///
 /// A DER hit starts at a canonical SEQUENCE tag.
-/// The scan reads PEM blocks and bare base64 before the DER walk.
+/// The scan reads PEM, bare base64, gzip, zlib, and zip.
 /// The scan reads the bytes inside a full certificate for a nested certificate.
-/// The scan does not inflate gzip or zlib.
 /// The scan rejects BER indefinite length.
 pub fn scan(bytes: &[u8]) -> Vec<Hit> {
     let mut hits = Vec::new();
+    scan_raw(bytes, &mut hits);
+    let mut budget = MAX_INFLATE_TOTAL;
+    let stored = scan_zip(bytes, &mut hits, &mut budget);
+    scan_gzip(bytes, &mut hits, &mut budget);
+    scan_zlib(bytes, &mut hits, &mut budget);
+    scan_utf16(bytes, &mut hits);
+    scan_pins(bytes, &mut hits);
+    tag_ranges(&stored, &mut hits, Container::Zip);
+    let map = place::Map::build(bytes);
+    for hit in &mut hits {
+        hit.place = map.place(hit.offset);
+        if map.signer(hit.offset) {
+            hit.role = Role::Signer;
+        }
+        if hit.container == Container::File && map.sea(hit.offset) {
+            hit.container = Container::Sea;
+        }
+    }
+    sort_hits(&mut hits);
+    hits
+}
+
+fn scan_raw(bytes: &[u8], hits: &mut Vec<Hit>) {
     let mut covered = Vec::new();
-    scan_pem(bytes, &mut hits, &mut covered);
-    scan_b64(bytes, &mut covered, &mut hits);
-    scan_der(bytes, &covered, &mut hits);
+    scan_pem(bytes, hits, &mut covered);
+    scan_b64(bytes, &mut covered, hits);
+    scan_der(bytes, &covered, hits);
+}
+
+fn sort_hits(hits: &mut [Hit]) {
     hits.sort_by(|left, right| {
         left.offset
             .cmp(&right.offset)
@@ -79,9 +139,11 @@ pub fn scan(bytes: &[u8]) -> Vec<Hit> {
             .then(left.sha256.cmp(&right.sha256))
             .then(left.kind.cmp(&right.kind))
             .then(left.encoding.cmp(&right.encoding))
+            .then(left.container.cmp(&right.container))
+            .then(left.role.cmp(&right.role))
+            .then(left.place.cmp(&right.place))
             .then(left.subject_cn.cmp(&right.subject_cn))
     });
-    hits
 }
 
 const MAX_CONTENT: usize = 1 << 20;
@@ -90,6 +152,14 @@ const MIN_B64: usize = 56;
 const MAX_B64: usize = 256_000;
 const MAX_PEM: usize = 2_000_000;
 const MAX_DEPTH: usize = 8;
+const MAX_INFLATE: usize = 1 << 20;
+const MAX_INFLATE_TOTAL: usize = 4 << 20;
+const MAX_STREAMS: usize = 16;
+const MAX_ZIPS: usize = 8;
+const MAX_ZIP_ENTRIES: usize = 64;
+const MAX_PINS: usize = 64;
+const MAX_PIN_EACH: usize = 8;
+const MAX_UTF16: usize = 16;
 const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
 const END: &[u8] = b"-----END CERTIFICATE-----";
 
@@ -273,6 +343,9 @@ fn walk(
                         sha256: digest,
                         spki_sha256: digest,
                         subject_cn: None,
+                        place: String::new(),
+                        role: Role::Trust,
+                        container: Container::File,
                     });
                     index += span;
                     continue;
@@ -326,6 +399,9 @@ fn hit_from(
         sha256: sha256(der),
         spki_sha256: sha256(found.spki),
         subject_cn: found.subject.and_then(subject_cn),
+        place: String::new(),
+        role: Role::Trust,
+        container: Container::File,
     }
 }
 
@@ -348,6 +424,469 @@ fn find_slice(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 fn is_b64(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+}
+
+fn push_decoded(
+    data: &[u8],
+    offset: usize,
+    length: usize,
+    container: Container,
+    hits: &mut Vec<Hit>,
+) {
+    let mut inner = Vec::new();
+    scan_raw(data, &mut inner);
+    for hit in &mut inner {
+        hit.offset = offset;
+        hit.length = length;
+        hit.container = container;
+    }
+    hits.extend(inner);
+}
+
+fn take_budget(budget: &mut usize, size: usize) -> bool {
+    if size > *budget {
+        return false;
+    }
+    *budget -= size;
+    true
+}
+
+fn scan_gzip(bytes: &[u8], hits: &mut Vec<Hit>, budget: &mut usize) {
+    let mut from = 0;
+    let mut attempts = 0;
+    while attempts < MAX_STREAMS {
+        let Some(at) = find_slice(bytes, &[0x1f, 0x8b], from) else {
+            break;
+        };
+        from = at + 1;
+        let Some((data, member)) = inflate::gunzip(&bytes[at..], MAX_INFLATE) else {
+            continue;
+        };
+        attempts += 1;
+        from = at + member.max(1);
+        if data.is_empty() {
+            continue;
+        }
+        if !take_budget(budget, data.len()) {
+            break;
+        }
+        let before = hits.len();
+        push_decoded(&data, at, member, Container::Gzip, hits);
+        if hits.len() > before {
+            hide_file_hits(hits, at, at + member);
+        }
+    }
+}
+
+fn scan_zlib(bytes: &[u8], hits: &mut Vec<Hit>, budget: &mut usize) {
+    let mut index = 0;
+    let mut attempts = 0;
+    while attempts < MAX_STREAMS && index + 2 < bytes.len() {
+        if bytes[index] != 0x78 {
+            index += 1;
+            continue;
+        }
+        let flg = bytes[index + 1];
+        let check = u16::from(bytes[index]) * 256 + u16::from(flg);
+        if check % 31 != 0 || flg & 0x20 != 0 || bytes[index] & 0x0f != 8 {
+            index += 1;
+            continue;
+        }
+        let Some(head) = inflate::prefix(&bytes[index + 2..], 8) else {
+            index += 1;
+            continue;
+        };
+        if !certish(&head) {
+            index += 1;
+            continue;
+        }
+        let at = index;
+        let Some((data, used)) = inflate::unzlib(&bytes[at..], MAX_INFLATE) else {
+            index += 1;
+            continue;
+        };
+        attempts += 1;
+        index = at + used.max(1);
+        if data.is_empty() {
+            continue;
+        }
+        if !take_budget(budget, data.len()) {
+            break;
+        }
+        let before = hits.len();
+        push_decoded(&data, at, used, Container::Zlib, hits);
+        if hits.len() > before {
+            hide_file_hits(hits, at, at + used);
+        }
+    }
+}
+
+fn certish(prefix: &[u8]) -> bool {
+    if prefix.starts_with(b"-----BEGIN ") || prefix.starts_with(b"PK\x03\x04") {
+        return true;
+    }
+    prefix.len() >= 2
+        && prefix[0] == 0x30
+        && (prefix[1] < 0x80 || matches!(prefix[1], 0x81 | 0x82 | 0x83))
+}
+
+fn scan_zip(bytes: &[u8], hits: &mut Vec<Hit>, budget: &mut usize) -> Vec<(usize, usize)> {
+    let mut stored = Vec::new();
+    let mut from = 0;
+    let mut zips = 0;
+    while zips < MAX_ZIPS {
+        let Some(at) = find_slice(bytes, b"PK\x05\x06", from) else {
+            break;
+        };
+        from = at + 1;
+        let Some(entries) = zip_entries(bytes, at) else {
+            continue;
+        };
+        zips += 1;
+        let mut count = 0;
+        for entry in entries {
+            if count >= MAX_ZIP_ENTRIES {
+                break;
+            }
+            count += 1;
+            if entry.method == 0 {
+                let Some(slice) = bytes.get(entry.data..entry.data + entry.comp) else {
+                    continue;
+                };
+                if entry.plain != entry.comp || inflate::crc32(slice) != entry.crc {
+                    continue;
+                }
+                stored.push((entry.data, entry.data + entry.comp));
+                continue;
+            }
+            if entry.method != 8 {
+                continue;
+            }
+            let Some(slice) = bytes.get(entry.data..entry.data + entry.comp) else {
+                continue;
+            };
+            let cap = if entry.plain == 0 {
+                MAX_INFLATE
+            } else {
+                MAX_INFLATE.min(entry.plain)
+            };
+            let Some((data, _)) = inflate::raw(slice, cap) else {
+                continue;
+            };
+            if entry.plain != 0 && data.len() != entry.plain {
+                continue;
+            }
+            if inflate::crc32(&data) != entry.crc {
+                continue;
+            }
+            if !take_budget(budget, data.len()) {
+                return stored;
+            }
+            let end = entry.data + entry.comp;
+            push_decoded(&data, entry.data, entry.comp, Container::Zip, hits);
+            hits.retain(|hit| {
+                !(hit.container == Container::File && hit.offset >= entry.data && hit.offset < end)
+            });
+        }
+    }
+    stored
+}
+
+struct ZipEntry {
+    method: u16,
+    crc: u32,
+    comp: usize,
+    plain: usize,
+    data: usize,
+}
+
+fn zip_entries(bytes: &[u8], eocd: usize) -> Option<Vec<ZipEntry>> {
+    if eocd + 22 > bytes.len() {
+        return None;
+    }
+    let comment = u16::from_le_bytes([bytes[eocd + 20], bytes[eocd + 21]]) as usize;
+    if eocd + 22 + comment > bytes.len() {
+        return None;
+    }
+    let total = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+    let cd_size = u32::from_le_bytes(bytes[eocd + 12..eocd + 16].try_into().ok()?) as usize;
+    let cd_off = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().ok()?) as usize;
+    if cd_size == 0xffff_ffff || cd_off == 0xffff_ffff || total == 0xffff {
+        return None;
+    }
+    let base = zip_base(bytes, eocd, cd_off, cd_size)?;
+    let cd_at = base.checked_add(cd_off)?;
+    let cd_end = cd_at.checked_add(cd_size)?;
+    if cd_end > bytes.len() || bytes.get(cd_at..cd_at + 4) != Some(b"PK\x01\x02") {
+        return None;
+    }
+    let mut entries = Vec::new();
+    let mut at = cd_at;
+    let stop = total.min(MAX_ZIP_ENTRIES);
+    while entries.len() < stop && at + 46 <= cd_end {
+        if bytes.get(at..at + 4) != Some(b"PK\x01\x02") {
+            break;
+        }
+        let flags = u16::from_le_bytes([bytes[at + 8], bytes[at + 9]]);
+        let method = u16::from_le_bytes([bytes[at + 10], bytes[at + 11]]);
+        let crc = u32::from_le_bytes(bytes[at + 16..at + 20].try_into().ok()?);
+        let comp = u32::from_le_bytes(bytes[at + 20..at + 24].try_into().ok()?) as usize;
+        let plain = u32::from_le_bytes(bytes[at + 24..at + 28].try_into().ok()?) as usize;
+        let name = u16::from_le_bytes([bytes[at + 28], bytes[at + 29]]) as usize;
+        let extra = u16::from_le_bytes([bytes[at + 30], bytes[at + 31]]) as usize;
+        let note = u16::from_le_bytes([bytes[at + 32], bytes[at + 33]]) as usize;
+        let local = u32::from_le_bytes(bytes[at + 42..at + 46].try_into().ok()?) as usize;
+        let Some(next) = at
+            .checked_add(46)
+            .and_then(|pos| pos.checked_add(name))
+            .and_then(|pos| pos.checked_add(extra))
+            .and_then(|pos| pos.checked_add(note))
+        else {
+            break;
+        };
+        if next > cd_end {
+            break;
+        }
+        at = next;
+        if flags & 1 != 0 || comp == 0xffff_ffff || plain == 0xffff_ffff {
+            continue;
+        }
+        if comp == 0 && plain == 0 {
+            continue;
+        }
+        if flags & 8 != 0 && comp == 0 {
+            continue;
+        }
+        let Some(data) = zip_data(bytes, base.saturating_add(local)) else {
+            continue;
+        };
+        if data.saturating_add(comp) > bytes.len() {
+            continue;
+        }
+        entries.push(ZipEntry {
+            method,
+            crc,
+            comp,
+            plain,
+            data,
+        });
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+fn zip_base(bytes: &[u8], eocd: usize, cd_off: usize, cd_size: usize) -> Option<usize> {
+    if bytes.get(cd_off..cd_off + 4) == Some(b"PK\x01\x02") {
+        return Some(0);
+    }
+    let base = eocd.checked_sub(cd_size)?.checked_sub(cd_off)?;
+    if bytes.get(base + cd_off..base + cd_off + 4) == Some(b"PK\x01\x02") {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+fn zip_data(bytes: &[u8], local: usize) -> Option<usize> {
+    if local.checked_add(30)? > bytes.len() || bytes.get(local..local + 4) != Some(b"PK\x03\x04") {
+        return None;
+    }
+    let name = u16::from_le_bytes([bytes[local + 26], bytes[local + 27]]) as usize;
+    let extra = u16::from_le_bytes([bytes[local + 28], bytes[local + 29]]) as usize;
+    if name > 4096 {
+        return None;
+    }
+    local.checked_add(30)?.checked_add(name)?.checked_add(extra)
+}
+
+fn hide_file_hits(hits: &mut Vec<Hit>, start: usize, end: usize) {
+    hits.retain(|hit| hit.container != Container::File || hit.offset < start || hit.offset >= end);
+}
+
+fn tag_ranges(ranges: &[(usize, usize)], hits: &mut [Hit], container: Container) {
+    for hit in hits {
+        if hit.container != Container::File {
+            continue;
+        }
+        if ranges
+            .iter()
+            .any(|(start, end)| hit.offset >= *start && hit.offset < *end)
+        {
+            hit.container = container;
+        }
+    }
+}
+
+fn scan_utf16(bytes: &[u8], hits: &mut Vec<Hit>) {
+    let begin = utf16_ascii(b"-----BEGIN CERTIFICATE-----");
+    let end = utf16_ascii(b"-----END CERTIFICATE-----");
+    let mut from = 0;
+    let mut found = 0;
+    while found < MAX_UTF16 {
+        let Some(start) = find_slice(bytes, &begin, from) else {
+            break;
+        };
+        let body = start + begin.len();
+        let Some(end_at) = find_slice(bytes, &end, body) else {
+            from = body;
+            continue;
+        };
+        let finish = end_at + end.len();
+        from = finish;
+        if finish - start > MAX_PEM || (finish - start) % 2 != 0 {
+            continue;
+        }
+        let wide = &bytes[start..finish];
+        if wide.chunks(2).any(|pair| pair.len() == 2 && pair[1] != 0) {
+            continue;
+        }
+        let text: Vec<u8> = wide.iter().step_by(2).copied().collect();
+        let before = hits.len();
+        let mut inner = Vec::new();
+        scan_raw(&text, &mut inner);
+        for hit in &mut inner {
+            hit.offset = start;
+            hit.length = finish - start;
+        }
+        if inner.is_empty() {
+            continue;
+        }
+        hits.extend(inner);
+        if hits.len() > before {
+            found += 1;
+        }
+    }
+}
+
+fn utf16_ascii(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 2);
+    for &byte in text {
+        out.push(byte);
+        out.push(0);
+    }
+    out
+}
+
+fn scan_pins(bytes: &[u8], hits: &mut Vec<Hit>) {
+    let mut digests: HashMap<[u8; 32], Option<String>> = HashMap::new();
+    for hit in hits.iter() {
+        if hit.kind == Kind::Pin {
+            continue;
+        }
+        let cn = hit.subject_cn.clone();
+        digests.entry(hit.sha256).or_insert_with(|| cn.clone());
+        digests.entry(hit.spki_sha256).or_insert(cn);
+    }
+    pin_text(bytes, &digests, hits);
+    pin_raw(bytes, &digests, hits);
+}
+
+fn pin_text(bytes: &[u8], digests: &HashMap<[u8; 32], Option<String>>, hits: &mut Vec<Hit>) {
+    let mut from = 0;
+    let mut count = hits.iter().filter(|hit| hit.kind == Kind::Pin).count();
+    while count < MAX_PINS {
+        let Some(at) = find_slice(bytes, b"sha256/", from) else {
+            break;
+        };
+        from = at + 1;
+        let start = at + b"sha256/".len();
+        let mut end = start;
+        while end < bytes.len() && end - start < 44 && is_b64(bytes[end]) {
+            end += 1;
+        }
+        if end < bytes.len() && bytes[end] == b'=' && end - start == 43 {
+            end += 1;
+        }
+        let token = &bytes[start..end];
+        if token.len() != 43 && token.len() != 44 {
+            continue;
+        }
+        let Some(raw) = b64_decode(token) else {
+            continue;
+        };
+        if raw.len() != 32 {
+            continue;
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&raw);
+        let cn = digests.get(&hash).and_then(Clone::clone);
+        hits.push(pin_hit(at, end - at, Encoding::Base64, hash, cn));
+        count += 1;
+        from = end;
+    }
+}
+
+fn pin_raw(bytes: &[u8], digests: &HashMap<[u8; 32], Option<String>>, hits: &mut Vec<Hit>) {
+    if digests.is_empty() || bytes.len() < 32 {
+        return;
+    }
+    let mut heads: HashMap<[u8; 8], Vec<[u8; 32]>> = HashMap::new();
+    for hash in digests.keys() {
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&hash[..8]);
+        heads.entry(head).or_default().push(*hash);
+    }
+    let mut per: HashMap<[u8; 32], usize> = HashMap::new();
+    let mut count = hits.iter().filter(|hit| hit.kind == Kind::Pin).count();
+    let mut index = 0;
+    while count < MAX_PINS && index + 32 <= bytes.len() {
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&bytes[index..index + 8]);
+        let Some(cands) = heads.get(&head) else {
+            index += 1;
+            continue;
+        };
+        let mut matched = false;
+        for cand in cands {
+            if &bytes[index..index + 32] != cand {
+                continue;
+            }
+            let seen = per.get(cand).copied().unwrap_or(0);
+            if seen >= MAX_PIN_EACH || inside_cert(index, 32, hits) {
+                break;
+            }
+            let cn = digests.get(cand).and_then(Clone::clone);
+            hits.push(pin_hit(index, 32, Encoding::Der, *cand, cn));
+            per.insert(*cand, seen + 1);
+            count += 1;
+            matched = true;
+            break;
+        }
+        index += if matched { 32 } else { 1 };
+    }
+}
+
+fn inside_cert(offset: usize, length: usize, hits: &[Hit]) -> bool {
+    let end = offset.saturating_add(length);
+    hits.iter().any(|hit| {
+        hit.kind != Kind::Pin
+            && offset >= hit.offset
+            && end <= hit.offset.saturating_add(hit.length)
+    })
+}
+
+fn pin_hit(
+    offset: usize,
+    length: usize,
+    encoding: Encoding,
+    hash: [u8; 32],
+    subject_cn: Option<String>,
+) -> Hit {
+    Hit {
+        offset,
+        length,
+        kind: Kind::Pin,
+        encoding,
+        sha256: hash,
+        spki_sha256: hash,
+        subject_cn,
+        place: String::new(),
+        role: Role::Trust,
+        container: Container::File,
+    }
 }
 
 // Some trust anchors omit the outer SEQUENCE tag.
@@ -1199,6 +1738,208 @@ mod tests {
         seq(&cat(&[&seq(&body), &alg, &signature()]))
     }
 
+    fn put_u16(buf: &mut [u8], at: usize, value: u16) {
+        buf[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(buf: &mut [u8], at: usize, value: u32) {
+        buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(buf: &mut [u8], at: usize, value: u64) {
+        buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn deflate_stored(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = data;
+        if rest.is_empty() {
+            out.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]);
+            return out;
+        }
+        while !rest.is_empty() {
+            let take = rest.len().min(65535);
+            let last = take == rest.len();
+            out.push(if last { 1 } else { 0 });
+            let len = take as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+        }
+        out
+    }
+
+    fn zlib_of(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        out.extend(deflate_stored(data));
+        out.extend_from_slice(&inflate::adler32(data).to_be_bytes());
+        out
+    }
+
+    fn pem_text(data: &[u8]) -> Vec<u8> {
+        let mut text = b"-----BEGIN CERTIFICATE-----\n".to_vec();
+        text.extend(b64_encode(data));
+        text.extend_from_slice(b"\n-----END CERTIFICATE-----\n");
+        text
+    }
+
+    fn zip_one(name: &str, plain: &[u8], method: u16, payload: &[u8]) -> Vec<u8> {
+        let crc = inflate::crc32(plain);
+        let name = name.as_bytes();
+        let mut local = Vec::new();
+        local.extend_from_slice(b"PK\x03\x04");
+        local.extend_from_slice(&20u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&method.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&crc.to_le_bytes());
+        local.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        local.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+        local.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(name);
+        local.extend_from_slice(payload);
+        let mut central = Vec::new();
+        central.extend_from_slice(b"PK\x01\x02");
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&method.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(name);
+        let cd_off = local.len() as u32;
+        let mut out = local;
+        out.extend_from_slice(&central);
+        let cd_size = (out.len() as u32) - cd_off;
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn elf_with(section: &[u8], overlay: &[u8]) -> Vec<u8> {
+        elf_named(b".rodata", section)
+            .into_iter()
+            .chain(overlay.iter().copied())
+            .collect()
+    }
+
+    fn elf_named(section_name: &[u8], section: &[u8]) -> Vec<u8> {
+        let mut strtab = vec![0];
+        let name_at = strtab.len();
+        strtab.extend_from_slice(section_name);
+        strtab.push(0);
+        let str_name = strtab.len();
+        strtab.extend_from_slice(b".shstrtab");
+        strtab.push(0);
+        let ph_off = 64usize;
+        let ro_off = 120usize;
+        let str_off = ro_off + section.len();
+        let sh_off = str_off + strtab.len();
+        let mut blob = vec![0u8; sh_off + 64 * 3];
+        blob[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        blob[4] = 2;
+        blob[5] = 1;
+        blob[6] = 1;
+        put_u16(&mut blob, 16, 2);
+        put_u16(&mut blob, 18, 0x3e);
+        put_u32(&mut blob, 20, 1);
+        put_u64(&mut blob, 32, ph_off as u64);
+        put_u64(&mut blob, 40, sh_off as u64);
+        put_u16(&mut blob, 52, 64);
+        put_u16(&mut blob, 54, 56);
+        put_u16(&mut blob, 56, 1);
+        put_u16(&mut blob, 58, 64);
+        put_u16(&mut blob, 60, 3);
+        put_u16(&mut blob, 62, 2);
+        put_u32(&mut blob, ph_off, 1);
+        put_u64(&mut blob, ph_off + 8, ro_off as u64);
+        put_u64(&mut blob, ph_off + 32, section.len() as u64);
+        blob[ro_off..ro_off + section.len()].copy_from_slice(section);
+        blob[str_off..str_off + strtab.len()].copy_from_slice(&strtab);
+        let s1 = sh_off + 64;
+        put_u32(&mut blob, s1, name_at as u32);
+        put_u32(&mut blob, s1 + 4, 1);
+        put_u64(&mut blob, s1 + 24, ro_off as u64);
+        put_u64(&mut blob, s1 + 32, section.len() as u64);
+        let s2 = sh_off + 128;
+        put_u32(&mut blob, s2, str_name as u32);
+        put_u32(&mut blob, s2 + 4, 3);
+        put_u64(&mut blob, s2 + 24, str_off as u64);
+        put_u64(&mut blob, s2 + 32, strtab.len() as u64);
+        blob
+    }
+
+    fn pe_with_signer(cert: &[u8]) -> Vec<u8> {
+        let opt_size = 240u16;
+        let lfanew = 0x40u32;
+        let opt = (lfanew as usize) + 24;
+        let section = opt + opt_size as usize;
+        let body = section + 40;
+        let mut blob = vec![0u8; body + cert.len()];
+        blob[0] = b'M';
+        blob[1] = b'Z';
+        put_u32(&mut blob, 0x3c, lfanew);
+        blob[lfanew as usize..lfanew as usize + 4].copy_from_slice(b"PE\0\0");
+        let coff = lfanew as usize + 4;
+        put_u16(&mut blob, coff, 0x8664);
+        put_u16(&mut blob, coff + 2, 1);
+        put_u16(&mut blob, coff + 16, opt_size);
+        put_u16(&mut blob, coff + 18, 2);
+        put_u16(&mut blob, opt, 0x20b);
+        put_u32(&mut blob, opt + 16, 0x1000);
+        put_u32(&mut blob, opt + 60, body as u32);
+        put_u32(&mut blob, opt + 108, 16);
+        put_u32(&mut blob, opt + 144, body as u32);
+        put_u32(&mut blob, opt + 148, cert.len() as u32);
+        blob[section..section + 6].copy_from_slice(b".rdata");
+        put_u32(&mut blob, section + 8, cert.len() as u32);
+        put_u32(&mut blob, section + 12, 0x1000);
+        put_u32(&mut blob, section + 16, cert.len() as u32);
+        put_u32(&mut blob, section + 20, body as u32);
+        blob[body..body + cert.len()].copy_from_slice(cert);
+        blob
+    }
+
+    fn macho_with_signer(cert: &[u8]) -> Vec<u8> {
+        let cert_off = 32 + 72 + 16;
+        let mut blob = vec![0u8; cert_off + cert.len()];
+        blob[0..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        put_u32(&mut blob, 4, 0x0100_0007);
+        put_u32(&mut blob, 12, 2);
+        put_u32(&mut blob, 16, 2);
+        put_u32(&mut blob, 20, 88);
+        put_u32(&mut blob, 32, 0x19);
+        put_u32(&mut blob, 36, 72);
+        blob[40..50].copy_from_slice(b"__LINKEDIT");
+        put_u64(&mut blob, 72, cert_off as u64);
+        put_u64(&mut blob, 80, cert.len() as u64);
+        put_u32(&mut blob, 104, 0x1d);
+        put_u32(&mut blob, 108, 16);
+        put_u32(&mut blob, 112, cert_off as u32);
+        put_u32(&mut blob, 116, cert.len() as u32);
+        blob[cert_off..].copy_from_slice(cert);
+        blob
+    }
+
     fn b64_encode(data: &[u8]) -> Vec<u8> {
         const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = Vec::new();
@@ -1413,8 +2154,159 @@ mod tests {
     }
 
     #[test]
-    fn the_scan_does_not_inflate_gzip() {
-        assert!(scan(GZIP).is_empty());
+    fn a_gzip_member_is_one_full_hit() {
+        let hits = scan(GZIP);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].container, Container::Gzip);
+        assert_eq!(hits[0].encoding, Encoding::Der);
+        assert_eq!(hits[0].role, Role::Trust);
+        assert_eq!(hits[0].place, "file");
+        assert_eq!(hits[0].offset, 0);
+        assert_eq!(hits[0].length, GZIP.len());
+        assert_eq!(hits[0].sha256, sha256(RSA_DER));
+        assert_eq!(hits[0].subject_cn.as_deref(), Some("probe-rsa"));
+    }
+
+    #[test]
+    fn a_zlib_stream_is_one_full_hit() {
+        let wrapped = zlib_of(ED_DER);
+        let hits = scan(&wrapped);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].container, Container::Zlib);
+        assert_eq!(hits[0].sha256, sha256(ED_DER));
+        assert_eq!(hits[0].offset, 0);
+        assert_eq!(hits[0].length, wrapped.len());
+        assert_eq!(hits[0].place, "file");
+    }
+
+    #[test]
+    fn a_deflated_zip_entry_is_one_full_hit() {
+        let payload = deflate_stored(ED_DER);
+        let mut zip = zip_one("ed.der", ED_DER, 8, &payload);
+        zip.extend_from_slice(b"PYINST");
+        let hits = scan(&zip);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].container, Container::Zip);
+        assert_eq!(hits[0].sha256, sha256(ED_DER));
+        assert_eq!(hits[0].place, "file");
+        assert_eq!(hits[0].subject_cn.as_deref(), Some("probe-ed25519"));
+    }
+
+    #[test]
+    fn an_elf_section_overlay_and_zip_keep_their_places() {
+        let mut bytes = elf_with(ED_SPKI, &[]);
+        let zip = zip_one("p256.der", P256_DER, 0, P256_DER);
+        bytes.extend_from_slice(&zip);
+        let hits = scan(&bytes);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].kind, Kind::Anchor);
+        assert_eq!(hits[0].place, ".rodata");
+        assert_eq!(hits[0].container, Container::File);
+        assert_eq!(hits[0].sha256, sha256(ED_SPKI));
+        assert_eq!(hits[1].kind, Kind::Full);
+        assert_eq!(hits[1].place, "overlay");
+        assert_eq!(hits[1].container, Container::Zip);
+        assert_eq!(hits[1].sha256, sha256(P256_DER));
+        let over = elf_with(ED_SPKI, ED_DER);
+        let over_hits = scan(&over);
+        assert!(over_hits.iter().any(|hit| {
+            hit.kind == Kind::Full && hit.place == "overlay" && hit.sha256 == sha256(ED_DER)
+        }));
+    }
+
+    #[test]
+    fn a_sea_section_marks_the_container() {
+        let bytes = elf_named(b"NODE_SEA_BLOB", ED_SPKI);
+        let hits = scan(&bytes);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].container, Container::Sea);
+        assert_eq!(hits[0].place, "NODE_SEA_BLOB");
+        assert_eq!(hits[0].kind, Kind::Anchor);
+        assert_eq!(hits[0].role, Role::Trust);
+    }
+
+    #[test]
+    fn a_pe_certificate_table_is_a_signer() {
+        let bytes = pe_with_signer(ED_DER);
+        let hits = scan(&bytes);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].role, Role::Signer);
+        assert_eq!(hits[0].place, ".rdata");
+        assert_eq!(hits[0].sha256, sha256(ED_DER));
+    }
+
+    #[test]
+    fn a_macho_code_signature_is_a_signer() {
+        let bytes = macho_with_signer(ED_DER);
+        let hits = scan(&bytes);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].role, Role::Signer);
+        assert_eq!(hits[0].place, "__LINKEDIT");
+        assert_eq!(hits[0].sha256, sha256(ED_DER));
+    }
+
+    #[test]
+    fn utf16_pem_is_one_full_hit() {
+        let text = pem_text(ED_DER);
+        let mut wide = Vec::new();
+        for byte in &text {
+            wide.push(*byte);
+            wide.push(0);
+        }
+        let hits = scan(&wide);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].encoding, Encoding::Pem);
+        assert_eq!(hits[0].sha256, sha256(ED_DER));
+        assert_eq!(hits[0].offset, 0);
+        assert_eq!(hits[0].length, wide.len() - 2);
+        assert_eq!(hits[0].place, "file");
+    }
+
+    #[test]
+    fn pins_match_a_cert_hash_and_skip_noise() {
+        let digest = sha256(EMSIGN);
+        let spki = sha256(EMSIGN_SPKI);
+        let mut bytes = EMSIGN.to_vec();
+        bytes.extend_from_slice(b"sha256/");
+        let text_at = bytes.len() - b"sha256/".len();
+        let text = b64_encode(&digest);
+        bytes.extend_from_slice(&text);
+        let text_len = b"sha256/".len() + text.len();
+        bytes.extend_from_slice(b" sha1/aaaaaaaa sha256/not-a-pin ");
+        let raw_at = bytes.len();
+        bytes.extend_from_slice(&spki);
+        bytes.extend_from_slice(&[0x11; 32]);
+        bytes.extend_from_slice(b"sha256/");
+        bytes.extend_from_slice(&b64_encode(&[0xab; 32]));
+        let hits = scan(&bytes);
+        let pins: Vec<_> = hits.iter().filter(|hit| hit.kind == Kind::Pin).collect();
+        assert_eq!(pins.len(), 3);
+        assert_eq!(pins[0].encoding, Encoding::Base64);
+        assert_eq!(pins[0].offset, text_at);
+        assert_eq!(pins[0].length, text_len);
+        assert_eq!(pins[0].sha256, digest);
+        assert_eq!(
+            pins[0].subject_cn.as_deref(),
+            Some("emSign ECC Root CA - G3")
+        );
+        assert_eq!(pins[1].encoding, Encoding::Der);
+        assert_eq!(pins[1].offset, raw_at);
+        assert_eq!(pins[1].length, 32);
+        assert_eq!(pins[1].sha256, spki);
+        assert_eq!(
+            pins[1].subject_cn.as_deref(),
+            Some("emSign ECC Root CA - G3")
+        );
+        assert_eq!(pins[2].encoding, Encoding::Base64);
+        assert_eq!(pins[2].sha256, [0xab; 32]);
+        assert_eq!(pins[2].subject_cn, None);
+        assert_eq!(hits.iter().filter(|hit| hit.kind == Kind::Full).count(), 1);
     }
 
     #[test]
