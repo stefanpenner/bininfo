@@ -1,0 +1,99 @@
+# ---
+# why: This file cites each eMudhra policy fixture.
+# uses: cargo test
+# how: cargo test reads the fixtures named in this file.
+# ---
+#
+# The check date is 2026-10-24.
+# A binary fixture has no comment.
+# This file cites that fixture.
+#
+# The eight eMudhra intermediates and the eight Sectigo cross-signs come from impacted-intermediates.json.
+# URL: https://emudhra.we-have-a-problem.com/impacted-intermediates.json
+# proof.zip on that site has the same eight eMudhra certificates.
+# URL: https://emudhra.we-have-a-problem.com/proof.zip
+# Each proof signature verifies the message in proof/message.txt.
+# The message text is We have a problem here - Wayne.
+# Bugzilla attachment 9664066 has the same eight certificates and the same signatures.
+# URL: https://bugzilla.mozilla.org/attachment.cgi?id=9664066
+# Bugzilla attachment 9664067 has the eight Sectigo cross-signs.
+# URL: https://bugzilla.mozilla.org/attachment.cgi?id=9664067
+# Bug 2083449 records the same sixteen certificate hashes.
+# URL: https://bugzilla.mozilla.org/show_bug.cgi?id=2083449
+# The cvebrief note records the same SPKI hashes.
+# URL: https://cvebrief.com/deep-dives/emudhra-intermediate-ca-compromise/
+# crt.sh hash lookup returned HTTP 502 on 2026-10-24.
+# The certificate bytes were checked against the JSON file and the Bugzilla attachments.
+# EM DV TLS CA - G2A was downloaded from crt.sh certificate 18286207181.
+# URL: https://crt.sh/?d=18286207181
+#
+# intermediates/ holds DER, PEM, base64, gzip, and zip for each eMudhra certificate.
+# sectigo/ holds DER and PEM for each cross-sign.
+# The SPKI matches the eMudhra certificate.
+# The certificate hash does not match.
+#
+# malleable/em-dv-tls-g3b-high-s.der is the eMudhra EM DV TLS CA - G3B certificate.
+# The ECDSA s value is replaced by n minus s.
+# The SPKI bytes stay the same.
+# The certificate hash changes.
+#
+# leaves/example-test-ov-tls-g3c.pem is a test-only leaf.
+# The subject is example.test.
+# The signer is the recovered EM OV TLS CA - G3C key.
+# The public scalar is 4.
+# leaves/example-test-ov-cs-g3b.pem is a test-only leaf.
+# The signer is the recovered EM OV CS CA - G3B key.
+# The public scalar is 66.
+# The matching chain file adds the real intermediate.
+#
+# roots/ comes from roots.json.
+# URL: https://emudhra.we-have-a-problem.com/roots.json
+#
+# bundles/cacert-2026-09-25.pem is the curl CA bundle from 2026-09-25.
+# URL: https://curl.se/ca/cacert-2026-09-25.pem
+# That file still holds emSign ECC Root CA - G3.
+# bundles/cacert-2026-10-20.pem is the curl CA bundle from 2026-10-20.
+# URL: https://curl.se/ca/cacert-2026-10-20.pem
+# That file does not hold emSign ECC Root CA - G3.
+# The bundle bytes are unchanged.
+#
+# negative/emsign-root-ca-g1.pem comes from the 2026-09-25 bundle.
+# negative/emsign-root-ca-c1.pem comes from the 2026-09-25 bundle.
+# negative/emsign-ecc-root-ca-c3.pem comes from the 2026-09-25 bundle.
+# negative/em-dv-tls-g2a.pem is EM DV TLS CA - G2A from crt.sh.
+# negative/emsign-root-tls-ca-g1.pem comes from Bugzilla attachment 9664144.
+# negative/emsign-root-tls-ca-g1-cross.pem comes from Bugzilla attachment 9664144.
+#
+# chains/ is a byte copy of chains.zip from the incident site.
+# URL: https://emudhra.we-have-a-problem.com/chains.zip
+#
+# corelight/emudhra-1.pcap is testing/Traces/emudhra-1.pcap from the Corelight package.
+# URL: https://github.com/corelight/emudhra-weak-keys
+# The pcap holds the zeek-testing leaf and EM OV TLS CA - G3C.
+# corelight/zeek-testing-*.pem files are the public server certificates from that package.
+# corelight/emsign-root-tls-g3-cross-signed.pem is the public cross-signed TLS root.
+# No private key from that package is in this directory.
+#
+# em-dv-tls-g3b eMudhra sha256 42c4accd12c4f59597925e1a08a7a90102608543809308d50ec427e118ba1493 spki ebed6475c2c2d80fcb199f3fe8dd6e6b3ce60b77eb15d4e42c3dec0c6f5b5105
+# em-dv-tls-g3b Sectigo sha256 45a883f349aedfd5f3a649b5498ffb121712ba8b448f3f2a91dbc5a766fcddbe spki ebed6475c2c2d80fcb199f3fe8dd6e6b3ce60b77eb15d4e42c3dec0c6f5b5105
+# em-ov-tls-g3b eMudhra sha256 98b896625c0c230adeec3eb2cf6aad5001ecf9156a68644e82374ce5833bc25b spki 43bffa19d6ef651451f6841e019931e96f6f2eaeff28ab4b6f1ce4576de2717b
+# em-ov-tls-g3b Sectigo sha256 5f1ded4dd590af74631290cf073b122a2aac6a1fa479778a0bd43579bd832699 spki 43bffa19d6ef651451f6841e019931e96f6f2eaeff28ab4b6f1ce4576de2717b
+# em-ev-tls-g3b eMudhra sha256 e7568fe6e12331f4fd7de61da4c7559d0f8eb192a218d4741a3ba75184333838 spki e0254c7fcdc265e2f0f8a428dabb75ab4ae039b4872d62f5ee57f0877d5a8a41
+# em-ev-tls-g3b Sectigo sha256 579480aea166290bd3c643589e795fc0d0e54e86505d180f1dff99efd3199512 spki e0254c7fcdc265e2f0f8a428dabb75ab4ae039b4872d62f5ee57f0877d5a8a41
+# em-dv-tls-g3c eMudhra sha256 0164d7ceae5bb909c272af151ff44b1177ae9b47d9424b94f1d9558c30934d19 spki 49dd353dc2b919a3770645117d0e60c16115e7d1bc259eefe734b00ea434fe5f
+# em-dv-tls-g3c Sectigo sha256 62b7f9868263f72f6911fc78ceaf72c1979158b7368bf648683bb2aa39b02e72 spki 49dd353dc2b919a3770645117d0e60c16115e7d1bc259eefe734b00ea434fe5f
+# em-ov-tls-g3c eMudhra sha256 cb6e15165ac802e9b3f993f16c25d41f4e81c21ebde71ae1b012ac00bf9c7c3f spki 63ecefee431d49523bc1136c4e72d0206a477086caf606cd5cf025686c109cf8
+# em-ov-tls-g3c Sectigo sha256 7485b51c0ed192878fa1d2f948fb529ae1842cc5086c4b67f7be5b2039de9489 spki 63ecefee431d49523bc1136c4e72d0206a477086caf606cd5cf025686c109cf8
+# em-ev-tls-g3c eMudhra sha256 432ec25f0d28de9006d97bf752f17bbb2cd41f669933fcb072d9a1148d0261f3 spki 5c0660a2b164910d8ff589c18e14552e9e0ec237dcefe2cb736d41a4811f81a0
+# em-ev-tls-g3c Sectigo sha256 fd9d5c2dbbd4995ab69b8d50c439d9527b00529199c2fd01b2174eb58f07021f spki 5c0660a2b164910d8ff589c18e14552e9e0ec237dcefe2cb736d41a4811f81a0
+# em-ov-cs-g3b eMudhra sha256 9e39de2881273acc225a149c72ba3e0f51424963669ab633ee1dc7df5db067b4 spki ec4ffa1ad0ac88081314b7aaffef6a91f97cd57291bb5ba686c5415f5eb4f6b6
+# em-ov-cs-g3b Sectigo sha256 a496e23ac0cab8155fc9b117b97eae368efcbb9041aec8804d5a308d2d01c2d8 spki ec4ffa1ad0ac88081314b7aaffef6a91f97cd57291bb5ba686c5415f5eb4f6b6
+# em-ov-cs-g3c eMudhra sha256 4b2460a466f95fd40113bcdcca2ceb29b3b093921de45474da7df48874c630b1 spki 92c063d67e8f14db71d288e11266ffdaf69cbf115f7bab14f3bc2f68d25e0e30
+# em-ov-cs-g3c Sectigo sha256 84112972b8e59d14560ae7e7119654474aad119990cf3722bfc1e3b91615e1fd spki 92c063d67e8f14db71d288e11266ffdaf69cbf115f7bab14f3bc2f68d25e0e30
+# em-dv-tls-g3b-high-s sha256 37e866582d43c35d7c17d47794b974f291b3047b868dc123382477f7a08aefa8 spki ebed6475c2c2d80fcb199f3fe8dd6e6b3ce60b77eb15d4e42c3dec0c6f5b5105
+# emsign-root-tls-g3 sha256 7dd78d5f4f13459a83dff9abbba62edbaf6f2d102bf257fd712f4d9f2746ed8d spki c619e4780ed8e0abeda24ad732567de4383a7ea941338f6d1a7d1b49ac792fe9
+# emsign-root-cs-g3 sha256 f2edaaff3d9b701fb4d14c9f285f8c0bad90fc3bcc1fa07d47f4718edaba34a5 spki 0a6c2b2ca5b364207954171987ac9d2178561569d8205457e77ca90c32ede282
+# sectigo-aaa sha256 d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 spki bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
+# emsign-ecc-g3 sha256 86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b spki 8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782
+# cacert-2026-09-25.pem sha256 a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505 bytes 188900
+# cacert-2026-10-20.pem sha256 796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe bytes 200116

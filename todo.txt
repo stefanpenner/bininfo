@@ -1,0 +1,10 @@
+# ---
+# why: This file lists later certificate container work.
+# uses: a reader
+# how: A reader opens this file at the repo root.
+# ---
+#
+# Later, bininfo::certs reads more compressed files.
+# Add Zip64, a zip inside a zip, and a JAR inside a WAR.
+# Add a streamed zip entry with size zero, and an encrypted zip entry.
+# Add zstd, brotli, xz, an UPX-packed binary, and a PKCS#12 trust store.

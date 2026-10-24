@@ -90,6 +90,7 @@ Put each flag before the file name.
 ```
 cargo run --quiet -- [--json] [--symbols] [--check] [--expect <claim>] <file>
 cargo run --quiet -- [--json] --claims <file>
+cargo run --quiet -- [--json] --policy <file> <file>
 ```
 
 A common `needed` name has a trailing note.
@@ -104,6 +105,24 @@ An unknown name has no note.
 Repeat `--expect` for each claim.
 `--claims` checks each line in a claim file.
 Add `--json` to print a check as JSON.
+`--policy` reads a policy file and judges embedded certificates.
+It does not print the page.
+A deny exits 1.
+A warn keeps exit 0.
+
+```
+cargo run --quiet -- --policy policies/distrusted.policy <file>
+```
+
+A rule line has this shape.
+
+```
+deny <id> spki <64 hex characters> :: <message>
+warn <id> issuer "<common name>" :: <message>
+```
+
+`spki` is the preferred match key.
+It is the SHA-256 of the public key bytes in the certificate.
 
 `hermetic` passes when all three facts are true.
 

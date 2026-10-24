@@ -4,6 +4,7 @@ why: This file is the library a caller uses.
 uses: bininfo
 how: The bininfo command calls open, render, and facts.
 A caller uses certs to scan file bytes.
+A caller uses check_policy to judge those hits.
 ---
 */
 
@@ -11,6 +12,8 @@ A caller uses certs to scan file bytes.
 //! `open` reads the bytes. `render` prints the page. `facts` feeds a claim.
 //! `elf`, `macho`, and `pe` read one format each.
 //! `certs` finds embedded certificates in file bytes.
+//! `policy` judges those hits.
+//! `check_policy` parses a policy and judges one file.
 
 pub mod certs;
 pub mod claim;
@@ -18,6 +21,7 @@ pub mod elf;
 pub mod kind;
 pub mod macho;
 pub mod pe;
+pub mod policy;
 
 mod library;
 mod style;
@@ -172,6 +176,12 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
 /// The scan reads DER, PEM, bare base64, gzip, zlib, and zip.
 pub fn certs(bytes: &[u8]) -> Vec<certs::Hit> {
     certs::scan(bytes)
+}
+
+/// Parse `text` and judge the certificates in `bytes`.
+pub fn check_policy(bytes: &[u8], text: &str) -> Result<policy::Report, String> {
+    let parsed = policy::parse(text)?;
+    Ok(policy::judge(&certs(bytes), &parsed))
 }
 
 /// Read the CPU and OS of this machine.
