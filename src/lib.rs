@@ -10,7 +10,9 @@ Another crate calls the same functions.
 //! Read one ELF, Mach-O, or PE file.
 //! `open` reads the bytes. `render` prints the page. `facts` feeds a claim.
 //! `elf`, `macho`, and `pe` read one format each.
+//! `certs` finds embedded certificates in file bytes.
 
+pub mod certs;
 pub mod claim;
 pub mod elf;
 pub mod kind;
@@ -164,6 +166,11 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
             host: claim::host_marks(&pe::symbols::floors(header, symbols), host),
         },
     }
+}
+
+/// Scan `bytes` for embedded certificates and trust anchors.
+pub fn certs(bytes: &[u8]) -> Vec<certs::Hit> {
+    certs::scan(bytes)
 }
 
 /// Read the CPU and OS of this machine.
