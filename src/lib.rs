@@ -169,7 +169,7 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
 }
 
 /// Scan `bytes` for embedded certificates and trust anchors.
-/// The scan reads DER, PEM, and bare base64.
+/// The scan reads DER, PEM, bare base64, gzip, zlib, and zip.
 pub fn certs(bytes: &[u8]) -> Vec<certs::Hit> {
     certs::scan(bytes)
 }
