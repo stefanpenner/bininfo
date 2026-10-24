@@ -12,6 +12,7 @@ Another crate calls the same functions.
 //! `elf`, `macho`, and `pe` read one format each.
 
 pub mod claim;
+pub mod certs;
 pub mod elf;
 pub mod kind;
 pub mod macho;
@@ -164,6 +165,11 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
             host: claim::host_marks(&pe::symbols::floors(header, symbols), host),
         },
     }
+}
+
+/// Scan the whole file for embedded certificates and trust anchors.
+pub fn certs(bytes: &[u8]) -> Vec<certs::Hit> {
+    certs::scan(bytes)
 }
 
 /// Read the CPU and OS of this machine.
