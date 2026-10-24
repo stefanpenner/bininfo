@@ -5,13 +5,14 @@ uses: bininfo
 how: The command reads arguments and one file.
 A terminal folds the page.
 A pipe prints the full page.
-It calls the bininfo library to print a page or check a claim.
+It calls the bininfo library to print a page, check a claim, or apply a policy.
 ---
 */
 
 //! Read an ELF, Mach-O, or PE header and print it.
 //! A terminal folds the page. A pipe prints the full page.
 //! `--check` asks whether the header names no other file.
+//! `--policy` judges embedded certificates and does not print the page.
 
 mod fold;
 mod tui;
@@ -24,6 +25,7 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 usage: bininfo [--json] [--symbols] [--check] [--expect <claim>] <file>
 usage: bininfo [--json] --claims <file>
+usage: bininfo [--json] --policy <file> <file>
 A terminal folds the page. A pipe prints the full page.";
 
 fn main() -> ExitCode {
@@ -49,6 +51,11 @@ enum Job {
     },
     Claims {
         path: String,
+        json: bool,
+    },
+    Policy {
+        path: String,
+        policy: String,
         json: bool,
     },
 }
@@ -80,6 +87,23 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
             check_one(&path, &claims, json)
         }
         Job::Claims { path, json } => check_file(&path, json),
+        Job::Policy { path, policy, json } => check_policy(&path, &policy, json),
+    }
+}
+
+fn check_policy(path: &str, policy: &str, json: bool) -> Result<ExitCode, String> {
+    let text = fs::read_to_string(policy).map_err(|err| format!("cannot read {policy}: {err}"))?;
+    let bytes = read_file(path)?;
+    let report = bininfo::check_policy(&bytes, &text)?;
+    if json {
+        print!("{}", bininfo::policy::summary_json(path, &report));
+    } else {
+        print!("{}", bininfo::policy::summary(path, &report));
+    }
+    if report.failed() {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -172,6 +196,7 @@ fn args_of(args: impl Iterator<Item = String>) -> Result<Job, String> {
     let mut check = false;
     let mut claims = None;
     let mut expect = Vec::new();
+    let mut policy = None;
     let mut path = None;
     let mut index = 0;
     while index < args.len() {
@@ -194,6 +219,15 @@ fn args_of(args: impl Iterator<Item = String>) -> Result<Job, String> {
                 return Err(USAGE.into());
             }
             claims = Some(file.clone());
+        } else if arg == "--policy" {
+            index += 1;
+            let Some(file) = args.get(index) else {
+                return Err(USAGE.into());
+            };
+            if file.starts_with('-') || policy.is_some() {
+                return Err(USAGE.into());
+            }
+            policy = Some(file.clone());
         } else if arg == "--expect" {
             index += 1;
             let Some(token) = args.get(index) else {
@@ -211,10 +245,19 @@ fn args_of(args: impl Iterator<Item = String>) -> Result<Job, String> {
         index += 1;
     }
     if let Some(file) = claims {
-        if path.is_some() || check || symbols || !expect.is_empty() {
+        if path.is_some() || check || symbols || !expect.is_empty() || policy.is_some() {
             return Err(USAGE.into());
         }
         return Ok(Job::Claims { path: file, json });
+    }
+    if let Some(policy) = policy {
+        if check || symbols || !expect.is_empty() {
+            return Err(USAGE.into());
+        }
+        let Some(path) = path else {
+            return Err(USAGE.into());
+        };
+        return Ok(Job::Policy { path, policy, json });
     }
     let Some(path) = path else {
         return Err(USAGE.into());

@@ -1,3 +1,11 @@
+/*
+---
+why: This file checks the bininfo command.
+uses: cargo test
+how: cargo test runs the bininfo command on small files.
+---
+*/
+
 use std::fs;
 use std::process::Command;
 
@@ -354,4 +362,59 @@ fn a_fat_macho_opens_each_slice() {
     assert!(check_text.contains("hermetic: true"), "{check_text}");
     assert!(!check_text.contains("says:"), "{check_text}");
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn a_policy_deny_exits_1_and_a_warn_exits_0() {
+    let deny = bin()
+        .arg("--policy")
+        .arg("policies/distrusted.policy")
+        .arg("tests/fixtures/emsign-ecc-g3.der")
+        .output()
+        .unwrap();
+    assert_eq!(deny.status.code(), Some(1));
+    let text = String::from_utf8(deny.stdout).unwrap();
+    assert!(text.contains("result: fail"), "{text}");
+    assert!(text.contains("deny emsign-ecc-g3 "), "{text}");
+    assert!(!text.contains("\ntype:"), "{text}");
+
+    let warn = bin()
+        .arg("--policy")
+        .arg("policies/distrusted.policy")
+        .arg("tests/fixtures/emudhra/roots/emsign-root-tls-g3.pem")
+        .output()
+        .unwrap();
+    assert!(
+        warn.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warn.stderr)
+    );
+    let text = String::from_utf8(warn.stdout).unwrap();
+    assert!(text.contains("result: pass"), "{text}");
+    assert!(text.contains("warn emsign-root-tls-g3 "), "{text}");
+
+    let safe = bin()
+        .arg("--policy")
+        .arg("policies/distrusted.policy")
+        .arg("tests/fixtures/emudhra/negative/emsign-root-ca-g1.pem")
+        .output()
+        .unwrap();
+    assert!(
+        safe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&safe.stderr)
+    );
+    let text = String::from_utf8(safe.stdout).unwrap();
+    assert!(text.contains("denies: 0"), "{text}");
+    assert!(!text.contains("\ndeny "), "{text}");
+
+    let mixed = bin()
+        .arg("--check")
+        .arg("--policy")
+        .arg("policies/distrusted.policy")
+        .arg("tests/fixtures/emsign-ecc-g3.der")
+        .output()
+        .unwrap();
+    assert!(!mixed.status.success());
+    assert!(String::from_utf8_lossy(&mixed.stderr).contains("usage: bininfo"));
 }

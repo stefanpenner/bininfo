@@ -56,3 +56,13 @@ fn a_caller_opens_one_elf_and_checks_a_claim() {
     let misses = bininfo::claim::judge(&facts, &claims);
     assert!(misses.is_empty(), "{misses:?}");
 }
+
+#[test]
+fn a_caller_checks_a_certificate_policy() {
+    let bytes = include_bytes!("fixtures/emsign-ecc-g3.der");
+    let text = include_str!("../policies/distrusted.policy");
+    let report = bininfo::check_policy(bytes, text).unwrap();
+    assert!(report.failed());
+    assert!(report.denies() >= 1);
+    assert!(bininfo::check_policy(bytes, "deny bad\n").is_err());
+}
