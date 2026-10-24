@@ -3,198 +3,689 @@
 why: This file finds embedded certificates and trust anchors in a binary.
 uses: bininfo
 how: bininfo calls this file to scan read-only bytes.
-This file does not print the page.
+The scan reads DER, PEM, and bare base64.
+The scan does not inflate gzip or zlib.
+The scan rejects BER indefinite length.
 ---
 */
 
-//! Scan a byte slice for ASN.1 certificate sequences.
+//! Scan a byte slice for certificates and trust anchors.
 //! A full certificate has an X.509 body, a signature algorithm, and a signature.
-//! A trust anchor is a smaller DER fragment.
+//! An anchor is a public key or trust-anchor info with a known key.
+//! A body is a bare certificate body.
+//! The scan reads DER, PEM, and bare base64.
+//! The scan does not inflate gzip or zlib.
+//! The scan rejects BER indefinite length.
 
 /// One hit in the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
-    /// File offset of the first byte.
+    /// File offset of the DER object or the encoded text.
     pub offset: usize,
-    /// Length of the SEQUENCE. The count includes the tag and the length bytes.
+    /// DER length includes the tag and the length bytes.
+    /// PEM length and base64 length are the text span.
     pub length: usize,
-    /// Full certificate or minimal trust-anchor fragment.
+    /// Full certificate, trust anchor, or bare certificate body.
     pub kind: Kind,
+    /// DER, PEM, or bare base64.
+    pub encoding: Encoding,
+    /// SHA-256 of the DER object.
+    pub sha256: [u8; 32],
+    /// SHA-256 of the public key.
+    pub spki_sha256: [u8; 32],
+    /// Subject common name. An anchor has none.
+    pub subject_cn: Option<String>,
 }
 
-/// Full X.509 certificate or a smaller trust-anchor fragment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Full X.509 certificate, trust anchor, or bare certificate body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     /// The bytes have the X.509 certificate shape.
     Full,
-    /// The bytes are a public key, trust-anchor info, or a certificate body.
+    /// The bytes are a public key or trust-anchor info.
     Anchor,
+    /// The bytes are a bare certificate body.
+    Body,
+}
+
+/// Wire form of one hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Encoding {
+    /// Raw DER in the file.
+    Der,
+    /// A PEM certificate block.
+    Pem,
+    /// A bare base64 run.
+    Base64,
 }
 
 /// Scan `bytes` for embedded certificates and trust anchors.
 ///
-/// A hit starts at the long-form SEQUENCE tag `30 81` or `30 82`.
-/// The length uses the shortest DER form.
-/// The scan moves to the first byte after an accepted hit.
-/// The scan reads the bytes inside a rejected sequence.
+/// A DER hit starts at a canonical SEQUENCE tag.
+/// The scan reads PEM blocks and bare base64 before the DER walk.
+/// The scan reads the bytes inside a full certificate for a nested certificate.
+/// The scan does not inflate gzip or zlib.
+/// The scan rejects BER indefinite length.
 pub fn scan(bytes: &[u8]) -> Vec<Hit> {
     let mut hits = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if !long_sequence_at(bytes, index) {
-            index += 1;
-            continue;
-        }
-        let Some(total) = sequence_len(&bytes[index..]) else {
-            index += 1;
-            continue;
-        };
-        let Some(end) = index.checked_add(total) else {
-            index += 1;
-            continue;
-        };
-        if end > bytes.len() || end <= index {
-            index += 1;
-            continue;
-        }
-        if let Some(kind) = classify(&bytes[index..end]) {
-            hits.push(Hit {
-                offset: index,
-                length: total,
-                kind,
-            });
-            index = end;
-        } else {
-            index += 1;
-        }
-    }
+    let mut covered = Vec::new();
+    scan_pem(bytes, &mut hits, &mut covered);
+    scan_b64(bytes, &mut covered, &mut hits);
+    scan_der(bytes, &covered, &mut hits);
+    hits.sort_by(|left, right| {
+        left.offset
+            .cmp(&right.offset)
+            .then(left.length.cmp(&right.length))
+            .then(left.sha256.cmp(&right.sha256))
+            .then(left.kind.cmp(&right.kind))
+            .then(left.encoding.cmp(&right.encoding))
+            .then(left.subject_cn.cmp(&right.subject_cn))
+    });
     hits
 }
 
-struct Part<'a> {
+const MAX_CONTENT: usize = 1 << 20;
+const MIN_OBJECT: usize = 44;
+const MIN_B64: usize = 56;
+const MAX_B64: usize = 256_000;
+const MAX_PEM: usize = 2_000_000;
+const MAX_DEPTH: usize = 8;
+const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+const END: &[u8] = b"-----END CERTIFICATE-----";
+
+const RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+const EC: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+const P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+const P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+const P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23];
+const ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+const ED448: &[u8] = &[0x2b, 0x65, 0x71];
+const X25519: &[u8] = &[0x2b, 0x65, 0x6e];
+const X448: &[u8] = &[0x2b, 0x65, 0x6f];
+const CN_OID: &[u8] = &[0x55, 0x04, 0x03];
+
+struct Found<'a> {
+    kind: Kind,
+    spki: &'a [u8],
+    subject: Option<&'a [u8]>,
+}
+
+#[derive(Clone, Copy)]
+struct Part {
     tag: u8,
-    content: &'a [u8],
+    start: usize,
+    head: usize,
+    end: usize,
 }
 
-fn long_sequence_at(bytes: &[u8], index: usize) -> bool {
-    bytes.get(index) == Some(&0x30) && matches!(bytes.get(index + 1), Some(0x81 | 0x82))
-}
-
-fn sequence_len(bytes: &[u8]) -> Option<usize> {
-    if !matches!(bytes.get(1), Some(0x81 | 0x82)) {
-        return None;
-    }
-    let (tag, _content, end) = next_part(bytes, 0)?;
-    if tag != 0x30 {
-        return None;
-    }
-    Some(end)
-}
-
-fn classify(slice: &[u8]) -> Option<Kind> {
-    let (tag, content, end) = next_part(slice, 0)?;
-    if tag != 0x30 || end != slice.len() || !matches!(slice.get(1), Some(0x81 | 0x82)) {
-        return None;
-    }
-    let kids = parts(content)?;
-    if is_cert(&kids) {
-        Some(Kind::Full)
-    } else if is_anchor(&kids) {
-        Some(Kind::Anchor)
-    } else {
-        None
-    }
-}
-
-fn is_cert(kids: &[Part<'_>]) -> bool {
-    if kids.len() != 3 || kids[0].tag != 0x30 || kids[1].tag != 0x30 || kids[2].tag != 0x03 {
-        return false;
-    }
-    if !alg_ok(kids[1].content) || !bit_ok(kids[2].content) {
-        return false;
-    }
-    let Some(body) = parts(kids[0].content) else {
-        return false;
-    };
-    tbs_parts_ok(&body, Some(kids[1].content))
-}
-
-fn is_anchor(kids: &[Part<'_>]) -> bool {
-    is_spki_kids(kids) || is_tai(kids) || tbs_parts_ok(kids, None)
-}
-
-fn is_spki_kids(kids: &[Part<'_>]) -> bool {
-    kids.len() == 2
-        && kids[0].tag == 0x30
-        && alg_ok(kids[0].content)
-        && kids[1].tag == 0x03
-        && bit_ok(kids[1].content)
-}
-
-fn is_spki_content(content: &[u8]) -> bool {
-    match parts(content) {
-        Some(fields) => is_spki_kids(&fields),
-        None => false,
-    }
-}
-
-fn is_tai(kids: &[Part<'_>]) -> bool {
-    match kids {
-        [key] if key.tag == 0x30 => is_spki_content(key.content),
-        [version, key] if version.tag == 0x02 && key.tag == 0x30 => {
-            version_one(version.content) && is_spki_content(key.content)
+impl Part {
+    const fn zero() -> Self {
+        Self {
+            tag: 0,
+            start: 0,
+            head: 0,
+            end: 0,
         }
-        _ => false,
+    }
+
+    fn raw<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+        &bytes[self.start..self.end]
+    }
+
+    fn content<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+        &bytes[self.head..self.end]
     }
 }
 
-fn tbs_parts_ok(fields: &[Part<'_>], signature_alg: Option<&[u8]>) -> bool {
+fn scan_pem(bytes: &[u8], hits: &mut Vec<Hit>, covered: &mut Vec<(usize, usize)>) {
+    let mut from = 0;
+    while from < bytes.len() {
+        let Some(start) = find_slice(bytes, BEGIN, from) else {
+            break;
+        };
+        let body = start + BEGIN.len();
+        let Some(end_at) = find_slice(bytes, END, body) else {
+            from = body;
+            continue;
+        };
+        let finish = end_at + END.len();
+        if end_at - body <= MAX_PEM {
+            if let Some(der) = b64_decode(&bytes[body..end_at]) {
+                let mut inner = Vec::new();
+                walk(&der, 0, Encoding::Pem, false, 0, &mut inner);
+                let span = finish - start;
+                for hit in &mut inner {
+                    hit.offset = start;
+                    hit.length = span;
+                }
+                hits.extend(inner);
+            }
+        }
+        covered.push((start, finish));
+        from = finish;
+    }
+}
+
+fn scan_b64(bytes: &[u8], covered: &mut Vec<(usize, usize)>, hits: &mut Vec<Hit>) {
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(end) = covered_end(index, covered) {
+            index = end;
+            continue;
+        }
+        if !is_b64(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut too_long = false;
+        while index < bytes.len() && is_b64(bytes[index]) && covered_end(index, covered).is_none() {
+            index += 1;
+            if index - start > MAX_B64 {
+                too_long = true;
+                break;
+            }
+        }
+        if too_long {
+            while index < bytes.len() && (is_b64(bytes[index]) || bytes[index] == b'=') {
+                index += 1;
+            }
+            continue;
+        }
+        let mut end = index;
+        let mut pads = 0;
+        while end < bytes.len()
+            && pads < 2
+            && bytes[end] == b'='
+            && end - start <= MAX_B64
+            && covered_end(end, covered).is_none()
+        {
+            end += 1;
+            pads += 1;
+        }
+        let run = end - start;
+        if run >= MIN_B64 && run % 4 == 0 {
+            if let Some(der) = b64_decode(&bytes[start..end]) {
+                let mut inner = Vec::new();
+                walk(&der, 0, Encoding::Base64, false, 0, &mut inner);
+                let covers = inner
+                    .iter()
+                    .any(|hit| hit.offset == 0 && hit.length == der.len());
+                if covers {
+                    let span = end - start;
+                    for hit in &mut inner {
+                        hit.offset = start;
+                        hit.length = span;
+                    }
+                    hits.extend(inner);
+                    covered.push((start, end));
+                }
+            }
+        }
+        if end == start {
+            index = start + 1;
+        } else {
+            index = end;
+        }
+    }
+}
+
+fn scan_der(bytes: &[u8], covered: &[(usize, usize)], hits: &mut Vec<Hit>) {
+    let mut spans = covered.to_vec();
+    spans.sort_unstable();
+    let mut cursor = 0;
+    for (start, end) in spans {
+        if cursor >= bytes.len() {
+            break;
+        }
+        let start = start.min(bytes.len());
+        if start > cursor {
+            walk(&bytes[cursor..start], cursor, Encoding::Der, false, 0, hits);
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < bytes.len() {
+        walk(&bytes[cursor..], cursor, Encoding::Der, false, 0, hits);
+    }
+}
+
+fn walk(
+    bytes: &[u8],
+    base: usize,
+    encoding: Encoding,
+    nested_only: bool,
+    depth: usize,
+    hits: &mut Vec<Hit>,
+) {
+    let mut index = 0;
+    while index < bytes.len() {
+        let Some(total) = sequence_total(bytes, index) else {
+            if !nested_only {
+                if let Some(span) = unwrapped_spki(bytes, index) {
+                    let content = &bytes[index..index + span];
+                    let wrapped = wrap_sequence(content);
+                    let digest = sha256(&wrapped);
+                    hits.push(Hit {
+                        offset: base + index,
+                        length: span,
+                        kind: Kind::Anchor,
+                        encoding,
+                        sha256: digest,
+                        spki_sha256: digest,
+                        subject_cn: None,
+                    });
+                    index += span;
+                    continue;
+                }
+            }
+            index += 1;
+            continue;
+        };
+        let slice = &bytes[index..index + total];
+        if let Some(found) = classify(slice) {
+            let record = !nested_only || found.kind == Kind::Full;
+            if record {
+                hits.push(hit_from(base + index, total, encoding, slice, &found));
+            }
+            let dive = record && matches!(found.kind, Kind::Full | Kind::Body) && depth < MAX_DEPTH;
+            if dive {
+                if let Some(header) = header_len(slice) {
+                    if header < slice.len() {
+                        walk(
+                            &slice[header..],
+                            base + index + header,
+                            encoding,
+                            true,
+                            depth + 1,
+                            hits,
+                        );
+                    }
+                }
+            }
+            if record {
+                index += total;
+                continue;
+            }
+        }
+        index += 1;
+    }
+}
+
+fn hit_from(
+    offset: usize,
+    length: usize,
+    encoding: Encoding,
+    der: &[u8],
+    found: &Found<'_>,
+) -> Hit {
+    Hit {
+        offset,
+        length,
+        kind: found.kind,
+        encoding,
+        sha256: sha256(der),
+        spki_sha256: sha256(found.spki),
+        subject_cn: found.subject.and_then(subject_cn),
+    }
+}
+
+fn covered_end(index: usize, covered: &[(usize, usize)]) -> Option<usize> {
+    covered
+        .iter()
+        .find(|(start, end)| index >= *start && index < *end)
+        .map(|(_, end)| *end)
+}
+
+fn find_slice(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= hay.len() || hay.len() - from < needle.len() {
+        return None;
+    }
+    hay[from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|index| index + from)
+}
+
+fn is_b64(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+}
+
+// Some trust anchors omit the outer SEQUENCE tag.
+fn unwrapped_spki(bytes: &[u8], index: usize) -> Option<usize> {
+    if bytes.get(index) != Some(&0x30) {
+        return None;
+    }
+    let (tag, _, alg_end) = next_part(bytes, index)?;
+    if tag != 0x30 || alg_end.saturating_sub(index) > 40 {
+        return None;
+    }
+    if bytes.get(alg_end) != Some(&0x03) {
+        return None;
+    }
+    let (bit_tag, _, end) = next_part(bytes, alg_end)?;
+    if bit_tag != 0x03 || end <= index {
+        return None;
+    }
+    let content = &bytes[index..end];
+    let mut kids = [Part::zero(); 4];
+    let count = fill(content, &mut kids)?;
+    if !spki_parts_ok(content, &kids[..count]) {
+        return None;
+    }
+    Some(end - index)
+}
+
+fn wrap_sequence(content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len() + 4);
+    out.push(0x30);
+    let len = content.len();
+    if len < 0x80 {
+        out.push(u8::try_from(len).unwrap_or(0));
+    } else if len <= 0xff {
+        out.push(0x81);
+        out.push(u8::try_from(len).unwrap_or(0));
+    } else if len <= 0xffff {
+        out.push(0x82);
+        out.extend_from_slice(&u16::try_from(len).unwrap_or(0).to_be_bytes());
+    } else {
+        out.push(0x83);
+        let be = u32::try_from(len).unwrap_or(0).to_be_bytes();
+        out.extend_from_slice(&be[1..]);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+fn sequence_total(bytes: &[u8], index: usize) -> Option<usize> {
+    if bytes.get(index) != Some(&0x30) {
+        return None;
+    }
+    let (content_len, len_bytes) = der_len(bytes.get(index + 1..)?)?;
+    let header = len_bytes.checked_add(1)?;
+    let total = header.checked_add(content_len)?;
+    if total < MIN_OBJECT {
+        return None;
+    }
+    let end = index.checked_add(total)?;
+    if end > bytes.len() {
+        return None;
+    }
+    let first = *bytes.get(index + header)?;
+    if first != 0x30 && first != 0xa0 && first != 0x02 {
+        return None;
+    }
+    Some(total)
+}
+
+fn header_len(slice: &[u8]) -> Option<usize> {
+    let (_, len_bytes) = der_len(slice.get(1..)?)?;
+    Some(len_bytes + 1)
+}
+
+fn classify(slice: &[u8]) -> Option<Found<'_>> {
+    let (tag, head, end) = next_part(slice, 0)?;
+    if tag != 0x30 || end != slice.len() {
+        return None;
+    }
+    let body = &slice[head..end];
+    let first = *body.first()?;
+    if first != 0x30 && first != 0xa0 && first != 0x02 {
+        return None;
+    }
+    let mut kids = [Part::zero(); 16];
+    let count = fill(body, &mut kids)?;
+    let kids = &kids[..count];
+    if let Some(found) = as_cert(body, kids) {
+        return Some(found);
+    }
+    if let Some(found) = as_spki(body, kids, slice) {
+        return Some(found);
+    }
+    if let Some(found) = as_tai(body, kids) {
+        return Some(found);
+    }
+    as_body(body, kids)
+}
+
+fn as_cert<'a>(body: &'a [u8], kids: &[Part]) -> Option<Found<'a>> {
+    if kids.len() != 3 || kids[0].tag != 0x30 || kids[1].tag != 0x30 || kids[2].tag != 0x03 {
+        return None;
+    }
+    if !alg_ok(kids[1].content(body)) || !bit_ok(kids[2].content(body)) {
+        return None;
+    }
+    let tbs = kids[0].content(body);
+    let mut fields = [Part::zero(); 16];
+    let count = fill(tbs, &mut fields)?;
+    let (spki, subject) = tbs_pair(tbs, &fields[..count], Some(kids[1].content(body)))?;
+    Some(Found {
+        kind: Kind::Full,
+        spki,
+        subject: Some(subject),
+    })
+}
+
+fn as_spki<'a>(body: &'a [u8], kids: &[Part], whole: &'a [u8]) -> Option<Found<'a>> {
+    if !spki_parts_ok(body, kids) {
+        return None;
+    }
+    Some(Found {
+        kind: Kind::Anchor,
+        spki: whole,
+        subject: None,
+    })
+}
+
+fn as_tai<'a>(body: &'a [u8], kids: &[Part]) -> Option<Found<'a>> {
+    let mut index = 0;
+    if kids.first().map(|part| part.tag) == Some(0x02) {
+        if !version_one(kids[0].content(body)) {
+            return None;
+        }
+        index = 1;
+    }
+    if index >= kids.len() || kids[index].tag != 0x30 {
+        return None;
+    }
+    let spki = kids[index].raw(body);
+    if !spki_ok(spki) {
+        return None;
+    }
+    index += 1;
+    if index < kids.len() {
+        let id = kids[index];
+        if kids.len() != index + 1 || id.tag != 0x04 {
+            return None;
+        }
+        let len = id.end.saturating_sub(id.head);
+        if !(1..=64).contains(&len) {
+            return None;
+        }
+    }
+    Some(Found {
+        kind: Kind::Anchor,
+        spki,
+        subject: None,
+    })
+}
+
+fn as_body<'a>(body: &'a [u8], kids: &[Part]) -> Option<Found<'a>> {
+    let (spki, subject) = tbs_pair(body, kids, None)?;
+    Some(Found {
+        kind: Kind::Body,
+        spki,
+        subject: Some(subject),
+    })
+}
+
+fn tbs_pair<'a>(
+    bytes: &'a [u8],
+    fields: &[Part],
+    signature: Option<&[u8]>,
+) -> Option<(&'a [u8], &'a [u8])> {
     let mut rest = fields;
     if let Some(first) = rest.first() {
         if first.tag == 0xa0 {
-            if !version_ok(first.content) {
-                return false;
+            if !version_ok(first.content(bytes)) {
+                return None;
             }
             rest = &rest[1..];
         }
     }
     if rest.len() < 6 {
-        return false;
+        return None;
     }
-    if rest[0].tag != 0x02 || !serial_ok(rest[0].content) {
-        return false;
+    if rest[0].tag != 0x02 || !serial_ok(rest[0].content(bytes)) {
+        return None;
     }
-    if rest[1].tag != 0x30 || !alg_ok(rest[1].content) {
-        return false;
+    if rest[1].tag != 0x30 || !alg_ok(rest[1].content(bytes)) {
+        return None;
     }
-    if let Some(signature_alg) = signature_alg {
-        if rest[1].content != signature_alg {
-            return false;
+    if let Some(signature) = signature {
+        if rest[1].content(bytes) != signature {
+            return None;
         }
     }
-    if rest[2].tag != 0x30 || !name_ok(rest[2].content) {
+    if rest[2].tag != 0x30 || !name_ok(rest[2].content(bytes)) {
+        return None;
+    }
+    if rest[3].tag != 0x30 || !validity_ok(rest[3].content(bytes)) {
+        return None;
+    }
+    if rest[4].tag != 0x30 || !name_ok(rest[4].content(bytes)) {
+        return None;
+    }
+    if rest[5].tag != 0x30 || !spki_ok(rest[5].raw(bytes)) {
+        return None;
+    }
+    if !rest[6..].iter().all(|field| field.tag & 0xc0 == 0x80) {
+        return None;
+    }
+    Some((rest[5].raw(bytes), rest[4].content(bytes)))
+}
+
+fn spki_ok(bytes: &[u8]) -> bool {
+    let Some((tag, head, end)) = next_part(bytes, 0) else {
+        return false;
+    };
+    if tag != 0x30 || end != bytes.len() {
         return false;
     }
-    if rest[3].tag != 0x30 || !validity_ok(rest[3].content) {
+    let mut kids = [Part::zero(); 4];
+    let Some(count) = fill(&bytes[head..end], &mut kids) else {
+        return false;
+    };
+    spki_parts_ok(&bytes[head..end], &kids[..count])
+}
+
+fn spki_parts_ok(body: &[u8], kids: &[Part]) -> bool {
+    if kids.len() != 2 || kids[0].tag != 0x30 || kids[1].tag != 0x03 {
         return false;
     }
-    if rest[4].tag != 0x30 || !name_ok(rest[4].content) {
+    let alg = kids[0].content(body);
+    let bits = kids[1].content(body);
+    let mut fields = [Part::zero(); 4];
+    let Some(count) = fill(alg, &mut fields) else {
+        return false;
+    };
+    let fields = &fields[..count];
+    if fields.is_empty() || fields[0].tag != 0x06 || !oid_ok(fields[0].content(alg)) {
         return false;
     }
-    if rest[5].tag != 0x30 || !is_spki_content(rest[5].content) {
+    let oid = fields[0].content(alg);
+    if oid == RSA {
+        return fields.len() == 2 && fields[1].raw(alg) == [0x05, 0x00] && rsa_ok(bits);
+    }
+    if oid == EC {
+        return fields.len() == 2 && fields[1].tag == 0x06 && ec_ok(fields[1].content(alg), bits);
+    }
+    if fields.len() != 1 {
         return false;
     }
-    rest[6..].iter().all(|field| field.tag & 0xc0 == 0x80)
+    if oid == ED25519 {
+        return raw_len(bits, 32);
+    }
+    if oid == ED448 {
+        return raw_len(bits, 57);
+    }
+    if oid == X25519 {
+        return raw_len(bits, 32);
+    }
+    if oid == X448 {
+        return raw_len(bits, 56);
+    }
+    false
+}
+
+fn rsa_ok(bits: &[u8]) -> bool {
+    let Some((&0, payload)) = bits.split_first() else {
+        return false;
+    };
+    let mut wrap = [Part::zero(); 2];
+    let Some(count) = fill(payload, &mut wrap) else {
+        return false;
+    };
+    if count != 1 || wrap[0].tag != 0x30 {
+        return false;
+    }
+    let seq = wrap[0].content(payload);
+    let mut kids = [Part::zero(); 4];
+    let Some(count) = fill(seq, &mut kids) else {
+        return false;
+    };
+    let kids = &kids[..count];
+    if kids.len() != 2 || kids[0].tag != 0x02 || kids[1].tag != 0x02 {
+        return false;
+    }
+    let modulus = kids[0].content(seq);
+    let exponent = kids[1].content(seq);
+    if !integer_ok(modulus) || !integer_ok(exponent) {
+        return false;
+    }
+    let mut mod_len = modulus.len();
+    if modulus.first() == Some(&0x00) {
+        mod_len -= 1;
+    }
+    (64..=1024).contains(&mod_len) && (1..=8).contains(&exponent.len())
+}
+
+fn ec_ok(curve: &[u8], bits: &[u8]) -> bool {
+    let coord = if curve == P256 {
+        32
+    } else if curve == P384 {
+        48
+    } else if curve == P521 {
+        66
+    } else {
+        return false;
+    };
+    let Some((&0, point)) = bits.split_first() else {
+        return false;
+    };
+    if point.is_empty() {
+        return false;
+    }
+    match point[0] {
+        0x04 => point.len() == 1 + coord + coord,
+        0x02 | 0x03 => point.len() == 1 + coord,
+        _ => false,
+    }
+}
+
+fn raw_len(bits: &[u8], len: usize) -> bool {
+    matches!(bits.split_first(), Some((&0, key)) if key.len() == len)
 }
 
 fn version_ok(content: &[u8]) -> bool {
-    let Some(fields) = parts(content) else {
+    let mut kids = [Part::zero(); 2];
+    let Some(count) = fill(content, &mut kids) else {
         return false;
     };
-    if fields.len() != 1 || fields[0].tag != 0x02 {
-        return false;
-    }
-    integer_ok(fields[0].content) && matches!(unsigned(fields[0].content), Some(0..=2))
+    let kids = &kids[..count];
+    kids.len() == 1
+        && kids[0].tag == 0x02
+        && integer_ok(kids[0].content(content))
+        && matches!(unsigned(kids[0].content(content)), Some(0..=2))
 }
 
 fn version_one(content: &[u8]) -> bool {
@@ -230,13 +721,15 @@ fn unsigned(content: &[u8]) -> Option<u32> {
 }
 
 fn alg_ok(content: &[u8]) -> bool {
-    let Some(fields) = parts(content) else {
+    let mut kids = [Part::zero(); 4];
+    let Some(count) = fill(content, &mut kids) else {
         return false;
     };
-    if fields.is_empty() || fields.len() > 2 || fields[0].tag != 0x06 {
+    let kids = &kids[..count];
+    if kids.is_empty() || kids.len() > 2 || kids[0].tag != 0x06 {
         return false;
     }
-    oid_ok(fields[0].content)
+    oid_ok(kids[0].content(content))
 }
 
 fn oid_ok(content: &[u8]) -> bool {
@@ -260,17 +753,29 @@ fn oid_ok(content: &[u8]) -> bool {
 }
 
 fn name_ok(content: &[u8]) -> bool {
-    match parts(content) {
-        Some(fields) => fields.iter().all(|field| field.tag == 0x31),
-        None => false,
+    let mut index = 0;
+    while index < content.len() {
+        let Some((tag, _, end)) = next_part(content, index) else {
+            return false;
+        };
+        if tag != 0x31 || end <= index {
+            return false;
+        }
+        index = end;
     }
+    true
 }
 
 fn validity_ok(content: &[u8]) -> bool {
-    let Some(fields) = parts(content) else {
+    let mut kids = [Part::zero(); 4];
+    let Some(count) = fill(content, &mut kids) else {
         return false;
     };
-    fields.len() == 2 && fields.iter().all(|field| time_ok(field.tag, field.content))
+    let kids = &kids[..count];
+    kids.len() == 2
+        && kids
+            .iter()
+            .all(|field| time_ok(field.tag, field.content(content)))
 }
 
 fn time_ok(tag: u8, content: &[u8]) -> bool {
@@ -279,34 +784,102 @@ fn time_ok(tag: u8, content: &[u8]) -> bool {
         0x18 => 14,
         _ => return false,
     };
-    if content.len() != digits + 1 || content[digits] != b'Z' {
-        return false;
+    if content.len() == digits + 1 && content[digits] == b'Z' {
+        return content[..digits].iter().all(u8::is_ascii_digit);
     }
-    content[..digits].iter().all(u8::is_ascii_digit)
+    if content.len() == digits + 5 && (content[digits] == b'+' || content[digits] == b'-') {
+        return content[..digits].iter().all(u8::is_ascii_digit)
+            && content[digits + 1..].iter().all(u8::is_ascii_digit);
+    }
+    false
 }
 
 fn bit_ok(content: &[u8]) -> bool {
-    let Some((unused, payload)) = content.split_first() else {
-        return false;
-    };
-    *unused == 0 && payload.len() >= 8
+    matches!(content.split_first(), Some((&0, payload)) if payload.len() >= 8)
 }
 
-fn parts(bytes: &[u8]) -> Option<Vec<Part<'_>>> {
-    let mut out = Vec::new();
+fn subject_cn(name: &[u8]) -> Option<String> {
     let mut index = 0;
+    while index < name.len() {
+        let (tag, head, end) = next_part(name, index)?;
+        if tag != 0x31 || end <= index {
+            return None;
+        }
+        let set = &name[head..end];
+        let mut at = 0;
+        while at < set.len() {
+            let (tag, at_head, at_end) = next_part(set, at)?;
+            if at_end <= at {
+                return None;
+            }
+            if tag == 0x30 {
+                if let Some(text) = atv_cn(&set[at_head..at_end]) {
+                    return Some(text);
+                }
+            }
+            at = at_end;
+        }
+        index = end;
+    }
+    None
+}
+
+fn atv_cn(atv: &[u8]) -> Option<String> {
+    let (tag, _, next) = next_part(atv, 0)?;
+    if tag != 0x06 {
+        return None;
+    }
+    let (_, oid_head, oid_end) = next_part(atv, 0)?;
+    if &atv[oid_head..oid_end] != CN_OID {
+        return None;
+    }
+    let (value_tag, value_head, value_end) = next_part(atv, next)?;
+    decode_string(value_tag, &atv[value_head..value_end])
+}
+
+fn decode_string(tag: u8, value: &[u8]) -> Option<String> {
+    match tag {
+        0x0c | 0x13 | 0x14 | 0x16 => Some(String::from_utf8_lossy(value).into_owned()),
+        0x1e => decode_bmp(value),
+        _ => None,
+    }
+}
+
+fn decode_bmp(value: &[u8]) -> Option<String> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut units = Vec::with_capacity(value.len() / 2);
+    for pair in value.chunks_exact(2) {
+        units.push(u16::from_be_bytes([pair[0], pair[1]]));
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
+fn fill(bytes: &[u8], out: &mut [Part]) -> Option<usize> {
+    let mut index = 0;
+    let mut count = 0;
     while index < bytes.len() {
-        let (tag, content, end) = next_part(bytes, index)?;
+        if count >= out.len() {
+            return None;
+        }
+        let (tag, head, end) = next_part(bytes, index)?;
         if end <= index {
             return None;
         }
-        out.push(Part { tag, content });
+        out[count] = Part {
+            tag,
+            start: index,
+            head,
+            end,
+        };
+        count += 1;
         index = end;
     }
-    Some(out)
+    Some(count)
 }
 
-fn next_part(bytes: &[u8], index: usize) -> Option<(u8, &[u8], usize)> {
+fn next_part(bytes: &[u8], index: usize) -> Option<(u8, usize, usize)> {
     if index >= bytes.len() {
         return None;
     }
@@ -314,14 +887,14 @@ fn next_part(bytes: &[u8], index: usize) -> Option<(u8, &[u8], usize)> {
     if tag & 0x1f == 0x1f {
         return None;
     }
-    let (content_len, len_bytes) = der_len(&bytes[index + 1..])?;
+    let (content_len, len_bytes) = der_len(bytes.get(index + 1..)?)?;
     let header = len_bytes.checked_add(1)?;
     let total = header.checked_add(content_len)?;
     let end = index.checked_add(total)?;
     if end > bytes.len() {
         return None;
     }
-    Some((tag, &bytes[index + header..end], end))
+    Some((tag, index + header, end))
 }
 
 fn der_len(bytes: &[u8]) -> Option<(usize, usize)> {
@@ -329,27 +902,234 @@ fn der_len(bytes: &[u8]) -> Option<(usize, usize)> {
     if first < 0x80 {
         return Some((usize::from(first), 1));
     }
+    // BER indefinite length is not DER.
+    if first == 0x80 {
+        return None;
+    }
     let width = usize::from(first & 0x7f);
-    if width == 0 || width > 2 || bytes.len() < 1 + width {
+    if width == 0 || width > 3 || bytes.len() < 1 + width {
         return None;
     }
     let mut value = 0usize;
     for byte in &bytes[1..1 + width] {
-        value = (value << 8) | usize::from(*byte);
+        value = value.checked_shl(8)?.checked_add(usize::from(*byte))?;
     }
-    let shortest = if width == 1 { 0x80 } else { 0x100 };
-    if value < shortest {
+    let shortest = match width {
+        1 => 0x80,
+        2 => 0x100,
+        3 => 0x1_0000,
+        _ => return None,
+    };
+    if value < shortest || value > MAX_CONTENT {
         return None;
     }
     Some((value, 1 + width))
+}
+
+fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut clean = Vec::with_capacity(input.len());
+    for &byte in input {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' => clean.push(byte),
+            b' ' | b'\t' | b'\r' | b'\n' => {}
+            _ => return None,
+        }
+    }
+    if clean.is_empty() {
+        return None;
+    }
+    match clean.len() % 4 {
+        0 => {}
+        2 => clean.extend_from_slice(b"=="),
+        3 => clean.push(b'='),
+        _ => return None,
+    }
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    let mut index = 0;
+    while index < clean.len() {
+        let chunk = &clean[index..index + 4];
+        let pads = chunk.iter().filter(|byte| **byte == b'=').count();
+        if pads > 2 || (pads > 0 && index + 4 != clean.len()) {
+            return None;
+        }
+        let mut values = [0u8; 4];
+        for (slot, &byte) in chunk.iter().enumerate() {
+            if byte == b'=' {
+                if slot < 4 - pads {
+                    return None;
+                }
+                continue;
+            }
+            values[slot] = b64_value(byte)?;
+        }
+        let packed = (u32::from(values[0]) << 18)
+            | (u32::from(values[1]) << 12)
+            | (u32::from(values[2]) << 6)
+            | u32::from(values[3]);
+        out.push((packed >> 16) as u8);
+        if pads < 2 {
+            out.push((packed >> 8) as u8);
+        }
+        if pads < 1 {
+            out.push(packed as u8);
+        }
+        index += 4;
+    }
+    Some(out)
+}
+
+fn b64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut state = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut block = [0u8; 64];
+    let mut filled = 0;
+    for &byte in data {
+        block[filled] = byte;
+        filled += 1;
+        if filled == 64 {
+            compress(&mut state, &block);
+            filled = 0;
+        }
+    }
+    block[filled] = 0x80;
+    filled += 1;
+    if filled > 56 {
+        for byte in &mut block[filled..] {
+            *byte = 0;
+        }
+        compress(&mut state, &block);
+        filled = 0;
+    }
+    for byte in &mut block[filled..56] {
+        *byte = 0;
+    }
+    let bits = u64::try_from(data.len()).unwrap_or(0).saturating_mul(8);
+    block[56..].copy_from_slice(&bits.to_be_bytes());
+    compress(&mut state, &block);
+    let mut out = [0u8; 32];
+    for (index, word) in state.iter().enumerate() {
+        out[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut words = [0u32; 64];
+    for index in 0..16 {
+        let offset = index * 4;
+        words[index] = u32::from_be_bytes([
+            block[offset],
+            block[offset + 1],
+            block[offset + 2],
+            block[offset + 3],
+        ]);
+    }
+    for index in 16..64 {
+        let s0 = words[index - 15].rotate_right(7)
+            ^ words[index - 15].rotate_right(18)
+            ^ (words[index - 15] >> 3);
+        let s1 = words[index - 2].rotate_right(17)
+            ^ words[index - 2].rotate_right(19)
+            ^ (words[index - 2] >> 10);
+        words[index] = words[index - 16]
+            .wrapping_add(s0)
+            .wrapping_add(words[index - 7])
+            .wrapping_add(s1);
+    }
+    let mut a = state[0];
+    let mut b = state[1];
+    let mut c = state[2];
+    let mut d = state[3];
+    let mut e = state[4];
+    let mut f = state[5];
+    let mut g = state[6];
+    let mut h = state[7];
+    for index in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = h
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(K[index])
+            .wrapping_add(words[index]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+    state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g);
+    state[7] = state[7].wrapping_add(h);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
-    const OTHER_OID: &[u8] = &[0x2b, 0x01];
+    const EMSIGN: &[u8] = include_bytes!("../tests/fixtures/emsign-ecc-g3.der");
+    const EMSIGN_SPKI: &[u8] = include_bytes!("../tests/fixtures/emsign-ecc-g3.spki.der");
+    const RSA_DER: &[u8] = include_bytes!("../tests/fixtures/probe-rsa.der");
+    const RSA_SPKI: &[u8] = include_bytes!("../tests/fixtures/probe-rsa.spki.der");
+    const P256_DER: &[u8] = include_bytes!("../tests/fixtures/probe-p256.der");
+    const P256_SPKI: &[u8] = include_bytes!("../tests/fixtures/probe-p256.spki.der");
+    const ED_DER: &[u8] = include_bytes!("../tests/fixtures/probe-ed25519.der");
+    const ED_SPKI: &[u8] = include_bytes!("../tests/fixtures/probe-ed25519.spki.der");
+    const NESTED: &[u8] = include_bytes!("../tests/fixtures/probe-nested.der");
+    const PEM: &[u8] = include_bytes!("../tests/fixtures/probe-bundle.pem");
+    const GZIP: &[u8] = include_bytes!("../tests/fixtures/probe-rsa.der.gz");
+
+    fn hex(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(DIGITS[(byte >> 4) as usize] as char);
+            out.push(DIGITS[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
 
     fn cat(parts: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -364,10 +1144,12 @@ mod tests {
             vec![len as u8]
         } else if len <= 0xff {
             vec![0x81, len as u8]
-        } else {
-            let wide = u16::try_from(len).expect("length fits in two bytes");
-            let be = wide.to_be_bytes();
+        } else if len <= 0xffff {
+            let be = (len as u16).to_be_bytes();
             vec![0x82, be[0], be[1]]
+        } else {
+            let be = (len as u32).to_be_bytes();
+            vec![0x83, be[1], be[2], be[3]]
         }
     }
 
@@ -383,279 +1165,426 @@ mod tests {
         tlv(0x30, content)
     }
 
-    fn alg(oid_bytes: &[u8]) -> Vec<u8> {
-        seq(&cat(&[&tlv(0x06, oid_bytes), &tlv(0x05, &[])]))
+    fn ed_alg() -> Vec<u8> {
+        seq(&tlv(0x06, ED25519))
     }
 
-    fn time(generalized: bool) -> Vec<u8> {
-        if generalized {
-            tlv(0x18, b"20250101000000Z")
-        } else {
-            tlv(0x17, b"250101000000Z")
-        }
+    fn name(cn: &[u8]) -> Vec<u8> {
+        let atv = seq(&cat(&[&tlv(0x06, CN_OID), &tlv(0x13, cn)]));
+        seq(&tlv(0x31, &atv))
     }
 
-    fn validity(generalized: bool) -> Vec<u8> {
-        let stamp = time(generalized);
-        seq(&cat(&[&stamp, &stamp]))
+    fn validity(stamp: &[u8], tag: u8) -> Vec<u8> {
+        let time = tlv(tag, stamp);
+        seq(&cat(&[&time, &time]))
     }
 
-    fn name() -> Vec<u8> {
-        let oid = tlv(0x06, &[0x55, 0x04, 0x03]);
-        let text = tlv(0x13, b"a");
-        let set = tlv(0x31, &seq(&cat(&[&oid, &text])));
-        seq(&set)
-    }
-
-    fn key_bits(len: usize) -> Vec<u8> {
-        let mut payload = vec![0x11; len];
-        payload.insert(0, 0x00);
+    fn signature() -> Vec<u8> {
+        let mut payload = vec![0x00];
+        payload.extend(std::iter::repeat(0x11).take(64));
         tlv(0x03, &payload)
     }
 
-    fn spki(key_len: usize) -> Vec<u8> {
-        seq(&cat(&[&alg(OID), &key_bits(key_len)]))
-    }
-
-    fn tbs(key_len: usize, version: bool, generalized: bool) -> Vec<u8> {
+    fn cert_with(stamp: &[u8], tag: u8, cn: &[u8], extra: &[u8]) -> Vec<u8> {
+        let alg = ed_alg();
         let mut body = Vec::new();
-        if version {
-            body.extend(tlv(0xa0, &tlv(0x02, &[0x02])));
-        }
+        body.extend(tlv(0xa0, &tlv(0x02, &[0x02])));
         body.extend(tlv(0x02, &[0x01]));
-        body.extend(alg(OID));
-        body.extend(name());
-        body.extend(validity(generalized));
-        body.extend(name());
-        body.extend(spki(key_len));
-        seq(&body)
+        body.extend(alg.clone());
+        body.extend(name(cn));
+        body.extend(validity(stamp, tag));
+        body.extend(name(cn));
+        body.extend_from_slice(ED_SPKI);
+        body.extend_from_slice(extra);
+        seq(&cat(&[&seq(&body), &alg, &signature()]))
     }
 
-    fn certificate(
-        key_len: usize,
-        sig_len: usize,
-        version: bool,
-        generalized: bool,
-        oid_bytes: &[u8],
-    ) -> Vec<u8> {
-        seq(&cat(&[
-            &tbs(key_len, version, generalized),
-            &alg(oid_bytes),
-            &key_bits(sig_len),
-        ]))
+    fn b64_encode(data: &[u8]) -> Vec<u8> {
+        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index + 3 <= data.len() {
+            let packed = (u32::from(data[index]) << 16)
+                | (u32::from(data[index + 1]) << 8)
+                | u32::from(data[index + 2]);
+            out.push(ALPHA[((packed >> 18) & 63) as usize]);
+            out.push(ALPHA[((packed >> 12) & 63) as usize]);
+            out.push(ALPHA[((packed >> 6) & 63) as usize]);
+            out.push(ALPHA[(packed & 63) as usize]);
+            index += 3;
+        }
+        if index < data.len() {
+            let mut packed = u32::from(data[index]) << 16;
+            if index + 1 < data.len() {
+                packed |= u32::from(data[index + 1]) << 8;
+            }
+            out.push(ALPHA[((packed >> 18) & 63) as usize]);
+            out.push(ALPHA[((packed >> 12) & 63) as usize]);
+            if index + 1 < data.len() {
+                out.push(ALPHA[((packed >> 6) & 63) as usize]);
+                out.push(b'=');
+            } else {
+                out.extend_from_slice(b"==");
+            }
+        }
+        out
     }
 
-    fn full_cert() -> Vec<u8> {
-        certificate(16, 40, true, false, OID)
-    }
-
-    fn wide_cert() -> Vec<u8> {
-        certificate(300, 40, true, false, OID)
-    }
-
-    fn one(bytes: &[u8]) -> Hit {
-        let hits = scan(bytes);
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        assert!(hits[0].offset + hits[0].length <= bytes.len());
-        hits[0].clone()
-    }
-
-    fn assert_form(bytes: &[u8], len_byte: u8) {
-        assert_eq!(bytes[0], 0x30);
+    #[test]
+    fn sha256_matches_known_vectors() {
         assert_eq!(
-            bytes[1],
-            len_byte,
-            "header {:02x?}",
-            &bytes[..4.min(bytes.len())]
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 
     #[test]
-    fn a_short_form_sequence_is_not_a_hit() {
-        let bytes = [0x30, 0x04, 0x01, 0x01, 0x00, 0x00];
-        assert!(scan(&bytes).is_empty());
+    fn an_emsign_certificate_is_full() {
+        let hits = scan(EMSIGN);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].offset, 0);
+        assert_eq!(hits[0].length, 594);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].encoding, Encoding::Der);
+        assert_eq!(
+            hex(&hits[0].sha256),
+            "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b"
+        );
+        assert_eq!(
+            hex(&hits[0].spki_sha256),
+            "8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782"
+        );
+        assert_eq!(
+            hits[0].subject_cn.as_deref(),
+            Some("emSign ECC Root CA - G3")
+        );
     }
 
     #[test]
-    fn a_two_byte_length_below_256_is_not_a_hit() {
-        let mut bytes = vec![0x30, 0x82, 0x00, 0x20];
-        bytes.extend_from_slice(&[0x30, 0x82, 0x00, 0x10]);
-        bytes.extend_from_slice(&[0u8; 16]);
-        bytes.extend_from_slice(&[0u8; 12]);
-        assert_eq!(bytes.len(), 36);
-        assert!(scan(&bytes).is_empty());
+    fn an_unwrapped_spki_is_an_anchor() {
+        for spki in [EMSIGN_SPKI, ED_SPKI, P256_SPKI, RSA_SPKI] {
+            assert_eq!(spki[0], 0x30);
+            let header = if spki[1] < 0x80 {
+                2
+            } else if spki[1] == 0x81 {
+                3
+            } else {
+                4
+            };
+            let content = &spki[header..];
+            let hits = scan(content);
+            assert_eq!(hits.len(), 1, "{}", content.len());
+            assert_eq!(hits[0].kind, Kind::Anchor);
+            assert_eq!(hits[0].length, content.len());
+            assert_eq!(hits[0].sha256, sha256(spki));
+            assert_eq!(hits[0].spki_sha256, sha256(spki));
+            assert_eq!(hits[0].subject_cn, None);
+            assert_eq!(scan(spki).len(), 1);
+        }
     }
 
     #[test]
-    fn a_one_byte_long_length_below_128_is_not_a_hit() {
-        let mut bytes = vec![0x30, 0x81, 0x04];
-        bytes.extend_from_slice(&[0u8; 4]);
-        assert!(scan(&bytes).is_empty());
+    fn an_emsign_spki_is_an_anchor() {
+        let hits = scan(EMSIGN_SPKI);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Anchor);
+        assert_eq!(hits[0].encoding, Encoding::Der);
+        assert_eq!(hits[0].length, 120);
+        assert_eq!(EMSIGN_SPKI[0], 0x30);
+        assert!(EMSIGN_SPKI[1] < 0x80);
+        assert_eq!(hits[0].sha256, sha256(EMSIGN_SPKI));
+        assert_eq!(hits[0].spki_sha256, hits[0].sha256);
+        assert_eq!(hits[0].subject_cn, None);
+        assert_eq!(
+            hex(&hits[0].sha256),
+            "8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782"
+        );
     }
 
     #[test]
-    fn a_narrow_certificate_is_full() {
-        let bytes = full_cert();
-        assert_form(&bytes, 0x81);
-        let hit = one(&bytes);
-        assert_eq!(hit.kind, Kind::Full);
-        assert_eq!(hit.offset, 0);
-        assert_eq!(hit.length, bytes.len());
+    fn openssl_probe_certificates_are_full() {
+        for (der, spki, cn, digest) in [
+            (
+                RSA_DER,
+                RSA_SPKI,
+                "probe-rsa",
+                "c3cf2905cc5c61ca49da61ecdc4135124016787013488db4465bec9245443c46",
+            ),
+            (
+                P256_DER,
+                P256_SPKI,
+                "probe-p256",
+                "b178a1d81eb98d8d6c1bea7766a831f335ac02ef81623f6368a7fbafcb059e7b",
+            ),
+            (
+                ED_DER,
+                ED_SPKI,
+                "probe-ed25519",
+                "37987cdcf09fbad463ad9e148cbc28f7ee4d6214c8b2e4c85001ee4ba9b986cb",
+            ),
+        ] {
+            let hits = scan(der);
+            assert_eq!(hits.len(), 1, "{cn}");
+            assert_eq!(hits[0].kind, Kind::Full);
+            assert_eq!(hits[0].encoding, Encoding::Der);
+            assert_eq!(hits[0].subject_cn.as_deref(), Some(cn));
+            assert_eq!(hex(&hits[0].sha256), digest);
+            assert_eq!(hits[0].spki_sha256, sha256(spki));
+            let keys = scan(spki);
+            assert_eq!(keys.len(), 1, "{cn} spki");
+            assert_eq!(keys[0].kind, Kind::Anchor);
+            assert_eq!(keys[0].subject_cn, None);
+            assert_eq!(keys[0].sha256, keys[0].spki_sha256);
+            assert_eq!(keys[0].length, spki.len());
+        }
+        assert_eq!(ED_SPKI[1], 0x2a);
+        assert_eq!(P256_SPKI[1], 0x59);
+        assert_eq!(RSA_SPKI[1], 0x82);
     }
 
     #[test]
-    fn a_wide_certificate_is_full_and_hides_inner_sequences() {
-        let bytes = wide_cert();
-        assert_form(&bytes, 0x82);
-        assert!(bytes[4..].windows(2).any(|pair| pair == [0x30, 0x82]));
-        let hit = one(&bytes);
-        assert_eq!(hit.kind, Kind::Full);
-        assert_eq!(hit.length, bytes.len());
+    fn a_nested_certificate_is_its_own_hit() {
+        let hits = scan(NESTED);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| hit.kind == Kind::Full));
+        assert_eq!(hits[0].offset, 0);
+        assert_eq!(hits[0].subject_cn.as_deref(), Some("probe-outer"));
+        assert_eq!(hits[0].sha256, sha256(NESTED));
+        assert_eq!(hits[1].offset, 527);
+        assert_eq!(hits[1].length, P256_DER.len());
+        assert_eq!(hits[1].sha256, sha256(P256_DER));
+        assert_eq!(hits[1].subject_cn.as_deref(), Some("probe-p256"));
+        assert_eq!(hits[1].encoding, Encoding::Der);
     }
 
     #[test]
-    fn a_generalized_time_certificate_is_full() {
-        let bytes = certificate(16, 40, true, true, OID);
-        assert_form(&bytes, 0x81);
-        assert_eq!(one(&bytes).kind, Kind::Full);
+    fn a_pem_bundle_is_three_hits() {
+        let hits = scan(PEM);
+        assert_eq!(hits.len(), 3);
+        assert!(hits
+            .iter()
+            .all(|hit| hit.kind == Kind::Full && hit.encoding == Encoding::Pem));
+        let mut got: Vec<_> = hits.iter().map(|hit| hit.sha256).collect();
+        got.sort();
+        let mut expect = vec![sha256(RSA_DER), sha256(P256_DER), sha256(ED_DER)];
+        expect.sort();
+        assert_eq!(got, expect);
+        let mut names: Vec<_> = hits
+            .iter()
+            .map(|hit| hit.subject_cn.clone().unwrap_or_default())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["probe-ed25519", "probe-p256", "probe-rsa"]);
+        let mut mixed = PEM.to_vec();
+        mixed.extend_from_slice(EMSIGN);
+        let mixed_hits = scan(&mixed);
+        assert_eq!(mixed_hits.len(), 4);
+        assert_eq!(mixed_hits[3].encoding, Encoding::Der);
+        assert_eq!(mixed_hits[3].sha256, sha256(EMSIGN));
     }
 
     #[test]
-    fn a_versionless_certificate_is_full() {
-        let bytes = certificate(16, 40, false, false, OID);
-        assert_form(&bytes, 0x81);
-        assert_eq!(one(&bytes).kind, Kind::Full);
+    fn bare_base64_is_one_hit() {
+        let text = b64_encode(EMSIGN);
+        let hits = scan(&text);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].encoding, Encoding::Base64);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].offset, 0);
+        assert_eq!(hits[0].length, text.len());
+        assert_eq!(hits[0].sha256, sha256(EMSIGN));
+        assert_eq!(
+            hits[0].subject_cn.as_deref(),
+            Some("emSign ECC Root CA - G3")
+        );
+        let mut wrapped = vec![0x2a];
+        wrapped.extend_from_slice(&text);
+        wrapped.push(b'*');
+        let wrapped_hits = scan(&wrapped);
+        assert_eq!(wrapped_hits.len(), 1);
+        assert_eq!(wrapped_hits[0].encoding, Encoding::Base64);
+        let mut loose = vec![0u8; 8];
+        loose.extend_from_slice(EMSIGN);
+        assert!(scan(&b64_encode(&loose)).is_empty());
+    }
+
+    #[test]
+    fn the_scan_does_not_inflate_gzip() {
+        assert!(scan(GZIP).is_empty());
+    }
+
+    #[test]
+    fn offset_and_generalized_times_are_hits() {
+        let offset = cert_with(b"250101000000+0000", 0x17, b"offset", &[]);
+        let hits = scan(&offset);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].subject_cn.as_deref(), Some("offset"));
+        let generalized = cert_with(b"20250101000000Z", 0x18, b"general", &[]);
+        assert_eq!(scan(&generalized).len(), 1);
+        let minus = cert_with(b"20250101000000-0500", 0x18, b"minus", &[]);
+        assert_eq!(scan(&minus).len(), 1);
+        let bad = cert_with(b"250101000000+00", 0x17, b"bad", &[]);
+        assert!(scan(&bad).iter().all(|hit| hit.kind != Kind::Full));
+    }
+
+    #[test]
+    fn trust_anchor_info_keeps_a_key_id() {
+        let tai = seq(&cat(&[
+            &tlv(0x02, &[0x01]),
+            ED_SPKI,
+            &tlv(0x04, &[1, 2, 3, 4]),
+        ]));
+        let hits = scan(&tai);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Anchor);
+        assert_eq!(hits[0].subject_cn, None);
+        assert_eq!(hits[0].spki_sha256, sha256(ED_SPKI));
+        assert_ne!(hits[0].sha256, hits[0].spki_sha256);
+        assert_eq!(hits[0].length, tai.len());
+        let empty_id = seq(&cat(&[&tlv(0x02, &[0x01]), ED_SPKI, &tlv(0x04, &[])]));
+        assert!(scan(&empty_id).iter().all(|hit| hit.offset != 0));
+        let long_id = seq(&cat(&[
+            &tlv(0x02, &[0x01]),
+            ED_SPKI,
+            &tlv(0x04, &[0u8; 65]),
+        ]));
+        assert!(scan(&long_id).iter().all(|hit| hit.offset != 0));
+    }
+
+    #[test]
+    fn a_bare_body_is_not_an_anchor() {
+        let alg = ed_alg();
+        let mut body = Vec::new();
+        body.extend(tlv(0xa0, &tlv(0x02, &[0x02])));
+        body.extend(tlv(0x02, &[0x01]));
+        body.extend(alg);
+        body.extend(name(b"body"));
+        body.extend(validity(b"250101000000Z", 0x17));
+        body.extend(name(b"body"));
+        body.extend_from_slice(ED_SPKI);
+        let tbs = seq(&body);
+        let hits = scan(&tbs);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Body);
+        assert_eq!(hits[0].subject_cn.as_deref(), Some("body"));
+        assert_eq!(hits[0].spki_sha256, sha256(ED_SPKI));
+        assert_eq!(hits[0].sha256, sha256(&tbs));
+    }
+
+    #[test]
+    fn an_unknown_key_is_not_a_hit() {
+        let oid = tlv(
+            0x06,
+            &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b],
+        );
+        let alg = seq(&cat(&[&oid, &tlv(0x05, &[])]));
+        let mut payload = vec![0x00];
+        payload.extend(std::iter::repeat(0x11).take(32));
+        let bits = tlv(0x03, &payload);
+        assert!(scan(&seq(&cat(&[&alg, &bits]))).is_empty());
+        let rsa_oid = tlv(0x06, RSA);
+        let rsa_alg = seq(&cat(&[&rsa_oid, &tlv(0x05, &[])]));
+        let mut short = vec![0x40];
+        short.extend(std::iter::repeat(0x11).take(31));
+        let mut payload = vec![0x00];
+        payload.extend(seq(&cat(&[
+            &tlv(0x02, &short),
+            &tlv(0x02, &[0x01, 0x00, 0x01]),
+        ])));
+        let short_bits = tlv(0x03, &payload);
+        assert!(scan(&seq(&cat(&[&rsa_alg, &short_bits]))).is_empty());
     }
 
     #[test]
     fn a_mismatched_signature_algorithm_is_not_a_hit() {
-        let bytes = certificate(16, 40, true, false, OTHER_OID);
-        assert_form(&bytes, 0x81);
-        assert!(scan(&bytes).is_empty());
-    }
-
-    #[test]
-    fn a_narrow_public_key_is_an_anchor() {
-        let bytes = spki(128);
-        assert_form(&bytes, 0x81);
-        let hit = one(&bytes);
-        assert_eq!(hit.kind, Kind::Anchor);
-        assert_eq!(hit.length, bytes.len());
-    }
-
-    #[test]
-    fn a_wide_public_key_is_an_anchor() {
-        let bytes = spki(300);
-        assert_form(&bytes, 0x82);
-        assert_eq!(one(&bytes).kind, Kind::Anchor);
-    }
-
-    #[test]
-    fn trust_anchor_info_is_an_anchor() {
-        let key = spki(128);
-        let bytes = seq(&cat(&[&tlv(0x02, &[0x01]), &key]));
-        assert!(matches!(bytes[1], 0x81 | 0x82));
-        assert_eq!(one(&bytes).kind, Kind::Anchor);
-    }
-
-    #[test]
-    fn a_certificate_body_is_an_anchor() {
-        let bytes = tbs(200, true, false);
-        assert!(matches!(bytes[1], 0x81 | 0x82));
-        assert_eq!(one(&bytes).kind, Kind::Anchor);
-    }
-
-    #[test]
-    fn a_loose_outer_sequence_does_not_hide_a_certificate() {
-        let cert = wide_cert();
-        let span = 1 + cert.len();
-        assert!(span >= 0x100 && span <= usize::from(u16::MAX));
-        let mut bytes = vec![0x30, 0x82];
-        bytes.extend_from_slice(&u16::try_from(span).unwrap().to_be_bytes());
-        bytes.push(0xff);
-        bytes.extend_from_slice(&cert);
-        let hit = one(&bytes);
-        assert_eq!(hit.kind, Kind::Full);
-        assert_eq!(hit.offset, 5);
-        assert_eq!(hit.length, cert.len());
-    }
-
-    #[test]
-    fn an_inner_length_past_the_body_is_not_a_hit() {
-        let mut body = vec![0x30, 0x82, 0x02, 0x00];
-        body.resize(0x100, 0);
-        let mut bytes = vec![0x30, 0x82, 0x01, 0x00];
-        bytes.extend_from_slice(&body);
-        assert_eq!(bytes.len(), 4 + 0x100);
-        assert!(scan(&bytes).is_empty());
-    }
-
-    #[test]
-    fn adjacent_hits_do_not_overlap() {
-        let cert = full_cert();
-        let key = spki(300);
-        let mut bytes = cert.clone();
-        let split = bytes.len();
-        bytes.extend_from_slice(&key);
-        bytes.splice(0..0, [0x11, 0x22]);
+        let alg = ed_alg();
+        let other = seq(&cat(&[
+            &tlv(
+                0x06,
+                &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b],
+            ),
+            &tlv(0x05, &[]),
+        ]));
+        let mut body = Vec::new();
+        body.extend(tlv(0xa0, &tlv(0x02, &[0x02])));
+        body.extend(tlv(0x02, &[0x01]));
+        body.extend(alg);
+        body.extend(name(b"mix"));
+        body.extend(validity(b"250101000000Z", 0x17));
+        body.extend(name(b"mix"));
+        body.extend_from_slice(ED_SPKI);
+        let bytes = seq(&cat(&[&seq(&body), &other, &signature()]));
         let hits = scan(&bytes);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].kind, Kind::Full);
+        assert!(hits.iter().all(|hit| hit.kind != Kind::Full));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Body);
+        assert_eq!(hits[0].subject_cn.as_deref(), Some("mix"));
+    }
+
+    #[test]
+    fn ber_indefinite_length_is_not_a_hit() {
+        assert!(scan(&[0x30, 0x80, 0x00, 0x00]).is_empty());
+        let mut wrapped = vec![0x30, 0x80];
+        wrapped.extend_from_slice(ED_SPKI);
+        wrapped.extend_from_slice(&[0x00, 0x00]);
+        let hits = scan(&wrapped);
+        assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].offset, 2);
-        assert_eq!(hits[0].length, cert.len());
-        assert_eq!(hits[1].kind, Kind::Anchor);
-        assert_eq!(hits[1].offset, 2 + split);
-        assert_eq!(hits[1].length, key.len());
-        assert!(hits[0].offset + hits[0].length <= hits[1].offset);
+        assert_eq!(hits[0].kind, Kind::Anchor);
+        assert_ne!(hits[0].offset, 0);
     }
 
     #[test]
-    fn a_certificate_at_the_end_of_the_buffer_is_a_hit() {
-        let cert = full_cert();
-        let mut bytes = vec![0u8; 7];
-        bytes.extend_from_slice(&cert);
-        let hit = one(&bytes);
-        assert_eq!(hit.offset, 7);
-        assert_eq!(hit.offset + hit.length, bytes.len());
-        assert_eq!(hit.kind, Kind::Full);
+    fn a_noncanonical_length_is_not_a_hit() {
+        assert_eq!(ED_SPKI[0], 0x30);
+        assert!(ED_SPKI[1] < 0x80);
+        let mut long = vec![0x30, 0x81, ED_SPKI[1]];
+        long.extend_from_slice(&ED_SPKI[2..]);
+        let hits = scan(&long);
+        assert_eq!(hits.len(), 1);
+        assert_ne!(hits[0].offset, 0);
+        assert_eq!(hits[0].sha256, sha256(ED_SPKI));
+        let mut wide = vec![0x30, 0x83, 0x00, 0x00, ED_SPKI[1]];
+        wide.extend_from_slice(&ED_SPKI[2..]);
+        let hits = scan(&wide);
+        assert_eq!(hits.len(), 1);
+        assert_ne!(hits[0].offset, 0);
+        assert_eq!(hits[0].sha256, sha256(ED_SPKI));
     }
 
     #[test]
-    fn truncated_headers_yield_no_hit() {
-        let samples: &[&[u8]] = &[
-            &[],
-            &[0x30],
-            &[0x30, 0x81],
-            &[0x30, 0x82],
-            &[0x30, 0x82, 0x01],
-            &[0x30, 0x82, 0x01, 0x00],
-            &[0x30, 0x81, 0x80],
-            &[0x30, 0x82, 0xff, 0xff],
-        ];
-        for bytes in samples {
-            assert!(scan(bytes).is_empty(), "{bytes:02x?}");
-        }
+    fn a_three_byte_length_certificate_is_full() {
+        let extra = tlv(0xa3, &vec![0u8; 0x1_0000]);
+        let bytes = cert_with(b"250101000000Z", 0x17, b"wide", &extra);
+        assert_eq!(bytes[0], 0x30);
+        assert_eq!(bytes[1], 0x83);
+        let hits = scan(&bytes);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Full);
+        assert_eq!(hits[0].length, bytes.len());
+        assert_eq!(hits[0].subject_cn.as_deref(), Some("wide"));
+        assert!(bytes.len() > 0x1_0000);
     }
 
     #[test]
-    fn noise_yields_no_hit() {
-        let samples = [
-            vec![],
-            vec![0u8; 3],
-            vec![0x30, 0x82],
-            vec![0x30, 0x81, 0xff],
-            vec![0xff; 128],
-            vec![0x30; 256],
-        ];
-        for bytes in samples {
-            assert!(scan(&bytes).is_empty());
-        }
+    fn a_rejected_sequence_does_not_hide_a_later_certificate() {
+        let mut bytes = vec![0x30, 0x82, 0xff, 0xff];
+        bytes.extend_from_slice(EMSIGN);
+        let hits = scan(&bytes);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].offset, 4);
+        assert_eq!(hits[0].sha256, sha256(EMSIGN));
+        assert!(scan(&[0x30, 0x04, 0x01, 0x01, 0x00, 0x00]).is_empty());
     }
 
     #[test]
-    fn the_library_fn_matches_scan() {
-        let mut bytes = vec![0x00, 0x30];
-        bytes.extend(full_cert());
-        assert_eq!(crate::certs(&bytes), scan(&bytes));
+    fn the_library_function_matches_scan() {
+        assert_eq!(crate::certs(EMSIGN), scan(EMSIGN));
+        assert_eq!(crate::certs(PEM), scan(PEM));
     }
 }
