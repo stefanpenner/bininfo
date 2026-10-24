@@ -3,7 +3,7 @@
 why: This file is the library a caller uses.
 uses: bininfo
 how: The bininfo command calls open, render, and facts.
-Another crate calls the same functions.
+A caller uses certs to scan file bytes.
 ---
 */
 
@@ -169,6 +169,7 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
 }
 
 /// Scan `bytes` for embedded certificates and trust anchors.
+/// The scan reads DER, PEM, and bare base64.
 pub fn certs(bytes: &[u8]) -> Vec<certs::Hit> {
     certs::scan(bytes)
 }
