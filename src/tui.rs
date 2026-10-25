@@ -19,8 +19,16 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use std::io::{self, Write};
+use std::sync::mpsc;
+use std::time::Duration;
 
-pub(crate) fn run(page: &str) -> io::Result<()> {
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Draw the page. `load` returns the full page and runs on a thread when the user opens `certs`.
+pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) -> io::Result<()> {
+    let mut load = Some(load);
+    let mut pending: Option<mpsc::Receiver<String>> = None;
+    let mut tick = 0usize;
     let mut view = View::spine(page);
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
@@ -29,7 +37,24 @@ pub(crate) fn run(page: &str) -> io::Result<()> {
     let mut typed = String::new();
     let mut search = false;
     loop {
-        draw(&mut stdout, &view, search.then_some(typed.as_str()))?;
+        let busy = pending.is_some().then(|| SPINNER[tick % SPINNER.len()]);
+        draw(&mut stdout, &view, search.then_some(typed.as_str()), busy)?;
+        if let Some(rx) = &pending {
+            match rx.try_recv() {
+                Ok(full) => {
+                    view = View::spine(&full);
+                    view.focus("certs");
+                    pending = None;
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => pending = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            tick += 1;
+            if !event::poll(Duration::from_millis(80))? {
+                continue;
+            }
+        }
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
@@ -40,18 +65,21 @@ pub(crate) fn run(page: &str) -> io::Result<()> {
             if search {
                 match key.code {
                     KeyCode::Enter => {
-                        if typed.is_empty() {
-                            view.find("");
-                        } else {
-                            view.find(&typed);
-                        }
+                        view.accept_search();
                         search = false;
                     }
-                    KeyCode::Esc => search = false,
+                    KeyCode::Esc => {
+                        view.cancel_search();
+                        search = false;
+                    }
                     KeyCode::Backspace => {
                         typed.pop();
+                        view.live(&typed);
                     }
-                    KeyCode::Char(ch) => typed.push(ch),
+                    KeyCode::Char(ch) => {
+                        typed.push(ch);
+                        view.live(&typed);
+                    }
                     _ => {}
                 }
                 continue;
@@ -60,10 +88,22 @@ pub(crate) fn run(page: &str) -> io::Result<()> {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('j') | KeyCode::Down => view.down(),
                 KeyCode::Char('k') | KeyCode::Up => view.up(),
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => view.open(),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    if view.cursor_key() == "certs" {
+                        if let Some(job) = load.take() {
+                            let (tx, rx) = mpsc::channel();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(job());
+                            });
+                            pending = Some(rx);
+                        }
+                    }
+                    view.open();
+                }
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => view.close(),
                 KeyCode::Char('/') => {
                     typed.clear();
+                    view.begin_search();
                     search = true;
                 }
                 KeyCode::Char('n') => view.next(),
@@ -74,7 +114,12 @@ pub(crate) fn run(page: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn draw(out: &mut io::Stdout, view: &View, query: Option<&str>) -> io::Result<()> {
+fn draw(
+    out: &mut io::Stdout,
+    view: &View,
+    query: Option<&str>,
+    busy: Option<char>,
+) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
     let width = cols as usize;
     let lines = view.slots_text();
@@ -97,6 +142,11 @@ fn draw(out: &mut io::Stdout, view: &View, query: Option<&str>) -> io::Result<()
         }
     }
     let status = match query {
+        None if busy.is_some() => format!(
+            "{} scanning certs and fetching bad lists...    q quit",
+            busy.unwrap_or(' ')
+        ),
+        Some(text) if view.searching_none() => format!("/{text}    no match"),
         Some(text) => format!("/{text}"),
         None => "j/k move    enter open    h close    / search    n next    q quit".to_string(),
     };

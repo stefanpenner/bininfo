@@ -1,0 +1,373 @@
+/*
+---
+why: This file judges each cert as valid or invalid.
+uses: bininfo
+how: The date check needs only the cert.
+The bad list comes from public advisories, through curl, with a cache.
+A missing list never fails the run. The cert is then judged by date alone.
+---
+*/
+
+//! Cert verdicts: dates and a list of known bad certs.
+
+use crate::certs::Hit;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const TTL: Duration = Duration::from_secs(24 * 3600);
+const EMUDHRA: [&str; 2] = [
+    "https://emudhra.we-have-a-problem.com/roots.json",
+    "https://emudhra.we-have-a-problem.com/impacted-intermediates.json",
+];
+const MOZILLA: &str = "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReportPEMCSV";
+
+/// One cert on the bad list. Hashes are lowercase hex.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bad {
+    pub sha256: String,
+    pub spki_sha256: String,
+    pub why: String,
+}
+
+/// The bad list and where it came from.
+#[derive(Clone, Debug, Default)]
+pub struct Bads {
+    pub list: Vec<Bad>,
+    /// `fetched`, `cache`, `stale cache`, or `unavailable`.
+    pub source: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Valid,
+    /// The cert has no dates and is not on the list.
+    Unknown,
+    Invalid(String),
+}
+
+impl Verdict {
+    pub fn mark(&self) -> &'static str {
+        match self {
+            Verdict::Valid => "✓",
+            Verdict::Unknown => "–",
+            Verdict::Invalid(_) => "✗",
+        }
+    }
+}
+
+/// Judge one hit. `now` is Unix seconds.
+pub fn judge(hit: &Hit, bads: &Bads, now: i64) -> Verdict {
+    let sha = crate::summary::hex(&hit.sha256);
+    let spki = crate::summary::hex(&hit.spki_sha256);
+    if let Some(bad) = bads
+        .list
+        .iter()
+        .find(|bad| bad.sha256 == sha || bad.spki_sha256 == spki)
+    {
+        return Verdict::Invalid(format!("on bad list: {}", bad.why));
+    }
+    match (hit.not_before, hit.not_after) {
+        (Some(from), _) if now < from => Verdict::Invalid(format!("not valid until {}", date(from))),
+        (_, Some(to)) if now > to => Verdict::Invalid(format!("expired {}", date(to))),
+        (Some(_), Some(_)) => Verdict::Valid,
+        _ => Verdict::Unknown,
+    }
+}
+
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// `YYYY-MM-DD` from Unix seconds.
+pub fn date(secs: i64) -> String {
+    let z = secs.div_euclid(86400) + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn cache_file() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("BININFO_BAD_CACHE") {
+        return Some(PathBuf::from(path));
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("bininfo").join("bad-certs.tsv"))
+}
+
+/// Load the bad list. With `fetch`, a missing or old cache is refreshed with curl.
+pub fn load(fetch: bool) -> Bads {
+    let file = cache_file();
+    let cached = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
+    let age = file
+        .as_ref()
+        .and_then(|f| std::fs::metadata(f).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok());
+    let fresh = age.is_some_and(|a| a < TTL);
+    if let (Some(text), true) = (&cached, fresh) {
+        return Bads {
+            list: from_tsv(text),
+            source: "cache",
+        };
+    }
+    if fetch {
+        let list = fetch_all();
+        if !list.is_empty() {
+            if let Some(f) = &file {
+                if let Some(dir) = f.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(f, to_tsv(&list));
+            }
+            return Bads {
+                list,
+                source: "fetched",
+            };
+        }
+    }
+    match cached {
+        Some(text) => Bads {
+            list: from_tsv(&text),
+            source: "stale cache",
+        },
+        None => Bads {
+            list: Vec::new(),
+            source: "unavailable",
+        },
+    }
+}
+
+fn fetch_all() -> Vec<Bad> {
+    let mut list = Vec::new();
+    for url in EMUDHRA {
+        if let Some(text) = curl(url) {
+            list.extend(parse_advisory(&text));
+        }
+    }
+    if let Some(text) = curl(MOZILLA) {
+        list.extend(parse_mozilla(&text));
+    }
+    list
+}
+
+fn curl(url: &str) -> Option<String> {
+    let out = Command::new("curl")
+        .args(["-fsSL", "-m", "20", url])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+fn to_tsv(list: &[Bad]) -> String {
+    list.iter()
+        .map(|b| format!("{}\t{}\t{}\n", b.sha256, b.spki_sha256, b.why))
+        .collect()
+}
+
+fn from_tsv(text: &str) -> Vec<Bad> {
+    text.lines()
+        .filter_map(|line| {
+            let mut cols = line.splitn(3, '\t');
+            Some(Bad {
+                sha256: cols.next()?.to_string(),
+                spki_sha256: cols.next()?.to_string(),
+                why: cols.next()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Read the eMudhra advisory JSON. Each record has `name`, `sha256`, `spki_sha256`.
+pub fn parse_advisory(text: &str) -> Vec<Bad> {
+    let mut out = Vec::new();
+    let mut name = String::new();
+    let mut sha = String::new();
+    for (key, value) in string_pairs(text) {
+        match key.as_str() {
+            "name" => name = value,
+            "sha256" => sha = value.to_lowercase(),
+            "spki_sha256" if !sha.is_empty() => out.push(Bad {
+                sha256: std::mem::take(&mut sha),
+                spki_sha256: value.to_lowercase(),
+                why: format!("eMudhra advisory, {name}"),
+            }),
+            _ => {}
+        }
+    }
+    out
+}
+
+// Every `"key": "value"` pair, in order. Enough for flat advisory JSON.
+fn string_pairs(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some((key, after)) = next_string(rest) {
+        let trimmed = after.trim_start();
+        if let Some(value_part) = trimmed.strip_prefix(':') {
+            if let Some(after_ws) = Some(value_part.trim_start()) {
+                if after_ws.starts_with('"') {
+                    if let Some((value, tail)) = next_string(after_ws) {
+                        out.push((key, value));
+                        rest = tail;
+                        continue;
+                    }
+                }
+            }
+        }
+        rest = after;
+    }
+    out
+}
+
+fn next_string(text: &str) -> Option<(String, &str)> {
+    let start = text.find('"')? + 1;
+    let mut out = String::new();
+    let mut chars = text[start..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((out, &text[start + i + 1..])),
+            '\\' => {
+                if let Some((_, n)) = chars.next() {
+                    out.push(n);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    None
+}
+
+/// Read the Mozilla CCADB roots CSV. A root with a distrust date is bad.
+pub fn parse_mozilla(text: &str) -> Vec<Bad> {
+    let mut rows = csv_rows(text).into_iter();
+    let Some(head) = rows.next() else {
+        return Vec::new();
+    };
+    let col = |name: &str| head.iter().position(|h| h.trim_start_matches('\u{feff}') == name);
+    let (Some(name), Some(sha), Some(tls), Some(mail)) = (
+        col("Common Name or Certificate Name"),
+        col("SHA-256 Fingerprint"),
+        col("Distrust for TLS After Date"),
+        col("Distrust for S/MIME After Date"),
+    ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let get = |i: usize| row.get(i).map(|s| s.trim()).unwrap_or("");
+        for (label, at) in [("TLS", tls), ("S/MIME", mail)] {
+            if !get(at).is_empty() && !get(sha).is_empty() {
+                out.push(Bad {
+                    sha256: get(sha).to_lowercase(),
+                    spki_sha256: String::new(),
+                    why: format!("Mozilla distrusts {label} after {}, {}", get(at), get(name)),
+                });
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn csv_rows(text: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quoted, c) {
+            (true, '"') if chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            (true, '"') => quoted = false,
+            (false, '"') => quoted = true,
+            (false, ',') => row.push(std::mem::take(&mut field)),
+            (false, '\n') => {
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
+            }
+            (false, '\r') => {}
+            _ => field.push(c),
+        }
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_print_as_iso() {
+        assert_eq!(date(0), "1970-01-01");
+        assert_eq!(date(1_709_251_200), "2024-03-01");
+    }
+
+    #[test]
+    fn advisory_records_become_bad_entries() {
+        let json = r#"[{"name":"Root A","sha256":"AB12","spki_sha256":"CD34","key":{"bits":384}},
+            {"name":"Root B","issuer_sha256":"FF","sha256":"EF56","spki_sha256":"0078"}]"#;
+        let bad = parse_advisory(json);
+        assert_eq!(bad.len(), 2);
+        assert_eq!(bad[0].sha256, "ab12");
+        assert_eq!(bad[0].spki_sha256, "cd34");
+        assert_eq!(bad[1].why, "eMudhra advisory, Root B");
+    }
+
+    #[test]
+    fn mozilla_csv_keeps_only_distrusted_roots() {
+        let csv = "Common Name or Certificate Name,SHA-256 Fingerprint,Distrust for TLS After Date,Distrust for S/MIME After Date\n\
+            \"Good, Root\",AA,,\nOld Root,BB,2024.11.30,\n";
+        let bad = parse_mozilla(csv);
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].sha256, "bb");
+        assert!(bad[0].why.contains("2024.11.30"));
+    }
+
+    #[test]
+    fn verdict_follows_list_then_dates() {
+        let mut hit = crate::certs::scan(include_bytes!("../tests/fixtures/emsign-ecc-g3.der"))
+            .remove(0);
+        let none = Bads::default();
+        assert!(matches!(judge(&hit, &none, now()), Verdict::Valid | Verdict::Invalid(_)));
+        let (from, to) = (hit.not_before.unwrap(), hit.not_after.unwrap());
+        assert_eq!(judge(&hit, &none, from + 1), Verdict::Valid);
+        assert!(matches!(judge(&hit, &none, to + 1), Verdict::Invalid(why) if why.starts_with("expired")));
+        assert!(matches!(judge(&hit, &none, from - 1), Verdict::Invalid(why) if why.starts_with("not valid until")));
+        let bads = Bads {
+            list: vec![Bad {
+                sha256: crate::summary::hex(&hit.sha256),
+                spki_sha256: String::new(),
+                why: "x".into(),
+            }],
+            source: "cache",
+        };
+        assert!(matches!(judge(&hit, &bads, from + 1), Verdict::Invalid(_)));
+        hit.not_before = None;
+        hit.not_after = None;
+        assert_eq!(judge(&hit, &none, 0), Verdict::Unknown);
+        assert_eq!(date(from), "2018-02-18");
+    }
+}

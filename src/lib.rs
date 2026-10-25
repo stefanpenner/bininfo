@@ -19,6 +19,7 @@ pub mod kind;
 pub mod macho;
 pub mod pe;
 pub mod summary;
+pub mod trust;
 
 mod library;
 mod style;

@@ -44,6 +44,10 @@ pub struct Hit {
     pub role: Role,
     /// File bytes, or the container that held the hit.
     pub container: Container,
+    /// Start of validity, in Unix seconds. Only a certificate or a body has it.
+    pub not_before: Option<i64>,
+    /// End of validity, in Unix seconds.
+    pub not_after: Option<i64>,
 }
 
 /// Full X.509 certificate, trust anchor, bare certificate body, or pin.
@@ -262,9 +266,11 @@ fn scan_pem(bytes: &[u8], hits: &mut Vec<Hit>, covered: &mut Vec<(usize, usize)>
 }
 
 fn scan_b64(bytes: &[u8], covered: &mut Vec<(usize, usize)>, hits: &mut Vec<Hit>) {
+    // Spans added below sit behind the cursor, so the snapshot stays right.
+    let fixed = merged(covered);
     let mut index = 0;
     while index < bytes.len() {
-        if let Some(end) = covered_end(index, covered) {
+        if let Some(end) = covered_end(index, &fixed) {
             index = end;
             continue;
         }
@@ -274,7 +280,7 @@ fn scan_b64(bytes: &[u8], covered: &mut Vec<(usize, usize)>, hits: &mut Vec<Hit>
         }
         let start = index;
         let mut too_long = false;
-        while index < bytes.len() && is_b64(bytes[index]) && covered_end(index, covered).is_none() {
+        while index < bytes.len() && is_b64(bytes[index]) && covered_end(index, &fixed).is_none() {
             index += 1;
             if index - start > MAX_B64 {
                 too_long = true;
@@ -293,7 +299,7 @@ fn scan_b64(bytes: &[u8], covered: &mut Vec<(usize, usize)>, hits: &mut Vec<Hit>
             && pads < 2
             && bytes[end] == b'='
             && end - start <= MAX_B64
-            && covered_end(end, covered).is_none()
+            && covered_end(end, &fixed).is_none()
         {
             end += 1;
             pads += 1;
@@ -371,6 +377,8 @@ fn walk(
                         place: String::new(),
                         role: Role::Trust,
                         container: Container::File,
+                        not_before: None,
+                        not_after: None,
                     });
                     index += span;
                     continue;
@@ -416,6 +424,7 @@ fn hit_from(
     der: &[u8],
     found: &Found<'_>,
 ) -> Hit {
+    let dates = validity_of(der, found.kind);
     Hit {
         offset,
         length,
@@ -427,14 +436,29 @@ fn hit_from(
         place: String::new(),
         role: Role::Trust,
         container: Container::File,
+        not_before: dates.map(|d| d.0),
+        not_after: dates.map(|d| d.1),
     }
 }
 
+fn merged(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut sorted = spans.to_vec();
+    sorted.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+// `covered` is sorted and disjoint.
 fn covered_end(index: usize, covered: &[(usize, usize)]) -> Option<usize> {
-    covered
-        .iter()
-        .find(|(start, end)| index >= *start && index < *end)
-        .map(|(_, end)| *end)
+    let next = covered.partition_point(|span| span.0 <= index);
+    let (_, end) = *covered.get(next.checked_sub(1)?)?;
+    (index < end).then_some(end)
 }
 
 fn find_slice(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -854,10 +878,19 @@ fn pin_raw(bytes: &[u8], digests: &HashMap<[u8; 32], Option<String>>, hits: &mut
         head.copy_from_slice(&hash[..8]);
         heads.entry(head).or_default().push(*hash);
     }
+    // Two leading bytes rule out nearly every offset before any hashing.
+    let mut seen_pair = vec![false; 1 << 16];
+    for hash in digests.keys() {
+        seen_pair[usize::from(hash[0]) << 8 | usize::from(hash[1])] = true;
+    }
     let mut per: HashMap<[u8; 32], usize> = HashMap::new();
     let mut count = hits.iter().filter(|hit| hit.kind == Kind::Pin).count();
     let mut index = 0;
     while count < MAX_PINS && index + 32 <= bytes.len() {
+        if !seen_pair[usize::from(bytes[index]) << 8 | usize::from(bytes[index + 1])] {
+            index += 1;
+            continue;
+        }
         let mut head = [0u8; 8];
         head.copy_from_slice(&bytes[index..index + 8]);
         let Some(cands) = heads.get(&head) else {
@@ -911,6 +944,8 @@ fn pin_hit(
         place: String::new(),
         role: Role::Trust,
         container: Container::File,
+        not_before: None,
+        not_after: None,
     }
 }
 
@@ -1328,6 +1363,88 @@ fn name_ok(content: &[u8]) -> bool {
         index = end;
     }
     true
+}
+
+// Read notBefore and notAfter from a certificate or a bare body.
+fn validity_of(der: &[u8], kind: Kind) -> Option<(i64, i64)> {
+    let (_, head, end) = next_part(der, 0)?;
+    let body = &der[head..end];
+    let mut kids = [Part::zero(); 16];
+    let count = fill(body, &mut kids)?;
+    let tbs_part = match kind {
+        Kind::Full => kids[0],
+        Kind::Body => Part {
+            tag: 0x30,
+            start: 0,
+            head: 0,
+            end: body.len(),
+        },
+        _ => return None,
+    };
+    let tbs = tbs_part.content(body);
+    let mut fields = [Part::zero(); 16];
+    let n = if kind == Kind::Full {
+        fill(tbs, &mut fields)?
+    } else {
+        for (slot, kid) in fields.iter_mut().zip(&kids[..count]) {
+            *slot = *kid;
+        }
+        count
+    };
+    let mut rest = &fields[..n];
+    if rest.first()?.tag == 0xa0 {
+        rest = &rest[1..];
+    }
+    let src = if kind == Kind::Full { tbs } else { body };
+    let mut times = [Part::zero(); 4];
+    let count = fill(rest.get(3)?.content(src), &mut times)?;
+    if count != 2 {
+        return None;
+    }
+    let window = rest[3].content(src);
+    Some((
+        unix_time(times[0].tag, times[0].content(window))?,
+        unix_time(times[1].tag, times[1].content(window))?,
+    ))
+}
+
+// UTCTime and GeneralizedTime to Unix seconds. A zone offset is applied.
+fn unix_time(tag: u8, text: &[u8]) -> Option<i64> {
+    let (year_len, digits) = if tag == 0x17 { (2, 12) } else { (4, 14) };
+    let num = |from: usize, len: usize| -> Option<i64> {
+        std::str::from_utf8(text.get(from..from + len)?)
+            .ok()?
+            .parse()
+            .ok()
+    };
+    let mut year = num(0, year_len)?;
+    if tag == 0x17 {
+        year += if year >= 50 { 1900 } else { 2000 };
+    }
+    let at = year_len;
+    let (month, day, hour, min, sec) = (
+        num(at, 2)?,
+        num(at + 2, 2)?,
+        num(at + 4, 2)?,
+        num(at + 6, 2)?,
+        num(at + 8, 2)?,
+    );
+    let mut secs = days_from_civil(year, month, day) * 86400 + hour * 3600 + min * 60 + sec;
+    if text.len() == digits + 5 {
+        let off = num(digits + 1, 2)? * 3600 + num(digits + 3, 2)? * 60;
+        secs += if text[digits] == b'+' { -off } else { off };
+    }
+    Some(secs)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 fn validity_ok(content: &[u8]) -> bool {

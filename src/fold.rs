@@ -37,6 +37,9 @@ pub(crate) struct View {
     cursor: usize,
     query: String,
     hit: usize,
+    // While a search is being typed: the hits and their ancestors, the only rows drawn.
+    shown: Option<HashSet<usize>>,
+    origin: usize,
 }
 
 enum Slot {
@@ -60,6 +63,8 @@ impl View {
             cursor,
             query: String::new(),
             hit: 0,
+            shown: None,
+            origin: cursor,
         }
     }
 
@@ -112,12 +117,73 @@ impl View {
         self.goto_hit();
     }
 
+    /// Start a search: remember where the cursor was so cancel can return to it.
+    pub(crate) fn begin_search(&mut self) {
+        self.origin = self.cursor;
+    }
+
+    /// Re-run the search on every key: show only the hits and the path down to each, cursor on the first.
+    pub(crate) fn live(&mut self, query: &str) {
+        self.query = query.to_lowercase();
+        self.hit = 0;
+        let hits = self.hits();
+        if self.query.is_empty() {
+            self.shown = None;
+            self.cursor = self.origin;
+            return;
+        }
+        let mut shown = HashSet::new();
+        for &id in &hits {
+            shown.insert(id);
+            let mut parent = self.items[id].parent;
+            while let Some(pid) = parent {
+                shown.insert(pid);
+                parent = self.items[pid].parent;
+            }
+        }
+        self.shown = Some(shown);
+        if let Some(&first) = hits.first() {
+            self.cursor = first;
+        }
+    }
+
+    /// Enter: leave the filtered view, keep the cursor on the hit with its parents open, so `n` walks on.
+    pub(crate) fn accept_search(&mut self) {
+        self.shown = None;
+        self.goto_hit();
+    }
+
+    /// Esc: drop the search and put the cursor back.
+    pub(crate) fn cancel_search(&mut self) {
+        self.shown = None;
+        self.query.clear();
+        self.cursor = self.origin;
+    }
+
+    pub(crate) fn searching_none(&self) -> bool {
+        matches!(&self.shown, Some(s) if s.is_empty())
+    }
+
     pub(crate) fn next(&mut self) {
         if self.query.is_empty() {
             return;
         }
         self.hit = self.hit.saturating_add(1);
         self.goto_hit();
+    }
+
+    /// Put the cursor on the top-level item with this key and open it.
+    pub(crate) fn focus(&mut self, key: &str) {
+        let found = self
+            .items
+            .iter()
+            .position(|item| item.parent.is_none() && item.key == key);
+        if let Some(id) = found {
+            self.cursor = id;
+            if !self.items[id].children.is_empty() {
+                self.open.insert(id);
+            }
+        }
     }
 
     pub(crate) fn cursor_key(&self) -> &str {
@@ -227,7 +293,7 @@ impl View {
         let mut gapped = false;
         let mut saw_header = false;
         for id in 0..self.items.len() {
-            if self.items[id].parent.is_some() {
+            if self.items[id].parent.is_some() || !self.is_shown(id) {
                 continue;
             }
             if is_header(&self.items[id]) {
@@ -246,12 +312,19 @@ impl View {
 
     fn push_node(&self, out: &mut Vec<Slot>, id: usize) {
         out.push(Slot::Item(id));
-        if self.items[id].children.is_empty() || !self.open.contains(&id) {
+        if self.items[id].children.is_empty() || (self.shown.is_none() && !self.open.contains(&id))
+        {
             return;
         }
         for &child in &self.items[id].children {
-            self.push_node(out, child);
+            if self.is_shown(child) {
+                self.push_node(out, child);
+            }
         }
+    }
+
+    fn is_shown(&self, id: usize) -> bool {
+        self.shown.as_ref().is_none_or(|shown| shown.contains(&id))
     }
 
     fn text(&self, id: usize) -> String {
@@ -693,6 +766,34 @@ symbols:
         );
         assert!(text.contains("v load"), "{text}");
         assert!(text.contains("v needed"), "{text}");
+    }
+
+    #[test]
+    fn typing_shows_only_the_tree_down_to_each_hit() {
+        let mut view = View::spine(PAGE);
+        view.begin_search();
+        view.live("compat");
+        let text = view.body();
+        assert!(text.contains("compat: 1.0.0"), "{text}");
+        assert!(!text.contains("kind: shared"), "{text}");
+        view.live("");
+        assert!(view.body().contains("kind: shared"), "{}", view.body());
+    }
+
+    #[test]
+    fn cancel_restores_the_cursor_and_accept_keeps_the_hit() {
+        let mut view = View::spine(PAGE);
+        let start = view.cursor_key().to_string();
+        view.begin_search();
+        view.live("compat");
+        assert_eq!(view.cursor_key(), "compat");
+        view.cancel_search();
+        assert_eq!(view.cursor_key(), start);
+        view.begin_search();
+        view.live("compat");
+        view.accept_search();
+        assert_eq!(view.cursor_key(), "compat");
+        assert!(view.body().contains("kind: shared"), "{}", view.body());
     }
 
     #[test]

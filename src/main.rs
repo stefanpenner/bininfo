@@ -85,12 +85,19 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
             let file = bininfo::open(&bytes, symbols)?;
             let color = color_stdout();
             let page = bininfo::render(&path, &file, json, color);
-            let summary = bininfo::summary::read(&bytes);
-            let text = bininfo::summary::merge(&page, &summary, json, color);
+            let online = env::var_os("BININFO_OFFLINE").is_none();
             if fold::interactive(io::stdout().is_terminal(), json) {
-                tui::run(&text).map_err(|err| err.to_string())?;
+                // The cert scan is slow. The page opens now and the scan runs when asked.
+                let cheap = bininfo::summary::read_cheap(&bytes);
+                let text = bininfo::summary::merge(&page, &cheap, json, color);
+                let load = move || {
+                    let full = bininfo::summary::read(&bytes, online);
+                    bininfo::summary::merge(&page, &full, false, color)
+                };
+                tui::run(&text, load).map_err(|err| err.to_string())?;
             } else {
-                print!("{text}");
+                let summary = bininfo::summary::read(&bytes, online);
+                print!("{}", bininfo::summary::merge(&page, &summary, json, color));
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -105,7 +112,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
         }
         Job::Claims { path, json } => check_file(&path, json),
         Job::Features => {
-            println!("certs\nmatch\npage-certs\nschema 1");
+            println!("certs\nmatch\npage-certs\ncert-validity\nschema 1");
             Ok(ExitCode::SUCCESS)
         }
         Job::Certs { path, json, want } => {
@@ -165,7 +172,7 @@ fn certs_page(path: &str, bytes: &[u8], json: bool, want: &Want) -> (String, usi
         let spki = hex(&hit.spki_sha256);
         let cn = hit.subject_cn.as_deref();
         if json {
-            rows.push(hit_json(&hit, by));
+            rows.push(hit_json(&hit, by, None));
         } else {
             rows.push(format!(
                 "{kind}\t{role}\t{container}\t{}\t{sha}\t{spki}\t{}\t{}",

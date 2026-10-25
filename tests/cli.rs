@@ -2,7 +2,10 @@ use std::fs;
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_bininfo"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bininfo"));
+    cmd.env("BININFO_OFFLINE", "1")
+        .env("BININFO_BAD_CACHE", "/nonexistent/bad-certs.tsv");
+    cmd
 }
 
 #[test]
@@ -432,7 +435,7 @@ fn the_page_shows_the_size_and_the_trust_certs() {
     assert!(text.contains("\nsize: 2.3 KiB"), "{text}");
     assert!(text.contains("\ncerts:"), "{text}");
     assert!(text.contains("  trust: 3"), "{text}");
-    assert!(text.contains("- cn: probe-rsa"), "{text}");
+    assert!(text.contains("cn: probe-rsa"), "{text}");
     assert!(text.contains("      sha256: c3cf2905"), "{text}");
 }
 
@@ -457,4 +460,29 @@ fn a_page_without_certs_says_zero() {
     assert!(text.contains("\ncerts:"), "{text}");
     assert!(text.contains("  trust: 0"), "{text}");
     assert!(text.contains(" KiB"), "{text}");
+}
+
+#[test]
+fn valid_certs_get_a_check_and_the_bad_list_source() {
+    let path = elf_with_pem("marks-certs");
+    let text = String::from_utf8(bin().arg(&path).output().unwrap().stdout).unwrap();
+    assert!(text.contains("✓ cn: probe-rsa"), "{text}");
+    assert!(text.contains("Bad list: unavailable"), "{text}");
+    let json = String::from_utf8(bin().arg("--json").arg(&path).output().unwrap().stdout).unwrap();
+    assert!(json.contains(r#""valid":true"#), "{json}");
+    assert!(json.contains(r#""not_after":"#), "{json}");
+}
+
+#[test]
+fn a_cached_bad_list_flags_a_cert_by_hash() {
+    let path = elf_with_pem("bad-certs");
+    let cache = std::env::temp_dir().join(format!("bad-{}.tsv", std::process::id()));
+    fs::write(&cache, "c3cf2905\t\tTest advisory\n").unwrap();
+    let hit = bin().arg("--certs").arg("--json").arg(&path).output().unwrap();
+    let all = String::from_utf8(hit.stdout).unwrap();
+    let sha = all.split(r#""sha256":""#).nth(1).unwrap().split('"').next().unwrap().to_string();
+    fs::write(&cache, format!("{sha}\t\tTest advisory\n")).unwrap();
+    let out = bin().env("BININFO_BAD_CACHE", &cache).arg("--json").arg(&path).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("on bad list: Test advisory"), "{text}");
 }

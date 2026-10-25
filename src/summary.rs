@@ -13,6 +13,7 @@ The page text from each format stays as it is.
 
 use crate::certs::{self, Hit, Region, Role};
 use crate::style;
+use crate::trust::{self, Bads, Verdict};
 use std::fmt::Write;
 
 const REGION_ROWS: usize = 64;
@@ -22,14 +23,49 @@ const SIGNER_NAMES: usize = 8;
 pub struct Summary {
     pub size: u64,
     pub regions: Vec<Region>,
-    pub hits: Vec<Hit>,
+    pub certs: Certs,
 }
 
-pub fn read(bytes: &[u8]) -> Summary {
+/// The scanned certs and a verdict for each. `loaded` is false until the scan runs.
+#[derive(Default)]
+pub struct Certs {
+    pub loaded: bool,
+    pub hits: Vec<Hit>,
+    pub verdicts: Vec<Verdict>,
+    pub bads: Bads,
+}
+
+/// Size and regions only. They are cheap. The certs stay unloaded.
+pub fn read_cheap(bytes: &[u8]) -> Summary {
     Summary {
         size: bytes.len() as u64,
         regions: certs::regions(bytes),
-        hits: certs::scan(bytes),
+        certs: Certs::default(),
+    }
+}
+
+/// Everything. `online` lets the bad list refresh from the network.
+pub fn read(bytes: &[u8], online: bool) -> Summary {
+    Summary {
+        certs: scan_certs(bytes, online),
+        ..read_cheap(bytes)
+    }
+}
+
+/// The slow part: scan for certs and judge each one.
+pub fn scan_certs(bytes: &[u8], online: bool) -> Certs {
+    let hits = certs::scan(bytes);
+    let bads = trust::load(online);
+    let now = trust::now();
+    let verdicts = hits
+        .iter()
+        .map(|hit| trust::judge(hit, &bads, now))
+        .collect();
+    Certs {
+        loaded: true,
+        hits,
+        verdicts,
+        bads,
     }
 }
 
@@ -56,9 +92,15 @@ fn word<T: std::fmt::Debug>(value: T) -> String {
 }
 
 /// One hit as a JSON object. `by` says why a match request kept it.
-pub fn hit_json(hit: &Hit, by: Option<&str>) -> String {
+pub fn hit_json(hit: &Hit, by: Option<&str>, verdict: Option<&Verdict>) -> String {
+    let secs = |v: Option<i64>| v.map_or("null".into(), |n| n.to_string());
+    let (valid, reason) = match verdict {
+        Some(Verdict::Valid) => ("true".to_string(), "null".to_string()),
+        Some(Verdict::Invalid(why)) => ("false".to_string(), json_str(why)),
+        _ => ("null".to_string(), "null".to_string()),
+    };
     format!(
-        "{{\"offset\":{},\"length\":{},\"kind\":\"{}\",\"role\":\"{}\",\"container\":\"{}\",\"place\":{},\"sha256\":\"{}\",\"spki_sha256\":\"{}\",\"subject_cn\":{},\"matched_by\":{}}}",
+        "{{\"offset\":{},\"length\":{},\"kind\":\"{}\",\"role\":\"{}\",\"container\":\"{}\",\"place\":{},\"sha256\":\"{}\",\"spki_sha256\":\"{}\",\"subject_cn\":{},\"not_before\":{},\"not_after\":{},\"valid\":{},\"reason\":{},\"matched_by\":{}}}",
         hit.offset,
         hit.length,
         word(hit.kind),
@@ -68,6 +110,10 @@ pub fn hit_json(hit: &Hit, by: Option<&str>) -> String {
         hex(&hit.sha256),
         hex(&hit.spki_sha256),
         hit.subject_cn.as_deref().map_or("null".into(), json_str),
+        secs(hit.not_before),
+        secs(hit.not_after),
+        valid,
+        reason,
         by.map_or("null".into(), |b| format!("\"{b}\"")),
     )
 }
@@ -131,16 +177,38 @@ fn regions_rung(out: &mut String, summary: &Summary, color: bool) {
 }
 
 fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
-    let trust: Vec<&Hit> = summary
+    if !summary.certs.loaded {
+        style::blank(out);
+        style::rung(
+            out,
+            color,
+            "certs",
+            "Not loaded. Press enter to scan. Run --certs to scan without the TUI.",
+            style::FG,
+            true,
+        );
+        return;
+    }
+    let judged: Vec<(&Hit, &Verdict)> = summary
+        .certs
         .hits
         .iter()
-        .filter(|h| h.role == Role::Trust)
+        .zip(&summary.certs.verdicts)
         .collect();
-    let signer: Vec<&Hit> = summary
-        .hits
+    let trust: Vec<(&Hit, &Verdict)> = judged
         .iter()
-        .filter(|h| h.role == Role::Signer)
+        .filter(|(h, _)| h.role == Role::Trust)
+        .copied()
         .collect();
+    let signer: Vec<&Hit> = judged
+        .iter()
+        .filter(|(h, _)| h.role == Role::Signer)
+        .map(|(h, _)| *h)
+        .collect();
+    let bad = trust
+        .iter()
+        .filter(|(_, v)| matches!(v, Verdict::Invalid(_)))
+        .count();
     style::blank(out);
     style::rung(
         out,
@@ -186,6 +254,16 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
             false,
         );
     }
+    style::field(
+        out,
+        color,
+        2,
+        "invalid",
+        &bad.to_string(),
+        &format!("Trust certs that are expired or on a bad list. Bad list: {}.", summary.certs.bads.source),
+        if bad > 0 { style::RED } else { style::WHITE },
+        bad > 0,
+    );
     if !trust.is_empty() {
         style::field(
             out,
@@ -198,16 +276,25 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
             false,
         );
     }
-    for hit in trust.iter().take(CERT_ROWS) {
+    for (hit, verdict) in trust.iter().take(CERT_ROWS) {
         let cn = hit.subject_cn.as_deref().unwrap_or("null");
-        let note = format!(
+        let mut note = format!(
             "{} {} in {}, {}",
             word(hit.kind),
             word(hit.encoding),
             hit.place,
             style::human(hit.length as u64)
         );
-        let _ = write_item(out, color, 4, &format!("cn: {cn}"), &note);
+        let (mark, fg) = match verdict {
+            Verdict::Valid => (verdict.mark(), style::GREEN),
+            Verdict::Unknown => (verdict.mark(), style::LABEL),
+            Verdict::Invalid(why) => {
+                note = format!("{why}; {note}");
+                (verdict.mark(), style::RED)
+            }
+        };
+        let tag = style::paint(color, mark, fg, true);
+        let _ = write_item(out, color, 4, &format!("{tag} cn: {cn}"), &note);
         let _ = writeln!(out, "      sha256: {}", hex(&hit.sha256));
         let _ = writeln!(out, "      spki_sha256: {}", hex(&hit.spki_sha256));
     }
@@ -232,7 +319,7 @@ fn write_item(
     text: &str,
     note: &str,
 ) -> std::fmt::Result {
-    let plain = indent + 2 + text.chars().count();
+    let plain = indent + 2 + plain_len(text);
     let dash = style::paint(color, "-", style::LABEL, false);
     style::align_note(
         out,
@@ -259,13 +346,23 @@ pub fn json_keys(summary: &Summary) -> String {
             )
         })
         .collect();
-    let hits: Vec<String> = summary.hits.iter().map(|h| hit_json(h, None)).collect();
+    let hits: Vec<String> = summary
+        .certs
+        .hits
+        .iter()
+        .zip(&summary.certs.verdicts)
+        .map(|(h, v)| hit_json(h, None, Some(v)))
+        .collect();
     format!(
         ",\"size\":{},\"regions\":[{}],\"certs\":[{}]",
         summary.size,
         regions.join(","),
         hits.join(",")
     )
+}
+
+fn plain_len(text: &str) -> usize {
+    plain(text).chars().count()
 }
 
 fn plain(line: &str) -> String {
