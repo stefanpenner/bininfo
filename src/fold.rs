@@ -644,6 +644,26 @@ pub(crate) fn strip_ansi(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const PAGE: &str = "\
+file: a                         # Path of this file.
+format: macho                   # elf, macho, or pe.
+
+type:                           # Rung 1.
+  filetype: DYLIB               # 4 bytes.
+  cputype_name: AArch64 (16777228)  # Word.
+
+load:                           # How this file starts.
+  kind: shared                  # A shared library.
+  interp: /usr/lib/dyld         # Path of the loader.
+  needed:                       # Libraries.
+    - /usr/lib/libSystem.B.dylib  # libc.
+      compat: 1.0.0
+      current: 2.0.0
+  pie: false                    # MH_PIE.
+";
+
     #[test]
     fn folded_cert_rows_keep_green_and_red_marks() {
         let text = tint_marks("  > - ✓ cn: a\n  > - ✗ cn: b");
