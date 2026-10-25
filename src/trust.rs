@@ -266,15 +266,23 @@ fn from_tsv(text: &str) -> Vec<Bad> {
 pub fn parse_advisory(text: &str) -> Vec<Bad> {
     let mut out = Vec::new();
     let mut name = String::new();
+    let mut operator = String::new();
     let mut sha = String::new();
     for (key, value) in string_pairs(text) {
         match key.as_str() {
             "name" => name = value,
+            "operator" => operator = value,
             "sha256" => sha = value.to_lowercase(),
             "spki_sha256" if !sha.is_empty() => out.push(Bad {
                 sha256: std::mem::take(&mut sha),
                 spki_sha256: value.to_lowercase(),
-                why: format!("eMudhra CA compromise advisory: {name}"),
+                why: if let Some(operator) = Some(std::mem::take(&mut operator))
+                    .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("emudhra"))
+                {
+                    format!("eMudhra advisory lists this {operator} root as a signer of affected eMudhra CAs: {name}")
+                } else {
+                    format!("eMudhra CA compromise advisory: {name}")
+                },
                 url: EMUDHRA_PAGE.to_string(),
                 kind: "distrusted".into(),
             }),
@@ -525,6 +533,9 @@ mod tests {
         assert_eq!(bad[0].spki_sha256, "cd34");
         assert_eq!(bad[1].why, "eMudhra CA compromise advisory: Root B");
         assert!(bad[1].url.starts_with("https://"));
+        let other = parse_advisory(r#"[{"name":"AAA","operator":"Sectigo","sha256":"1","spki_sha256":"2"},{"name":"X","sha256":"3","spki_sha256":"4"}]"#);
+        assert!(other[0].why.contains("Sectigo root as a signer"));
+        assert_eq!(other[1].why, "eMudhra CA compromise advisory: X");
     }
 
     #[test]
