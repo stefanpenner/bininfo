@@ -670,6 +670,7 @@ fn split_line(plain: &str) -> (usize, bool, String, String) {
 fn tint_marks(line: &str) -> String {
     line.replace('✓', "\x1b[1;38;2;37;190;106m✓\x1b[0m")
         .replace('✗', "\x1b[1;38;2;255;92;92m✗\x1b[0m")
+        .replace('‼', "\x1b[1;38;2;255;45;149m‼\x1b[0m")
         .replace('⊘', "\x1b[1;38;2;255;92;92m⊘\x1b[0m")
         .replace('◷', "\x1b[1;38;2;245;176;66m◷\x1b[0m")
 }

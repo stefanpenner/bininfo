@@ -41,7 +41,7 @@ pub struct Bad {
     pub why: String,
     /// Where to read about it.
     pub url: String,
-    /// `distrusted` or `revoked`.
+    /// `critical` (compromised or leaked), `revoked`, or `distrusted`.
     pub kind: String,
 }
 
@@ -76,6 +76,7 @@ impl Verdict {
             Verdict::Valid => "✓",
             Verdict::Unknown => "–",
             Verdict::Expired(_) | Verdict::NotYetValid(_) => "◷",
+            Verdict::Distrusted { kind, .. } if kind == "critical" => "‼",
             Verdict::Distrusted { kind, .. } if kind == "revoked" => "⊘",
             Verdict::Distrusted { .. } => "✗",
         }
@@ -88,6 +89,7 @@ impl Verdict {
             Verdict::Unknown => "unknown",
             Verdict::Expired(_) => "expired",
             Verdict::NotYetValid(_) => "not_yet_valid",
+            Verdict::Distrusted { kind, .. } if kind == "critical" => "critical",
             Verdict::Distrusted { kind, .. } if kind == "revoked" => "revoked",
             Verdict::Distrusted { .. } => "distrusted",
         }
@@ -160,7 +162,7 @@ fn cache_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("bininfo").join("bad-certs-v3.tsv"))
+    Some(base.join("bininfo").join("bad-certs-v4.tsv"))
 }
 
 /// Load the bad list. With `fetch`, a missing or old cache is refreshed with curl.
@@ -281,19 +283,24 @@ pub fn parse_advisory(text: &str) -> Vec<Bad> {
             "name" => name = value,
             "operator" => operator = value,
             "sha256" => sha = value.to_lowercase(),
-            "spki_sha256" if !sha.is_empty() => out.push(Bad {
-                sha256: std::mem::take(&mut sha),
-                spki_sha256: value.to_lowercase(),
-                why: if let Some(operator) = Some(std::mem::take(&mut operator))
-                    .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("emudhra"))
-                {
-                    format!("eMudhra advisory lists this {operator} root as a signer of affected eMudhra CAs: {name}")
-                } else {
-                    format!("eMudhra CA compromise advisory: {name}")
-                },
-                url: EMUDHRA_PAGE.to_string(),
-                kind: "distrusted".into(),
-            }),
+            "spki_sha256" if !sha.is_empty() => {
+                let other = Some(std::mem::take(&mut operator))
+                    .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("emudhra"));
+                let (kind, why) = match other {
+                    Some(op) => (
+                        "distrusted",
+                        format!("eMudhra advisory lists this {op} root as a signer of affected eMudhra CAs: {name}"),
+                    ),
+                    None => ("critical", format!("eMudhra CA compromise advisory: {name}")),
+                };
+                out.push(Bad {
+                    sha256: std::mem::take(&mut sha),
+                    spki_sha256: value.to_lowercase(),
+                    why,
+                    url: EMUDHRA_PAGE.to_string(),
+                    kind: kind.into(),
+                });
+            }
             _ => {}
         }
     }
@@ -472,7 +479,7 @@ pub fn parse_revoked(text: &str) -> Vec<Bad> {
             spki_sha256: String::new(),
             why,
             url: ONECRL_PAGE.into(),
-            kind: "revoked".into(),
+            kind: if reason.contains("Compromise") { "critical" } else { "revoked" }.into(),
         });
     }
     out
@@ -544,6 +551,8 @@ mod tests {
         let other = parse_advisory(r#"[{"name":"AAA","operator":"Sectigo","sha256":"1","spki_sha256":"2"},{"name":"X","sha256":"3","spki_sha256":"4"}]"#);
         assert!(other[0].why.contains("Sectigo root as a signer"));
         assert_eq!(other[1].why, "eMudhra CA compromise advisory: X");
+        assert_eq!(bad[0].kind, "critical");
+        assert_eq!(other[0].kind, "distrusted");
     }
 
     #[test]
@@ -565,8 +574,10 @@ mod tests {
         assert_eq!(bad[0].url, "https://bugzilla.example/1");
         let revoked = "Revocation Status,RFC 5280 Revocation Reason Code,Date of Revocation,Certificate Subject Common Name,SHA-256 Fingerprint\nRevoked,(2) cACompromise,2023 Feb 24,Sub CA,CD\n";
         let bad = parse_revoked(revoked);
-        assert_eq!(bad[0].kind, "revoked");
+        assert_eq!(bad[0].kind, "critical");
         assert!(bad[0].why.contains("cACompromise"));
+        let plain = "Revocation Status,RFC 5280 Revocation Reason Code,Date of Revocation,Certificate Subject Common Name,SHA-256 Fingerprint\nRevoked,(5) cessationOfOperation,2023 Feb 24,Sub CA,CD\n";
+        assert_eq!(parse_revoked(plain)[0].kind, "revoked");
         assert!(bad[0].why.contains("2023 Feb 24"));
     }
 

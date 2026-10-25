@@ -215,7 +215,8 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
         .map(|(h, _)| *h)
         .collect();
     let count = |want: &str| trust.iter().filter(|(_, v)| v.status() == want).count();
-    let (expired, not_yet, distrusted, revoked) = (
+    let (critical, expired, not_yet, distrusted, revoked) = (
+        count("critical"),
         count("expired"),
         count("not_yet_valid"),
         count("distrusted"),
@@ -270,10 +271,20 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
         out,
         color,
         2,
+        "critical",
+        &critical.to_string(),
+        "Compromised or leaked keys, such as the eMudhra advisory CAs. Broken. Act first.",
+        if critical > 0 { style::CRITICAL } else { style::WHITE },
+        critical > 0,
+    );
+    style::field(
+        out,
+        color,
+        2,
         "distrusted",
         &distrusted.to_string(),
         &format!(
-            "Compromised, distrusted, or removed from a root store. Bad list: {}.",
+            "Distrusted or removed from a root store. Bad list: {}.",
             summary.certs.bads.source
         ),
         if distrusted > 0 { style::RED } else { style::WHITE },
@@ -336,6 +347,7 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
             Verdict::Valid => style::GREEN,
             Verdict::Unknown => style::LABEL,
             Verdict::Expired(_) | Verdict::NotYetValid(_) => style::AMBER,
+            Verdict::Distrusted { kind, .. } if kind == "critical" => style::CRITICAL,
             Verdict::Distrusted { .. } => style::RED,
         };
         let mark = verdict.mark();
