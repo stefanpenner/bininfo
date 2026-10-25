@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const TTL: Duration = Duration::from_secs(24 * 3600);
+const TTL: Duration = Duration::from_secs(15 * 60);
 const EMUDHRA: [&str; 2] = [
     "https://emudhra.we-have-a-problem.com/roots.json",
     "https://emudhra.we-have-a-problem.com/impacted-intermediates.json",
@@ -195,10 +195,18 @@ pub fn load(fetch: bool) -> Bads {
         }
     }
     match cached {
-        Some(text) => Bads {
-            list: from_tsv(&text),
-            source: "stale cache",
-        },
+        Some(text) => {
+            // Rewrite the old list so a failed fetch is not retried until the TTL passes.
+            if fetch {
+                if let Some(f) = &file {
+                    let _ = std::fs::write(f, &text);
+                }
+            }
+            Bads {
+                list: from_tsv(&text),
+                source: "stale cache",
+            }
+        }
         None => Bads {
             list: Vec::new(),
             source: "unavailable",
