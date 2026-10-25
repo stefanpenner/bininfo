@@ -215,8 +215,12 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
         .map(|(h, _)| *h)
         .collect();
     let count = |want: &str| trust.iter().filter(|(_, v)| v.status() == want).count();
-    let (expired, not_yet, distrusted) =
-        (count("expired"), count("not_yet_valid"), count("distrusted"));
+    let (expired, not_yet, distrusted, revoked) = (
+        count("expired"),
+        count("not_yet_valid"),
+        count("distrusted"),
+        count("revoked"),
+    );
     style::blank(out);
     style::rung(
         out,
@@ -269,11 +273,21 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
         "distrusted",
         &distrusted.to_string(),
         &format!(
-            "Compromised, distrusted, or revoked, by a bad list. Bad list: {}.",
+            "Compromised, distrusted, or removed from a root store. Bad list: {}.",
             summary.certs.bads.source
         ),
         if distrusted > 0 { style::RED } else { style::WHITE },
         distrusted > 0,
+    );
+    style::field(
+        out,
+        color,
+        2,
+        "revoked",
+        &revoked.to_string(),
+        "Revoked by the CA, per the CCADB list.",
+        if revoked > 0 { style::RED } else { style::WHITE },
+        revoked > 0,
     );
     style::field(
         out,

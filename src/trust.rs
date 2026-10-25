@@ -22,6 +22,13 @@ const EMUDHRA: [&str; 2] = [
 ];
 const EMUDHRA_PAGE: &str = "https://emudhra.we-have-a-problem.com/";
 const MOZILLA_PAGE: &str = "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReport";
+const MOZILLA_REMOVED: &str =
+    "https://ccadb.my.salesforce-sites.com/mozilla/RemovedCACertificateReportPEMCSV";
+const MOZILLA_REVOKED: &str =
+    "https://ccadb.my.salesforce-sites.com/mozilla/PublicIntermediateCertsRevokedWithPEMCSV";
+const MOZILLA_REMOVED_PAGE: &str =
+    "https://ccadb.my.salesforce-sites.com/mozilla/RemovedCACertificateReport";
+const ONECRL_PAGE: &str = "https://wiki.mozilla.org/CA/Revocation_Checking_in_Firefox";
 const MOZILLA: &str = "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReportPEMCSV";
 
 /// One cert on the bad list. Hashes are lowercase hex.
@@ -32,6 +39,8 @@ pub struct Bad {
     pub why: String,
     /// Where to read about it.
     pub url: String,
+    /// `distrusted` or `revoked`.
+    pub kind: String,
 }
 
 /// The bad list and where it came from.
@@ -52,7 +61,11 @@ pub enum Verdict {
     /// Before notBefore. The text names the date.
     NotYetValid(String),
     /// On a bad list: compromised, distrusted, or revoked.
-    Distrusted { why: String, url: String },
+    Distrusted {
+        kind: String,
+        why: String,
+        url: String,
+    },
 }
 
 impl Verdict {
@@ -61,6 +74,7 @@ impl Verdict {
             Verdict::Valid => "✓",
             Verdict::Unknown => "–",
             Verdict::Expired(_) | Verdict::NotYetValid(_) => "◷",
+            Verdict::Distrusted { kind, .. } if kind == "revoked" => "⊘",
             Verdict::Distrusted { .. } => "✗",
         }
     }
@@ -72,6 +86,7 @@ impl Verdict {
             Verdict::Unknown => "unknown",
             Verdict::Expired(_) => "expired",
             Verdict::NotYetValid(_) => "not_yet_valid",
+            Verdict::Distrusted { kind, .. } if kind == "revoked" => "revoked",
             Verdict::Distrusted { .. } => "distrusted",
         }
     }
@@ -103,6 +118,7 @@ pub fn judge(hit: &Hit, bads: &Bads, now: i64) -> Verdict {
         .find(|bad| bad.sha256 == sha || (!bad.spki_sha256.is_empty() && bad.spki_sha256 == spki))
     {
         return Verdict::Distrusted {
+            kind: bad.kind.clone(),
             why: bad.why.clone(),
             url: bad.url.clone(),
         };
@@ -142,7 +158,7 @@ fn cache_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("bininfo").join("bad-certs.tsv"))
+    Some(base.join("bininfo").join("bad-certs-v2.tsv"))
 }
 
 /// Load the bad list. With `fetch`, a missing or old cache is refreshed with curl.
@@ -198,6 +214,12 @@ fn fetch_all() -> Vec<Bad> {
     if let Some(text) = curl(MOZILLA) {
         list.extend(parse_mozilla(&text));
     }
+    if let Some(text) = curl(MOZILLA_REMOVED) {
+        list.extend(parse_removed(&text));
+    }
+    if let Some(text) = curl(MOZILLA_REVOKED) {
+        list.extend(parse_revoked(&text));
+    }
     list
 }
 
@@ -216,19 +238,20 @@ fn curl(url: &str) -> Option<String> {
 
 fn to_tsv(list: &[Bad]) -> String {
     list.iter()
-        .map(|b| format!("{}\t{}\t{}\t{}\n", b.sha256, b.spki_sha256, b.why, b.url))
+        .map(|b| format!("{}\t{}\t{}\t{}\t{}\n", b.sha256, b.spki_sha256, b.why, b.url, b.kind))
         .collect()
 }
 
 fn from_tsv(text: &str) -> Vec<Bad> {
     text.lines()
         .filter_map(|line| {
-            let mut cols = line.splitn(4, '\t');
+            let mut cols = line.splitn(5, '\t');
             Some(Bad {
                 sha256: cols.next()?.to_string(),
                 spki_sha256: cols.next()?.to_string(),
                 why: cols.next()?.to_string(),
                 url: cols.next().unwrap_or("").to_string(),
+                kind: cols.next().unwrap_or("distrusted").to_string(),
             })
         })
         .collect()
@@ -248,6 +271,7 @@ pub fn parse_advisory(text: &str) -> Vec<Bad> {
                 spki_sha256: value.to_lowercase(),
                 why: format!("eMudhra CA compromise advisory: {name}"),
                 url: EMUDHRA_PAGE.to_string(),
+                kind: "distrusted".into(),
             }),
             _ => {}
         }
@@ -320,12 +344,83 @@ pub fn parse_mozilla(text: &str) -> Vec<Bad> {
                     spki_sha256: String::new(),
                     why: format!("Mozilla distrusts {label} after {}: {}", get(at), get(name)),
                     url: MOZILLA_PAGE.to_string(),
+                    kind: "distrusted".into(),
                 });
                 break;
             }
         }
     }
     out
+}
+
+/// Read the CCADB removed-roots CSV. Mozilla took these roots out of its store.
+pub fn parse_removed(text: &str) -> Vec<Bad> {
+    let mut out = Vec::new();
+    for row in records(text) {
+        let get = |k: &str| row.get(k).map(|s| s.trim()).unwrap_or("");
+        let sha = get("SHA-256 Fingerprint");
+        if sha.is_empty() {
+            continue;
+        }
+        let when = get("Firefox Release When Removed");
+        let bug = get("Removal Bug No. or Date");
+        out.push(Bad {
+            sha256: sha.to_lowercase(),
+            spki_sha256: String::new(),
+            why: format!(
+                "removed from the Mozilla root store{}: {}",
+                if when.is_empty() { String::new() } else { format!(" ({when})") },
+                get("Root Certificate Name")
+            ),
+            url: if bug.starts_with("http") { bug.into() } else { MOZILLA_REMOVED_PAGE.into() },
+            kind: "distrusted".into(),
+        });
+    }
+    out
+}
+
+/// Read the CCADB revoked-intermediates CSV.
+pub fn parse_revoked(text: &str) -> Vec<Bad> {
+    let mut out = Vec::new();
+    for row in records(text) {
+        let get = |k: &str| row.get(k).map(|s| s.trim()).unwrap_or("");
+        let sha = get("SHA-256 Fingerprint");
+        if sha.is_empty() {
+            continue;
+        }
+        let reason = get("RFC 5280 Revocation Reason Code");
+        let reason = reason.split(") ").last().unwrap_or("");
+        let status = get("Revocation Status").to_lowercase();
+        let date = get("Date of Revocation");
+        let mut why = format!("{status} (CCADB): {}", get("Certificate Subject Common Name"));
+        if !reason.is_empty() {
+            why.push_str(&format!(", {reason}"));
+        }
+        if !date.is_empty() {
+            why.push_str(&format!(", {date}"));
+        }
+        out.push(Bad {
+            sha256: sha.to_lowercase(),
+            spki_sha256: String::new(),
+            why,
+            url: ONECRL_PAGE.into(),
+            kind: "revoked".into(),
+        });
+    }
+    out
+}
+
+// Each CSV row as a map from header to value.
+fn records(text: &str) -> Vec<std::collections::HashMap<String, String>> {
+    let mut rows = csv_rows(text).into_iter();
+    let Some(head) = rows.next() else {
+        return Vec::new();
+    };
+    let head: Vec<String> = head
+        .into_iter()
+        .map(|h| h.trim_start_matches('\u{feff}').to_string())
+        .collect();
+    rows.map(|row| head.iter().cloned().zip(row).collect()).collect()
 }
 
 fn csv_rows(text: &str) -> Vec<Vec<String>> {
@@ -391,6 +486,20 @@ mod tests {
     }
 
     #[test]
+    fn ccadb_removed_and_revoked_rows_become_bad_entries() {
+        let removed = "Root Certificate Name,Firefox Release When Removed,SHA-256 Fingerprint,Removal Bug No. or Date\nOld,Firefox 117,AB,https://bugzilla.example/1\n";
+        let bad = parse_removed(removed);
+        assert_eq!(bad[0].sha256, "ab");
+        assert!(bad[0].why.contains("Firefox 117"));
+        assert_eq!(bad[0].url, "https://bugzilla.example/1");
+        let revoked = "Revocation Status,RFC 5280 Revocation Reason Code,Date of Revocation,Certificate Subject Common Name,SHA-256 Fingerprint\nRevoked,(2) cACompromise,2023 Feb 24,Sub CA,CD\n";
+        let bad = parse_revoked(revoked);
+        assert_eq!(bad[0].kind, "revoked");
+        assert!(bad[0].why.contains("cACompromise"));
+        assert!(bad[0].why.contains("2023 Feb 24"));
+    }
+
+    #[test]
     fn verdict_follows_list_then_dates() {
         let mut hit = crate::certs::scan(include_bytes!("../tests/fixtures/emsign-ecc-g3.der"))
             .remove(0);
@@ -406,6 +515,7 @@ mod tests {
                 spki_sha256: String::new(),
                 why: "x".into(),
                 url: "https://example.test/".into(),
+                kind: "distrusted".into(),
             }],
             source: "cache",
         };
