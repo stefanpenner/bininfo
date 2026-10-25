@@ -29,6 +29,8 @@ const MOZILLA_REVOKED: &str =
 const MOZILLA_REMOVED_PAGE: &str =
     "https://ccadb.my.salesforce-sites.com/mozilla/RemovedCACertificateReport";
 const ONECRL_PAGE: &str = "https://wiki.mozilla.org/CA/Revocation_Checking_in_Firefox";
+const ONECRL: &str =
+    "https://firefox.settings.services.mozilla.com/v1/buckets/security-state/collections/onecrl/records";
 const MOZILLA: &str = "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReportPEMCSV";
 
 /// One cert on the bad list. Hashes are lowercase hex.
@@ -158,7 +160,7 @@ fn cache_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("bininfo").join("bad-certs-v2.tsv"))
+    Some(base.join("bininfo").join("bad-certs-v3.tsv"))
 }
 
 /// Load the bad list. With `fetch`, a missing or old cache is refreshed with curl.
@@ -210,6 +212,9 @@ fn fetch_all() -> Vec<Bad> {
         if let Some(text) = curl(url) {
             list.extend(parse_advisory(&text));
         }
+    }
+    if let Some(text) = curl(ONECRL) {
+        list.extend(parse_onecrl(&text));
     }
     if let Some(text) = curl(MOZILLA) {
         list.extend(parse_mozilla(&text));
@@ -317,6 +322,53 @@ fn next_string(text: &str) -> Option<(String, &str)> {
         }
     }
     None
+}
+
+/// Read Mozilla OneCRL, the list Firefox itself blocks. Only entries keyed by
+/// public key hash can match here; issuer and serial entries need the serial.
+pub fn parse_onecrl(text: &str) -> Vec<Bad> {
+    let mut out = Vec::new();
+    let (mut bug, mut subject) = (String::new(), String::new());
+    for (key, value) in string_pairs(text) {
+        match key.as_str() {
+            "bug" => bug = value,
+            "subject" => subject = value,
+            "pubKeyHash" => {
+                let Some(hash) = crate::certs::b64_decode(value.as_bytes()) else { continue };
+                let name = crate::certs::b64_decode(subject.as_bytes())
+                    .and_then(|der| der_common_name(&der))
+                    .unwrap_or_else(|| "unnamed".into());
+                let url = match bug.as_str() {
+                    "" => ONECRL_PAGE.to_string(),
+                    b if b.bytes().all(|c| c.is_ascii_digit()) => {
+                        format!("https://bugzilla.mozilla.org/show_bug.cgi?id={b}")
+                    }
+                    b => b.to_string(),
+                };
+                out.push(Bad {
+                    sha256: String::new(),
+                    spki_sha256: crate::summary::hex(&hash),
+                    why: format!("blocked by Mozilla OneCRL: {name}"),
+                    url,
+                    kind: "revoked".into(),
+                });
+            }
+            "id" => {
+                bug.clear();
+                subject.clear();
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+// The commonName (2.5.4.3) string in a DER name, if any.
+fn der_common_name(der: &[u8]) -> Option<String> {
+    let at = der.windows(3).position(|w| w == [0x55, 0x04, 0x03])? + 3;
+    let len = *der.get(at + 1)? as usize;
+    let text = der.get(at + 2..at + 2 + len)?;
+    Some(String::from_utf8_lossy(text).into_owned())
 }
 
 /// Read the Mozilla CCADB roots CSV. A root with a distrust date is bad.
@@ -497,6 +549,17 @@ mod tests {
         assert_eq!(bad[0].kind, "revoked");
         assert!(bad[0].why.contains("cACompromise"));
         assert!(bad[0].why.contains("2023 Feb 24"));
+    }
+
+    #[test]
+    fn onecrl_pubkey_entries_become_revoked_by_spki() {
+        let json = r#"{"data":[{"details":{"bug":"2083382"},"subject":"MDExGzAZBgNVBAMMEkVNIERWIFRMUyBDQSAtIEczQg==","pubKeyHash":"6+1kdcLC2A/LGZ8/6N1uazzmC3frFdTkLD3sDG9bUQU=","id":"a"},{"details":{"bug":"9"},"issuerName":"x","serialNumber":"y","id":"b"}]}"#;
+        let bad = parse_onecrl(json);
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].spki_sha256.len(), 64);
+        assert!(bad[0].why.contains("EM DV TLS CA - G3B"));
+        assert!(bad[0].url.ends_with("id=2083382"));
+        assert_eq!(bad[0].kind, "revoked");
     }
 
     #[test]

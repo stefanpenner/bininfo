@@ -1607,7 +1607,7 @@ fn der_len(bytes: &[u8]) -> Option<(usize, usize)> {
     Some((value, 1 + width))
 }
 
-fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
     let mut clean = Vec::with_capacity(input.len());
     for &byte in input {
         match byte {
