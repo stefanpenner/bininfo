@@ -355,3 +355,56 @@ fn a_fat_macho_opens_each_slice() {
     assert!(!check_text.contains("says:"), "{check_text}");
     let _ = fs::remove_file(path);
 }
+
+fn padded_bundle(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let pem = std::path::Path::new("tests/fixtures/probe-bundle.pem").to_path_buf();
+    let mut bytes = vec![0u8; 2048];
+    bytes.extend(fs::read(&pem).unwrap());
+    let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    fs::write(&path, bytes).unwrap();
+    (path, pem)
+}
+
+#[test]
+fn features_lists_certs_and_match() {
+    let out = bin().arg("--features").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success());
+    assert!(text.lines().any(|l| l == "certs"), "{text}");
+    assert!(text.lines().any(|l| l == "match"), "{text}");
+}
+
+#[test]
+fn certs_json_has_a_version_and_a_list() {
+    let (path, _) = padded_bundle("certs-json");
+    let out = bin().args(["--certs", "--json"]).arg(&path).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{text}");
+    assert!(text.starts_with(r#"{"version":1,"file":""#), "{text}");
+    assert!(text.contains(r#""certs":[{"#), "{text}");
+    assert_eq!(text.lines().count(), 1, "{text}");
+}
+
+#[test]
+fn match_keeps_only_matches_and_exits_1() {
+    let (path, pem) = padded_bundle("certs-match");
+    let hit = bin().args(["--certs", "--json", "--match"]).arg(&pem).arg(&path).output().unwrap();
+    let text = String::from_utf8(hit.stdout).unwrap();
+    assert_eq!(hit.status.code(), Some(1), "{text}");
+    assert!(text.contains(r#""matched_by":"sha256""#), "{text}");
+
+    let miss = bin()
+        .args(["--certs", "--json", "--match-cn", "No Such CA"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8(miss.stdout).unwrap();
+    assert_eq!(miss.status.code(), Some(0), "{text}");
+    assert!(text.contains(r#""certs":[]"#), "{text}");
+}
+
+#[test]
+fn match_without_certs_is_a_usage_error() {
+    let out = bin().args(["--match-cn", "x", "/bin/ls"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+}
