@@ -33,12 +33,12 @@ fn advisory(block: &str) -> Option<Link> {
     })
 }
 
-// Every cert is findable by SHA-256 in public Certificate Transparency logs.
+// A web search by SHA-256 always loads. crt.sh is slow and returns 404 for certs that are not logged.
 fn cert_search(block: &str) -> Option<Link> {
     let sha = one_cert(block)?;
     Some(Link {
-        label: "crt.sh",
-        url: format!("https://crt.sh/?sha256={sha}"),
+        label: "hash search",
+        url: format!("https://duckduckgo.com/?q={sha}"),
     })
 }
 
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn a_plain_cert_row_searches_by_hash() {
         let link = for_block(&format!("- ✓ cn: a\n  sha256: {SHA}\n")).unwrap();
-        assert_eq!(link.url, format!("https://crt.sh/?sha256={SHA}"));
+        assert_eq!(link.url, format!("https://duckduckgo.com/?q={SHA}"));
     }
 
     #[test]
