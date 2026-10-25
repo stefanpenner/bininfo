@@ -20,6 +20,8 @@ const EMUDHRA: [&str; 2] = [
     "https://emudhra.we-have-a-problem.com/roots.json",
     "https://emudhra.we-have-a-problem.com/impacted-intermediates.json",
 ];
+const EMUDHRA_PAGE: &str = "https://emudhra.we-have-a-problem.com/";
+const MOZILLA_PAGE: &str = "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReport";
 const MOZILLA: &str = "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReportPEMCSV";
 
 /// One cert on the bad list. Hashes are lowercase hex.
@@ -28,6 +30,8 @@ pub struct Bad {
     pub sha256: String,
     pub spki_sha256: String,
     pub why: String,
+    /// Where to read about it.
+    pub url: String,
 }
 
 /// The bad list and where it came from.
@@ -43,7 +47,12 @@ pub enum Verdict {
     Valid,
     /// The cert has no dates and is not on the list.
     Unknown,
-    Invalid(String),
+    /// Past notAfter. The text names the date.
+    Expired(String),
+    /// Before notBefore. The text names the date.
+    NotYetValid(String),
+    /// On a bad list: compromised, distrusted, or revoked.
+    Distrusted { why: String, url: String },
 }
 
 impl Verdict {
@@ -51,25 +60,56 @@ impl Verdict {
         match self {
             Verdict::Valid => "✓",
             Verdict::Unknown => "–",
-            Verdict::Invalid(_) => "✗",
+            Verdict::Expired(_) | Verdict::NotYetValid(_) => "◷",
+            Verdict::Distrusted { .. } => "✗",
+        }
+    }
+
+    /// A stable word for JSON.
+    pub fn status(&self) -> &'static str {
+        match self {
+            Verdict::Valid => "valid",
+            Verdict::Unknown => "unknown",
+            Verdict::Expired(_) => "expired",
+            Verdict::NotYetValid(_) => "not_yet_valid",
+            Verdict::Distrusted { .. } => "distrusted",
+        }
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Verdict::Expired(date) => Some(format!("expired {date}")),
+            Verdict::NotYetValid(date) => Some(format!("not valid until {date}")),
+            Verdict::Distrusted { why, .. } => Some(why.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Verdict::Distrusted { url, .. } if !url.is_empty() => Some(url),
+            _ => None,
         }
     }
 }
 
-/// Judge one hit. `now` is Unix seconds.
+/// Judge one hit. `now` is Unix seconds. The bad list wins over dates.
 pub fn judge(hit: &Hit, bads: &Bads, now: i64) -> Verdict {
     let sha = crate::summary::hex(&hit.sha256);
     let spki = crate::summary::hex(&hit.spki_sha256);
     if let Some(bad) = bads
         .list
         .iter()
-        .find(|bad| bad.sha256 == sha || bad.spki_sha256 == spki)
+        .find(|bad| bad.sha256 == sha || (!bad.spki_sha256.is_empty() && bad.spki_sha256 == spki))
     {
-        return Verdict::Invalid(format!("on bad list: {}", bad.why));
+        return Verdict::Distrusted {
+            why: bad.why.clone(),
+            url: bad.url.clone(),
+        };
     }
     match (hit.not_before, hit.not_after) {
-        (Some(from), _) if now < from => Verdict::Invalid(format!("not valid until {}", date(from))),
-        (_, Some(to)) if now > to => Verdict::Invalid(format!("expired {}", date(to))),
+        (Some(from), _) if now < from => Verdict::NotYetValid(date(from)),
+        (_, Some(to)) if now > to => Verdict::Expired(date(to)),
         (Some(_), Some(_)) => Verdict::Valid,
         _ => Verdict::Unknown,
     }
@@ -176,18 +216,19 @@ fn curl(url: &str) -> Option<String> {
 
 fn to_tsv(list: &[Bad]) -> String {
     list.iter()
-        .map(|b| format!("{}\t{}\t{}\n", b.sha256, b.spki_sha256, b.why))
+        .map(|b| format!("{}\t{}\t{}\t{}\n", b.sha256, b.spki_sha256, b.why, b.url))
         .collect()
 }
 
 fn from_tsv(text: &str) -> Vec<Bad> {
     text.lines()
         .filter_map(|line| {
-            let mut cols = line.splitn(3, '\t');
+            let mut cols = line.splitn(4, '\t');
             Some(Bad {
                 sha256: cols.next()?.to_string(),
                 spki_sha256: cols.next()?.to_string(),
                 why: cols.next()?.to_string(),
+                url: cols.next().unwrap_or("").to_string(),
             })
         })
         .collect()
@@ -205,7 +246,8 @@ pub fn parse_advisory(text: &str) -> Vec<Bad> {
             "spki_sha256" if !sha.is_empty() => out.push(Bad {
                 sha256: std::mem::take(&mut sha),
                 spki_sha256: value.to_lowercase(),
-                why: format!("eMudhra advisory, {name}"),
+                why: format!("eMudhra CA compromise advisory: {name}"),
+                url: EMUDHRA_PAGE.to_string(),
             }),
             _ => {}
         }
@@ -276,7 +318,8 @@ pub fn parse_mozilla(text: &str) -> Vec<Bad> {
                 out.push(Bad {
                     sha256: get(sha).to_lowercase(),
                     spki_sha256: String::new(),
-                    why: format!("Mozilla distrusts {label} after {}, {}", get(at), get(name)),
+                    why: format!("Mozilla distrusts {label} after {}: {}", get(at), get(name)),
+                    url: MOZILLA_PAGE.to_string(),
                 });
                 break;
             }
@@ -333,7 +376,8 @@ mod tests {
         assert_eq!(bad.len(), 2);
         assert_eq!(bad[0].sha256, "ab12");
         assert_eq!(bad[0].spki_sha256, "cd34");
-        assert_eq!(bad[1].why, "eMudhra advisory, Root B");
+        assert_eq!(bad[1].why, "eMudhra CA compromise advisory: Root B");
+        assert!(bad[1].url.starts_with("https://"));
     }
 
     #[test]
@@ -351,20 +395,21 @@ mod tests {
         let mut hit = crate::certs::scan(include_bytes!("../tests/fixtures/emsign-ecc-g3.der"))
             .remove(0);
         let none = Bads::default();
-        assert!(matches!(judge(&hit, &none, now()), Verdict::Valid | Verdict::Invalid(_)));
+        assert!(matches!(judge(&hit, &none, now()), Verdict::Valid | Verdict::Expired(_)));
         let (from, to) = (hit.not_before.unwrap(), hit.not_after.unwrap());
         assert_eq!(judge(&hit, &none, from + 1), Verdict::Valid);
-        assert!(matches!(judge(&hit, &none, to + 1), Verdict::Invalid(why) if why.starts_with("expired")));
-        assert!(matches!(judge(&hit, &none, from - 1), Verdict::Invalid(why) if why.starts_with("not valid until")));
+        assert!(matches!(judge(&hit, &none, to + 1), Verdict::Expired(_)));
+        assert!(matches!(judge(&hit, &none, from - 1), Verdict::NotYetValid(_)));
         let bads = Bads {
             list: vec![Bad {
                 sha256: crate::summary::hex(&hit.sha256),
                 spki_sha256: String::new(),
                 why: "x".into(),
+                url: "https://example.test/".into(),
             }],
             source: "cache",
         };
-        assert!(matches!(judge(&hit, &bads, from + 1), Verdict::Invalid(_)));
+        assert!(matches!(judge(&hit, &bads, from + 1), Verdict::Distrusted { .. }));
         hit.not_before = None;
         hit.not_after = None;
         assert_eq!(judge(&hit, &none, 0), Verdict::Unknown);

@@ -94,13 +94,20 @@ fn word<T: std::fmt::Debug>(value: T) -> String {
 /// One hit as a JSON object. `by` says why a match request kept it.
 pub fn hit_json(hit: &Hit, by: Option<&str>, verdict: Option<&Verdict>) -> String {
     let secs = |v: Option<i64>| v.map_or("null".into(), |n| n.to_string());
-    let (valid, reason) = match verdict {
-        Some(Verdict::Valid) => ("true".to_string(), "null".to_string()),
-        Some(Verdict::Invalid(why)) => ("false".to_string(), json_str(why)),
-        _ => ("null".to_string(), "null".to_string()),
+    let valid = match verdict {
+        Some(Verdict::Valid) => "true",
+        Some(Verdict::Unknown) | None => "null",
+        Some(_) => "false",
     };
+    let status = verdict.map_or("null".into(), |v| format!("\"{}\"", v.status()));
+    let reason = verdict
+        .and_then(Verdict::reason)
+        .map_or("null".into(), |r| json_str(&r));
+    let url = verdict
+        .and_then(Verdict::url)
+        .map_or("null".into(), json_str);
     format!(
-        "{{\"offset\":{},\"length\":{},\"kind\":\"{}\",\"role\":\"{}\",\"container\":\"{}\",\"place\":{},\"sha256\":\"{}\",\"spki_sha256\":\"{}\",\"subject_cn\":{},\"not_before\":{},\"not_after\":{},\"valid\":{},\"reason\":{},\"matched_by\":{}}}",
+        "{{\"offset\":{},\"length\":{},\"kind\":\"{}\",\"role\":\"{}\",\"container\":\"{}\",\"place\":{},\"sha256\":\"{}\",\"spki_sha256\":\"{}\",\"subject_cn\":{},\"not_before\":{},\"not_after\":{},\"valid\":{},\"status\":{},\"reason\":{},\"url\":{},\"matched_by\":{}}}",
         hit.offset,
         hit.length,
         word(hit.kind),
@@ -113,7 +120,9 @@ pub fn hit_json(hit: &Hit, by: Option<&str>, verdict: Option<&Verdict>) -> Strin
         secs(hit.not_before),
         secs(hit.not_after),
         valid,
+        status,
         reason,
+        url,
         by.map_or("null".into(), |b| format!("\"{b}\"")),
     )
 }
@@ -205,10 +214,9 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
         .filter(|(h, _)| h.role == Role::Signer)
         .map(|(h, _)| *h)
         .collect();
-    let bad = trust
-        .iter()
-        .filter(|(_, v)| matches!(v, Verdict::Invalid(_)))
-        .count();
+    let count = |want: &str| trust.iter().filter(|(_, v)| v.status() == want).count();
+    let (expired, not_yet, distrusted) =
+        (count("expired"), count("not_yet_valid"), count("distrusted"));
     style::blank(out);
     style::rung(
         out,
@@ -258,12 +266,37 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
         out,
         color,
         2,
-        "invalid",
-        &bad.to_string(),
-        &format!("Trust certs that are expired or on a bad list. Bad list: {}.", summary.certs.bads.source),
-        if bad > 0 { style::RED } else { style::WHITE },
-        bad > 0,
+        "distrusted",
+        &distrusted.to_string(),
+        &format!(
+            "Compromised, distrusted, or revoked, by a bad list. Bad list: {}.",
+            summary.certs.bads.source
+        ),
+        if distrusted > 0 { style::RED } else { style::WHITE },
+        distrusted > 0,
     );
+    style::field(
+        out,
+        color,
+        2,
+        "expired",
+        &expired.to_string(),
+        "Past the notAfter date.",
+        if expired > 0 { style::AMBER } else { style::WHITE },
+        expired > 0,
+    );
+    if not_yet > 0 {
+        style::field(
+            out,
+            color,
+            2,
+            "not_yet_valid",
+            &not_yet.to_string(),
+            "Before the notBefore date.",
+            style::AMBER,
+            true,
+        );
+    }
     if !trust.is_empty() {
         style::field(
             out,
@@ -285,16 +318,21 @@ fn certs_rung(out: &mut String, summary: &Summary, color: bool) {
             hit.place,
             style::human(hit.length as u64)
         );
-        let (mark, fg) = match verdict {
-            Verdict::Valid => (verdict.mark(), style::GREEN),
-            Verdict::Unknown => (verdict.mark(), style::LABEL),
-            Verdict::Invalid(why) => {
-                note = format!("{why}; {note}");
-                (verdict.mark(), style::RED)
-            }
+        let fg = match verdict {
+            Verdict::Valid => style::GREEN,
+            Verdict::Unknown => style::LABEL,
+            Verdict::Expired(_) | Verdict::NotYetValid(_) => style::AMBER,
+            Verdict::Distrusted { .. } => style::RED,
         };
+        let mark = verdict.mark();
+        if let Some(why) = verdict.reason() {
+            note = format!("{why}; {note}");
+        }
         let tag = style::paint(color, mark, fg, true);
         let _ = write_item(out, color, 4, &format!("{tag} cn: {cn}"), &note);
+        if let Some(url) = verdict.url() {
+            let _ = writeln!(out, "      read: {url}");
+        }
         let _ = writeln!(out, "      sha256: {}", hex(&hit.sha256));
         let _ = writeln!(out, "      spki_sha256: {}", hex(&hit.spki_sha256));
     }

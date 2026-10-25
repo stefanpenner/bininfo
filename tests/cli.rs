@@ -481,8 +481,15 @@ fn a_cached_bad_list_flags_a_cert_by_hash() {
     let hit = bin().arg("--certs").arg("--json").arg(&path).output().unwrap();
     let all = String::from_utf8(hit.stdout).unwrap();
     let sha = all.split(r#""sha256":""#).nth(1).unwrap().split('"').next().unwrap().to_string();
-    fs::write(&cache, format!("{sha}\t\tTest advisory\n")).unwrap();
+    fs::write(&cache, format!("{sha}\t\tTest advisory\thttps://example.test/x\n")).unwrap();
     let out = bin().env("BININFO_BAD_CACHE", &cache).arg("--json").arg(&path).output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains("on bad list: Test advisory"), "{text}");
+    assert!(text.contains("Test advisory"), "{text}");
+    assert!(text.contains(r#""status":"distrusted""#), "{text}");
+    assert!(text.contains(r#""url":"https://example.test/x""#), "{text}");
+    let out = bin().env("BININFO_BAD_CACHE", &cache).arg(&path).output().unwrap();
+    let page = String::from_utf8(out.stdout).unwrap();
+    assert!(page.contains("distrusted: 1"), "{page}");
+    assert!(page.contains("✗ cn:"), "{page}");
+    assert!(page.contains("read: https://example.test/x"), "{page}");
 }
