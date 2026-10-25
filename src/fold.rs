@@ -111,6 +111,40 @@ impl View {
         self.move_cursor(-1);
     }
 
+    pub(crate) fn top(&mut self) {
+        self.edge(false);
+    }
+
+    pub(crate) fn bottom(&mut self) {
+        self.edge(true);
+    }
+
+    /// Move by many rows, stopping at the first or last.
+    pub(crate) fn jump(&mut self, rows: isize) {
+        for _ in 0..rows.unsigned_abs() {
+            let before = self.cursor;
+            self.move_cursor(rows.signum());
+            if self.cursor == before {
+                break;
+            }
+        }
+    }
+
+    fn edge(&mut self, last: bool) {
+        let ids: Vec<usize> = self
+            .slots()
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Item(id) => Some(*id),
+                Slot::Gap => None,
+            })
+            .collect();
+        let pick = if last { ids.last() } else { ids.first() };
+        if let Some(&id) = pick {
+            self.cursor = id;
+        }
+    }
+
     pub(crate) fn find(&mut self, query: &str) {
         self.query = query.to_lowercase();
         self.hit = 0;
@@ -663,6 +697,20 @@ load:                           # How this file starts.
       current: 2.0.0
   pie: false                    # MH_PIE.
 ";
+
+    #[test]
+    fn top_bottom_and_jump_move_the_cursor() {
+        let mut view = View::spine(PAGE);
+        view.bottom();
+        let last = view.cursor_slot();
+        assert!(last > 0);
+        view.top();
+        assert_eq!(view.cursor_slot(), 0);
+        view.jump(1000);
+        assert_eq!(view.cursor_slot(), last);
+        view.jump(-1000);
+        assert_eq!(view.cursor_slot(), 0);
+    }
 
     #[test]
     fn folded_cert_rows_keep_green_and_red_marks() {

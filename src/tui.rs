@@ -29,6 +29,7 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
     let mut load = Some(load);
     let mut pending: Option<mpsc::Receiver<String>> = None;
     let mut tick = 0usize;
+    let mut g_pending = false;
     let mut view = View::spine(page);
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
@@ -84,7 +85,26 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
                 }
                 continue;
             }
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let page = terminal::size().map_or(10, |(_, rows)| rows as isize / 2);
+            if key.code == KeyCode::Char('g') {
+                if g_pending {
+                    view.top();
+                }
+                g_pending = !g_pending;
+                continue;
+            }
+            g_pending = false;
             match key.code {
+                KeyCode::Char('G') | KeyCode::End => view.bottom(),
+                KeyCode::Home | KeyCode::Char('<') => view.top(),
+                KeyCode::Char('>') => view.bottom(),
+                KeyCode::Char('d') if ctrl => view.jump(page),
+                KeyCode::Char('u') if ctrl => view.jump(-page),
+                KeyCode::PageDown | KeyCode::Char(' ') => view.jump(page * 2),
+                KeyCode::PageUp => view.jump(-page * 2),
+                KeyCode::Char('n') if ctrl => view.down(),
+                KeyCode::Char('p') if ctrl => view.up(),
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('j') | KeyCode::Down => view.down(),
                 KeyCode::Char('k') | KeyCode::Up => view.up(),
@@ -148,7 +168,7 @@ fn draw(
         ),
         Some(text) if view.searching_none() => format!("/{text}    no match"),
         Some(text) => format!("/{text}"),
-        None => "j/k move    enter open    h close    / search    n next    q quit".to_string(),
+        None => "j/k move    gg/G top/bottom    enter open    h close    / search    n next    q quit".to_string(),
     };
     queue!(
         out,
