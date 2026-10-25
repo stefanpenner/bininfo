@@ -338,7 +338,7 @@ impl View {
             return insert_mark(&item.raw, item.indent, mark);
         }
         let indent = " ".repeat(item.indent);
-        format!("{indent}{mark} {}", self.label(id))
+        tint_marks(&format!("{indent}{mark} {}", self.label(id)))
     }
 
     fn label(&self, id: usize) -> String {
@@ -618,6 +618,12 @@ fn split_line(plain: &str) -> (usize, bool, String, String) {
     }
 }
 
+// A folded row is rebuilt from plain text, so the cert marks get their colour back.
+fn tint_marks(line: &str) -> String {
+    line.replace('✓', "\x1b[1;38;2;37;190;106m✓\x1b[0m")
+        .replace('✗', "\x1b[1;38;2;255;92;92m✗\x1b[0m")
+}
+
 pub(crate) fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -638,25 +644,12 @@ pub(crate) fn strip_ansi(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    const PAGE: &str = "\
-file: a                         # Path of this file.
-format: macho                   # elf, macho, or pe.
-
-type:                           # Rung 1.
-  filetype: DYLIB               # 4 bytes.
-  cputype_name: AArch64 (16777228)  # Word.
-
-load:                           # How this file starts.
-  kind: shared                  # A shared library.
-  interp: /usr/lib/dyld         # Path of the loader.
-  needed:                       # Libraries.
-    - /usr/lib/libSystem.B.dylib  # libc.
-      compat: 1.0.0
-      current: 2.0.0
-  pie: false                    # MH_PIE.
-";
+    #[test]
+    fn folded_cert_rows_keep_green_and_red_marks() {
+        let text = tint_marks("  > - ✓ cn: a\n  > - ✗ cn: b");
+        assert!(text.contains("38;2;37;190;106m✓"), "{text}");
+        assert!(text.contains("38;2;255;92;92m✗"), "{text}");
+    }
 
     #[test]
     fn a_terminal_folds_and_json_stays_text() {
