@@ -23,6 +23,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "\
 usage: bininfo [--json] [--symbols] [--check] [--expect <claim>] <file>
+usage: bininfo --certs [--json] <file>
 usage: bininfo [--json] --claims <file>
 A terminal folds the page. A pipe prints the full page.";
 
@@ -48,6 +49,10 @@ enum Job {
         expect: Vec<String>,
     },
     Claims {
+        path: String,
+        json: bool,
+    },
+    Certs {
         path: String,
         json: bool,
     },
@@ -80,7 +85,60 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
             check_one(&path, &claims, json)
         }
         Job::Claims { path, json } => check_file(&path, json),
+        Job::Certs { path, json } => {
+            let bytes = read_file(&path)?;
+            print!("{}", certs_page(&bytes, json));
+            Ok(ExitCode::SUCCESS)
+        }
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn json_str(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One line per hit: a JSON object, or tab-separated fields.
+fn certs_page(bytes: &[u8], json: bool) -> String {
+    let mut out = String::new();
+    for hit in bininfo::certs(bytes) {
+        let kind = format!("{:?}", hit.kind).to_lowercase();
+        let role = format!("{:?}", hit.role).to_lowercase();
+        let container = format!("{:?}", hit.container).to_lowercase();
+        let cn = hit.subject_cn.as_deref().unwrap_or("");
+        if json {
+            let cn = hit.subject_cn.as_deref().map_or("null".into(), json_str);
+            out.push_str(&format!(
+                "{{\"offset\":{},\"length\":{},\"kind\":\"{kind}\",\"role\":\"{role}\",\"container\":\"{container}\",\"place\":{},\"sha256\":\"{}\",\"spki_sha256\":\"{}\",\"subject_cn\":{cn}}}\n",
+                hit.offset,
+                hit.length,
+                json_str(&hit.place),
+                hex(&hit.sha256),
+                hex(&hit.spki_sha256),
+            ));
+        } else {
+            out.push_str(&format!(
+                "{kind}\t{role}\t{container}\t{}\t{}\t{}\t{cn}\n",
+                hit.place,
+                hex(&hit.sha256),
+                hex(&hit.spki_sha256),
+            ));
+        }
+    }
+    out
 }
 
 fn check_one(path: &str, claims: &[bininfo::claim::Claim], json: bool) -> Result<ExitCode, String> {
@@ -170,6 +228,7 @@ fn args_of(args: impl Iterator<Item = String>) -> Result<Job, String> {
     let mut json = false;
     let mut symbols = false;
     let mut check = false;
+    let mut certs = false;
     let mut claims = None;
     let mut expect = Vec::new();
     let mut path = None;
@@ -183,6 +242,8 @@ fn args_of(args: impl Iterator<Item = String>) -> Result<Job, String> {
             json = true;
         } else if arg == "--symbols" {
             symbols = true;
+        } else if arg == "--certs" {
+            certs = true;
         } else if arg == "--check" {
             check = true;
         } else if arg == "--claims" {
@@ -211,7 +272,7 @@ fn args_of(args: impl Iterator<Item = String>) -> Result<Job, String> {
         index += 1;
     }
     if let Some(file) = claims {
-        if path.is_some() || check || symbols || !expect.is_empty() {
+        if path.is_some() || check || certs || symbols || !expect.is_empty() {
             return Err(USAGE.into());
         }
         return Ok(Job::Claims { path: file, json });
@@ -219,6 +280,12 @@ fn args_of(args: impl Iterator<Item = String>) -> Result<Job, String> {
     let Some(path) = path else {
         return Err(USAGE.into());
     };
+    if certs {
+        if check || symbols || !expect.is_empty() {
+            return Err(USAGE.into());
+        }
+        return Ok(Job::Certs { path, json });
+    }
     if check || !expect.is_empty() {
         return Ok(Job::Check { path, json, expect });
     }
