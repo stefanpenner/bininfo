@@ -408,3 +408,53 @@ fn match_without_certs_is_a_usage_error() {
     let out = bin().args(["--match-cn", "x", "/bin/ls"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
 }
+
+fn elf_with_pem(name: &str) -> std::path::PathBuf {
+    let mut bytes = vec![0u8; 64];
+    bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    bytes[16] = 2;
+    bytes[18] = 62;
+    bytes.extend(fs::read("tests/fixtures/probe-bundle.pem").unwrap());
+    let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn the_page_shows_the_size_and_the_trust_certs() {
+    let path = elf_with_pem("page-certs");
+    let out = bin().arg(&path).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("\nsize: 2.3 KiB"), "{text}");
+    assert!(text.contains("\ncerts:"), "{text}");
+    assert!(text.contains("  trust: 3"), "{text}");
+    assert!(text.contains("- cn: probe-rsa"), "{text}");
+    assert!(text.contains("      sha256: c3cf2905"), "{text}");
+}
+
+#[test]
+fn the_json_page_keeps_bytes_and_adds_certs() {
+    let path = elf_with_pem("json-certs");
+    let out = bin().arg("--json").arg(&path).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains(r#""e_type":"EXEC""#), "{text}");
+    assert!(text.contains(r#""size":2381"#), "{text}");
+    assert!(text.contains(r#""regions":["#), "{text}");
+    assert!(text.contains(r#""subject_cn":"probe-rsa""#), "{text}");
+    assert!(text.trim_end().ends_with("]}"), "{text}");
+    assert_eq!(text.lines().count(), 1, "{text}");
+}
+
+#[test]
+fn a_page_without_certs_says_zero() {
+    let out = bin().arg("/bin/ls").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("\ncerts:"), "{text}");
+    assert!(text.contains("  trust: 0"), "{text}");
+    assert!(text.contains(" KiB"), "{text}");
+}

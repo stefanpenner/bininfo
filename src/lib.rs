@@ -18,6 +18,7 @@ pub mod elf;
 pub mod kind;
 pub mod macho;
 pub mod pe;
+pub mod summary;
 
 mod library;
 mod style;

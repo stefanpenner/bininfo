@@ -78,6 +78,21 @@ pub fn raw_field(
     );
 }
 
+/// Byte count a person can read: `812 B`, `246.5 KiB`, `1.2 MiB`.
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1023.95 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 /// Header hex. Digits are `A` through `F`, as in `0xCAFEBABE`.
 pub fn hex(value: u64) -> String {
     format!("0x{value:X}")
@@ -537,6 +552,18 @@ impl Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_sizes_pick_a_unit() {
+        assert_eq!(human(0), "0 B");
+        assert_eq!(human(1023), "1023 B");
+        assert_eq!(human(1024), "1.0 KiB");
+        assert_eq!(human(253_584), "247.6 KiB");
+        assert_eq!(human(1_572_864), "1.5 MiB");
+        assert_eq!(human(1_048_575), "1.0 MiB");
+        assert_eq!(human(5 * 1024 * 1024 * 1024), "5.0 GiB");
+        assert_eq!(human(u64::MAX), "16384.0 PiB");
+    }
 
     #[test]
     fn hex_uses_uppercase_digits() {

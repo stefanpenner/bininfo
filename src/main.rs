@@ -21,6 +21,8 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
+use bininfo::summary::{hex, hit_json, json_str};
+
 const USAGE: &str = "\
 usage: bininfo [--json] [--symbols] [--check] [--expect <claim>] <file>
 usage: bininfo --certs [--json] [--match <pem>]... [--match-cn <name>]... <file>
@@ -81,7 +83,10 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
         } => {
             let bytes = read_file(&path)?;
             let file = bininfo::open(&bytes, symbols)?;
-            let text = bininfo::render(&path, &file, json, color_stdout());
+            let color = color_stdout();
+            let page = bininfo::render(&path, &file, json, color);
+            let summary = bininfo::summary::read(&bytes);
+            let text = bininfo::summary::merge(&page, &summary, json, color);
             if fold::interactive(io::stdout().is_terminal(), json) {
                 tui::run(&text).map_err(|err| err.to_string())?;
             } else {
@@ -100,7 +105,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
         }
         Job::Claims { path, json } => check_file(&path, json),
         Job::Features => {
-            println!("certs\nmatch\nschema 1");
+            println!("certs\nmatch\npage-certs\nschema 1");
             Ok(ExitCode::SUCCESS)
         }
         Job::Certs { path, json, want } => {
@@ -116,24 +121,6 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn json_str(text: &str) -> String {
-    let mut out = String::from("\"");
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// Why a hit matched: the cert hash, the key hash, or the name.
 fn matched_by(hit: &bininfo::certs::Hit, want: &Want) -> Option<&'static str> {
     let sha = hex(&hit.sha256);
@@ -142,7 +129,11 @@ fn matched_by(hit: &bininfo::certs::Hit, want: &Want) -> Option<&'static str> {
         Some("sha256")
     } else if want.hashes.contains(&spki) {
         Some("spki")
-    } else if hit.subject_cn.as_ref().is_some_and(|cn| want.names.contains(cn)) {
+    } else if hit
+        .subject_cn
+        .as_ref()
+        .is_some_and(|cn| want.names.contains(cn))
+    {
         Some("cn")
     } else {
         None
@@ -174,14 +165,7 @@ fn certs_page(path: &str, bytes: &[u8], json: bool, want: &Want) -> (String, usi
         let spki = hex(&hit.spki_sha256);
         let cn = hit.subject_cn.as_deref();
         if json {
-            rows.push(format!(
-                "{{\"offset\":{},\"length\":{},\"kind\":\"{kind}\",\"role\":\"{role}\",\"container\":\"{container}\",\"place\":{},\"sha256\":\"{sha}\",\"spki_sha256\":\"{spki}\",\"subject_cn\":{},\"matched_by\":{}}}",
-                hit.offset,
-                hit.length,
-                json_str(&hit.place),
-                cn.map_or("null".into(), json_str),
-                by.map_or("null".into(), |b| format!("\"{b}\"")),
-            ));
+            rows.push(hit_json(&hit, by));
         } else {
             rows.push(format!(
                 "{kind}\t{role}\t{container}\t{}\t{sha}\t{spki}\t{}\t{}",

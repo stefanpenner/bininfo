@@ -124,6 +124,31 @@ pub fn scan(bytes: &[u8]) -> Vec<Hit> {
     hits
 }
 
+/// A segment or section of the file, by file offset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub section: bool,
+    pub name: String,
+    pub offset: usize,
+    pub size: usize,
+}
+
+/// Name the segments and sections of an ELF, Mach-O, or PE file. Other bytes have none.
+pub fn regions(bytes: &[u8]) -> Vec<Region> {
+    let mut out: Vec<Region> = place::Map::build(bytes)
+        .spans()
+        .into_iter()
+        .map(|(section, name, start, end)| Region {
+            section,
+            name,
+            offset: start,
+            size: end - start,
+        })
+        .collect();
+    out.sort_by(|a, b| (a.offset, a.section, &a.name).cmp(&(b.offset, b.section, &b.name)));
+    out
+}
+
 fn scan_raw(bytes: &[u8], hits: &mut Vec<Hit>) {
     let mut covered = Vec::new();
     scan_pem(bytes, hits, &mut covered);

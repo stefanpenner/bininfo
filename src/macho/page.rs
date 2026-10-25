@@ -244,8 +244,8 @@ fn write_slice(out: &mut String, slice: &Slice, color: bool) {
         color,
         4,
         "size",
-        &slice.size.to_string(),
-        "Byte size of this slice.",
+        &style::human(slice.size),
+        "Size of this slice.",
         style::WHITE,
         false,
     );
@@ -593,8 +593,8 @@ fn size_rung(out: &mut String, thin: &Thin, color: bool) {
         color,
         2,
         "sizeofcmds",
-        &thin.sizeofcmds.to_string(),
-        "4 bytes. Byte size of all load commands.",
+        &style::human(u64::from(thin.sizeofcmds)),
+        "4 bytes. Size of all load commands.",
         fg,
         bold,
     );
@@ -699,8 +699,8 @@ fn section_rung(out: &mut String, commands: &Commands, color: bool) {
         color,
         2,
         "strsize",
-        &commands.strsize.to_string(),
-        "4 bytes. Byte size of the string table.",
+        &style::human(u64::from(commands.strsize)),
+        "4 bytes. Size of the string table.",
         style::WHITE,
         false,
     );

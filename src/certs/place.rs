@@ -82,6 +82,15 @@ impl Map {
         }
     }
 
+    /// Segments, then sections, as (is_section, name, start, end).
+    pub(super) fn spans(&self) -> Vec<(bool, String, usize, usize)> {
+        let segs = self.segments.iter().map(|s| (false, s));
+        let secs = self.sections.iter().map(|s| (true, s));
+        segs.chain(secs)
+            .map(|(sec, s)| (sec, s.name.clone(), s.start, s.end))
+            .collect()
+    }
+
     pub(super) fn signer(&self, offset: usize) -> bool {
         contains(&self.signer, offset)
     }
