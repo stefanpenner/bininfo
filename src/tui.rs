@@ -10,6 +10,7 @@ This file reads keys and draws the page.
 //! Draw the folded page. Keys move, open, close, and search.
 
 use super::fold::{self, View};
+use bininfo::links;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
@@ -30,6 +31,7 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
     let mut pending: Option<mpsc::Receiver<String>> = None;
     let mut tick = 0usize;
     let mut g_pending = false;
+    let mut note: Option<String> = None;
     let mut view = View::spine(page);
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
@@ -39,7 +41,7 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
     let mut search = false;
     loop {
         let busy = pending.is_some().then(|| SPINNER[tick % SPINNER.len()]);
-        draw(&mut stdout, &view, search.then_some(typed.as_str()), busy)?;
+        draw(&mut stdout, &view, search.then_some(typed.as_str()), busy, note.as_deref())?;
         if let Some(rx) = &pending {
             match rx.try_recv() {
                 Ok(full) => {
@@ -60,6 +62,7 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            note = None;
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 break;
             }
@@ -96,6 +99,15 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
             }
             g_pending = false;
             match key.code {
+                KeyCode::Char('o') => {
+                    note = Some(match links::for_block(&view.cursor_block()) {
+                        Some(link) => match links::open(&link.url) {
+                            Ok(()) => format!("opened {}: {}", link.label, link.url),
+                            Err(err) => format!("cannot open {}: {err}", link.url),
+                        },
+                        None => "nothing to open here".to_string(),
+                    });
+                }
                 KeyCode::Char('G') | KeyCode::End => view.bottom(),
                 KeyCode::Home | KeyCode::Char('<') => view.top(),
                 KeyCode::Char('>') => view.bottom(),
@@ -139,6 +151,7 @@ fn draw(
     view: &View,
     query: Option<&str>,
     busy: Option<char>,
+    note: Option<&str>,
 ) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
     let width = cols as usize;
@@ -168,7 +181,14 @@ fn draw(
         ),
         Some(text) if view.searching_none() => format!("/{text}    no match"),
         Some(text) => format!("/{text}"),
-        None => "j/k move    gg/G top/bottom    enter open    h close    / search    n next    q quit".to_string(),
+        None if note.is_some() => note.unwrap_or("").to_string(),
+        None => {
+            let open = links::for_block(&view.cursor_block())
+                .map_or(String::new(), |link| format!("    o open {}", link.label));
+            format!(
+                "j/k move    gg/G top/bottom    enter fold    / search    n next{open}    q quit"
+            )
+        }
     };
     queue!(
         out,

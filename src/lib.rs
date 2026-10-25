@@ -16,6 +16,7 @@ pub mod certs;
 pub mod claim;
 pub mod elf;
 pub mod kind;
+pub mod links;
 pub mod macho;
 pub mod pe;
 pub mod summary;

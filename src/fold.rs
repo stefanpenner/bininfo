@@ -220,6 +220,20 @@ impl View {
         }
     }
 
+    /// Plain text of the selected row and every row under it.
+    pub(crate) fn cursor_block(&self) -> String {
+        let mut out = Vec::new();
+        let mut stack = vec![self.cursor];
+        while let Some(id) = stack.pop() {
+            let Some(item) = self.items.get(id) else {
+                continue;
+            };
+            out.push(strip_ansi(&item.raw));
+            stack.extend(item.children.iter().rev());
+        }
+        out.join("\n")
+    }
+
     pub(crate) fn cursor_key(&self) -> &str {
         self.items
             .get(self.cursor)
