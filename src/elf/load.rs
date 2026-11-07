@@ -3,6 +3,7 @@
 why: This file reads how an ELF file starts.
 uses: bininfo
 how: bininfo calls this file to read program headers.
+This file reads DT_SONAME, filter, auxiliary, and loader flags.
 This file does not print the page.
 ---
 */
@@ -20,9 +21,21 @@ const PT_INTERP: u32 = 3;
 const DT_NULL: u64 = 0;
 const DT_NEEDED: u64 = 1;
 const DT_STRTAB: u64 = 5;
+const DT_SONAME: u64 = 14;
 const DT_RPATH: u64 = 15;
+const DT_SYMBOLIC: u64 = 16;
+const DT_TEXTREL: u64 = 22;
+const DT_BIND_NOW: u64 = 24;
 const DT_RUNPATH: u64 = 29;
+const DT_FLAGS: u64 = 30;
 const DT_FLAGS_1: u64 = 0x6fff_fffb;
+const DT_AUXILIARY: u64 = 0x7fff_fffd;
+const DT_FILTER: u64 = 0x7fff_ffff;
+const DF_ORIGIN: u64 = 0x1;
+const DF_SYMBOLIC: u64 = 0x2;
+const DF_TEXTREL: u64 = 0x4;
+const DF_BIND_NOW: u64 = 0x8;
+const DF_STATIC_TLS: u64 = 0x10;
 const DF_1_PIE: u64 = 0x0800_0000;
 const NAME_CAP: usize = 4096;
 const IMPORT_CAP: usize = 256;
@@ -32,9 +45,13 @@ const IMPORT_CAP: usize = 256;
 pub struct Load {
     pub kind: Kind,             // static, dynamic-pie, static-pie, or shared.
     pub interp: Option<String>, // Path of the loader. None means this file starts itself.
+    pub soname: Option<String>, // DT_SONAME. None means the file has no soname.
     pub needed: Vec<String>,    // Library names the loader opens.
+    pub filter: Vec<String>,    // DT_FILTER names, in file order.
+    pub auxiliary: Vec<String>, // DT_AUXILIARY names, in file order.
     pub runpath: Vec<String>,   // DT_RUNPATH directories. A colon splits one string.
     pub rpath: Vec<String>,     // DT_RPATH directories. A colon splits one string.
+    pub flags: Vec<String>,     // DT_FLAGS and DT_FLAGS_1 words, in flag order.
     pub delay: Vec<String>,     // Always empty. ELF has no delay-import record.
     pub pie: bool,              // PIE bit in DT_FLAGS_1.
 }
@@ -42,19 +59,23 @@ pub struct Load {
 pub fn read(bytes: &[u8], header: &Header) -> Load {
     let rows = program_headers(bytes, header);
     let interp = rows.iter().find_map(|row| interp_path(bytes, row));
-    let (pie, needed, runpath, rpath) = rows
+    let dyns = rows
         .iter()
         .find(|row| row.ty == PT_DYNAMIC)
         .map(|row| dynamic_facts(bytes, header, &rows, row))
-        .unwrap_or((false, Vec::new(), Vec::new(), Vec::new()));
+        .unwrap_or_else(DynFacts::empty);
     Load {
-        kind: classify(header.kind, interp.is_some(), pie),
+        kind: classify(header.kind, interp.is_some(), dyns.pie),
         interp,
-        needed,
-        runpath,
-        rpath,
+        soname: dyns.soname,
+        needed: dyns.needed,
+        filter: dyns.filter,
+        auxiliary: dyns.auxiliary,
+        runpath: dyns.runpath,
+        rpath: dyns.rpath,
+        flags: dyns.flags,
         delay: Vec::new(),
-        pie,
+        pie: dyns.pie,
     }
 }
 
@@ -143,38 +164,166 @@ fn interp_path(bytes: &[u8], row: &Phdr) -> Option<String> {
     Some(read_text(bytes, row.offset, row.filesz))
 }
 
-fn dynamic_facts(
-    bytes: &[u8],
-    header: &Header,
-    rows: &[Phdr],
-    row: &Phdr,
-) -> (bool, Vec<String>, Vec<String>, Vec<String>) {
+struct DynFacts {
+    pie: bool,
+    soname: Option<String>,
+    needed: Vec<String>,
+    filter: Vec<String>,
+    auxiliary: Vec<String>,
+    runpath: Vec<String>,
+    rpath: Vec<String>,
+    flags: Vec<String>,
+}
+
+impl DynFacts {
+    fn empty() -> Self {
+        Self {
+            pie: false,
+            soname: None,
+            needed: Vec::new(),
+            filter: Vec::new(),
+            auxiliary: Vec::new(),
+            runpath: Vec::new(),
+            rpath: Vec::new(),
+            flags: Vec::new(),
+        }
+    }
+}
+
+fn dynamic_facts(bytes: &[u8], header: &Header, rows: &[Phdr], row: &Phdr) -> DynFacts {
     let mut strtab = None;
+    let mut flags = 0u64;
     let mut flags1 = 0u64;
+    let mut symbolic = false;
+    let mut textrel = false;
+    let mut bind_now = false;
+    let mut soname_at = None;
     let mut needed_at = Vec::new();
+    let mut filter_at = Vec::new();
+    let mut auxiliary_at = Vec::new();
     let mut runpath_at = Vec::new();
     let mut rpath_at = Vec::new();
     for (tag, val) in dyn_pairs(bytes, header, row) {
         match tag {
             DT_NULL => break,
             DT_STRTAB => strtab = Some(val),
-            DT_FLAGS_1 => flags1 = val,
+            DT_FLAGS => flags |= val,
+            DT_FLAGS_1 => flags1 |= val,
             DT_NEEDED => needed_at.push(val),
+            DT_SONAME if soname_at.is_none() => soname_at = Some(val),
+            DT_FILTER => filter_at.push(val),
+            DT_AUXILIARY => auxiliary_at.push(val),
             DT_RUNPATH => runpath_at.push(val),
             DT_RPATH => rpath_at.push(val),
+            DT_SYMBOLIC => symbolic = true,
+            DT_TEXTREL => textrel = true,
+            DT_BIND_NOW => bind_now = true,
             _ => {}
         }
     }
+    let words = flag_words(flags, flags1, symbolic, textrel, bind_now);
     let pie = flags1 & DF_1_PIE != 0;
     let Some(base) = strtab.and_then(|vaddr| vaddr_to_offset(rows, vaddr)) else {
-        return (pie, Vec::new(), Vec::new(), Vec::new());
+        let mut empty = DynFacts::empty();
+        empty.pie = pie;
+        empty.flags = words;
+        return empty;
     };
-    (
+    let soname = soname_at
+        .and_then(|off| base.checked_add(off))
+        .map(|at| read_text(bytes, at, NAME_CAP as u64))
+        .filter(|name| !name.is_empty());
+    DynFacts {
         pie,
-        names_at(bytes, base, &needed_at),
-        split_dirs(names_at(bytes, base, &runpath_at)),
-        split_dirs(names_at(bytes, base, &rpath_at)),
-    )
+        soname,
+        needed: names_at(bytes, base, &needed_at),
+        filter: names_at(bytes, base, &filter_at),
+        auxiliary: names_at(bytes, base, &auxiliary_at),
+        runpath: split_dirs(names_at(bytes, base, &runpath_at)),
+        rpath: split_dirs(names_at(bytes, base, &rpath_at)),
+        flags: words,
+    }
+}
+
+fn flag_words(
+    flags: u64,
+    flags1: u64,
+    symbolic: bool,
+    textrel: bool,
+    bind_now: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if flags & DF_ORIGIN != 0 || flags1 & 0x80 != 0 {
+        out.push("origin".into());
+    }
+    if symbolic || flags & DF_SYMBOLIC != 0 {
+        out.push("symbolic".into());
+    }
+    if textrel || flags & DF_TEXTREL != 0 {
+        out.push("textrel".into());
+    }
+    if bind_now || flags & DF_BIND_NOW != 0 {
+        out.push("bind-now".into());
+    }
+    if flags & DF_STATIC_TLS != 0 {
+        out.push("static-tls".into());
+    }
+    const FLAGS1: &[(u64, &str)] = &[
+        (0x1, "now"),
+        (0x2, "global"),
+        (0x4, "group"),
+        (0x8, "nodelete"),
+        (0x10, "loadfltr"),
+        (0x20, "initfirst"),
+        (0x40, "noopen"),
+        (0x100, "direct"),
+        (0x200, "trans"),
+        (0x400, "interpose"),
+        (0x800, "nodeflib"),
+        (0x1000, "nodump"),
+        (0x2000, "confalt"),
+        (0x4000, "endfiltee"),
+        (0x8000, "dispreldne"),
+        (0x1_0000, "disprelpnd"),
+        (0x2_0000, "nodirect"),
+        (0x4_0000, "ignmuldef"),
+        (0x8_0000, "noksyms"),
+        (0x10_0000, "nohdr"),
+        (0x20_0000, "edited"),
+        (0x40_0000, "noreloc"),
+        (0x80_0000, "symintpose"),
+        (0x100_0000, "globaudit"),
+        (0x200_0000, "singleton"),
+        (0x400_0000, "stub"),
+        (0x800_0000, "pie"),
+        (0x1000_0000, "kmod"),
+        (0x2000_0000, "weakfilter"),
+        (0x4000_0000, "nocommon"),
+    ];
+    for (bit, word) in FLAGS1 {
+        if flags1 & bit != 0 {
+            out.push((*word).into());
+        }
+    }
+    push_unknown(&mut out, flags, 0x1f);
+    let known1 = FLAGS1.iter().fold(0x80u64, |mask, (bit, _)| mask | bit);
+    push_unknown(&mut out, flags1, known1);
+    out
+}
+
+fn push_unknown(out: &mut Vec<String>, value: u64, known: u64) {
+    let mut rest = value & !known;
+    let mut bit = 1u64;
+    while rest != 0 {
+        if rest & bit != 0 {
+            out.push(format!("0x{bit:x}"));
+            rest &= !bit;
+        }
+        if bit == 1 << 63 {
+            break;
+        }
+        bit <<= 1;
+    }
 }
 
 fn names_at(bytes: &[u8], base: u64, offs: &[u64]) -> Vec<String> {
@@ -320,9 +469,53 @@ mod tests {
         assert_eq!(load.kind, Kind::Static);
         assert_eq!(load.interp, None);
         assert!(load.needed.is_empty());
+        assert!(load.soname.is_none());
+        assert!(load.filter.is_empty());
+        assert!(load.auxiliary.is_empty());
+        assert!(load.flags.is_empty());
         assert!(load.runpath.is_empty());
         assert!(load.rpath.is_empty());
         assert!(!load.pie);
+    }
+
+    #[test]
+    fn soname_filter_auxiliary_and_flag_words_keep_tag_order() {
+        let bytes = elf_with_dynamic_endian(
+            Data::Little,
+            Type::Dyn,
+            DF_1_PIE | 0x1 | 0x20_0000 | (1 << 31),
+            None,
+            &[],
+            None,
+            None,
+            Extra {
+                soname: Some("libfoo.so.1"),
+                filter: &["libbar.so"],
+                auxiliary: &["libaux.so"],
+                flags: DF_ORIGIN,
+                symbolic: true,
+                textrel: false,
+                bind_now: true,
+            },
+        );
+        let header = header::parse(&bytes).unwrap();
+        let load = read(&bytes, &header);
+        assert_eq!(load.soname.as_deref(), Some("libfoo.so.1"));
+        assert_eq!(load.filter, ["libbar.so"]);
+        assert_eq!(load.auxiliary, ["libaux.so"]);
+        assert_eq!(
+            load.flags,
+            [
+                "origin",
+                "symbolic",
+                "bind-now",
+                "now",
+                "edited",
+                "pie",
+                "0x80000000"
+            ]
+        );
+        assert!(load.pie);
     }
 
     #[test]
@@ -365,6 +558,7 @@ mod tests {
             &["libc.so.6"],
             Some("$ORIGIN/../lib:/opt/lib"),
             Some("/old"),
+            Extra::none(),
         );
         let header = header::parse(&bytes).unwrap();
         let load = read(&bytes, &header);
@@ -384,7 +578,16 @@ mod tests {
 
     #[test]
     fn big_endian_dynamic_keeps_the_pie_bit() {
-        let bytes = elf_with_dynamic_endian(Data::Big, Type::Dyn, DF_1_PIE, None, &[], None, None);
+        let bytes = elf_with_dynamic_endian(
+            Data::Big,
+            Type::Dyn,
+            DF_1_PIE,
+            None,
+            &[],
+            None,
+            None,
+            Extra::none(),
+        );
         let header = header::parse(&bytes).unwrap();
         let load = read(&bytes, &header);
         assert_eq!(header.data, Data::Big);
@@ -440,8 +643,41 @@ mod tests {
         bytes
     }
 
+    struct Extra<'a> {
+        soname: Option<&'a str>,
+        filter: &'a [&'a str],
+        auxiliary: &'a [&'a str],
+        flags: u64,
+        symbolic: bool,
+        textrel: bool,
+        bind_now: bool,
+    }
+
+    impl Extra<'static> {
+        fn none() -> Self {
+            Self {
+                soname: None,
+                filter: &[],
+                auxiliary: &[],
+                flags: 0,
+                symbolic: false,
+                textrel: false,
+                bind_now: false,
+            }
+        }
+    }
+
     fn elf_with_dynamic(ty: Type, flags1: u64, interp: Option<&str>, needed: &[&str]) -> Vec<u8> {
-        elf_with_dynamic_endian(Data::Little, ty, flags1, interp, needed, None, None)
+        elf_with_dynamic_endian(
+            Data::Little,
+            ty,
+            flags1,
+            interp,
+            needed,
+            None,
+            None,
+            Extra::none(),
+        )
     }
 
     fn elf_with_dynamic_endian(
@@ -452,6 +688,7 @@ mod tests {
         needed: &[&str],
         runpath: Option<&str>,
         rpath: Option<&str>,
+        extra: Extra<'_>,
     ) -> Vec<u8> {
         let mut names = Vec::new();
         let mut needed_at = Vec::new();
@@ -462,6 +699,15 @@ mod tests {
         }
         let run_at = runpath.map(|text| push_name(&mut names, text));
         let r_at = rpath.map(|text| push_name(&mut names, text));
+        let soname_at = extra.soname.map(|text| push_name(&mut names, text));
+        let mut filter_at = Vec::new();
+        for name in extra.filter {
+            filter_at.push(push_name(&mut names, name));
+        }
+        let mut auxiliary_at = Vec::new();
+        for name in extra.auxiliary {
+            auxiliary_at.push(push_name(&mut names, name));
+        }
         if names.is_empty() {
             names.push(0);
         }
@@ -472,8 +718,16 @@ mod tests {
         });
         let phnum: u16 = if interp_bytes.is_some() { 3 } else { 2 };
         let ph_bytes = phnum as usize * 56;
-        let extra = run_at.is_some() as usize + r_at.is_some() as usize;
-        let dyn_entries = 3 + needed.len() + extra;
+        let extra_n = run_at.is_some() as usize
+            + r_at.is_some() as usize
+            + soname_at.is_some() as usize
+            + filter_at.len()
+            + auxiliary_at.len()
+            + (extra.flags != 0) as usize
+            + extra.symbolic as usize
+            + extra.textrel as usize
+            + extra.bind_now as usize;
+        let dyn_entries = 3 + needed.len() + extra_n;
         let dyn_bytes = dyn_entries * 16;
         let header_len = 64;
         let dyn_off = header_len + ph_bytes;
@@ -517,6 +771,10 @@ mod tests {
             &needed_at,
             run_at,
             r_at,
+            soname_at,
+            &filter_at,
+            &auxiliary_at,
+            &extra,
             data,
         );
         bytes[str_off..str_off + names.len()].copy_from_slice(&names);
@@ -562,6 +820,10 @@ mod tests {
         needed_at: &[u64],
         run_at: Option<u64>,
         r_at: Option<u64>,
+        soname_at: Option<u64>,
+        filter_at: &[u64],
+        auxiliary_at: &[u64],
+        extra: &Extra<'_>,
         data: Data,
     ) {
         put_u64(bytes, at, DT_STRTAB, data);
@@ -582,6 +844,41 @@ mod tests {
         if let Some(name_at) = r_at {
             put_u64(bytes, slot, DT_RPATH, data);
             put_u64(bytes, slot + 8, name_at, data);
+            slot += 16;
+        }
+        if let Some(name_at) = soname_at {
+            put_u64(bytes, slot, DT_SONAME, data);
+            put_u64(bytes, slot + 8, name_at, data);
+            slot += 16;
+        }
+        for name_at in filter_at {
+            put_u64(bytes, slot, DT_FILTER, data);
+            put_u64(bytes, slot + 8, *name_at, data);
+            slot += 16;
+        }
+        for name_at in auxiliary_at {
+            put_u64(bytes, slot, DT_AUXILIARY, data);
+            put_u64(bytes, slot + 8, *name_at, data);
+            slot += 16;
+        }
+        if extra.flags != 0 {
+            put_u64(bytes, slot, DT_FLAGS, data);
+            put_u64(bytes, slot + 8, extra.flags, data);
+            slot += 16;
+        }
+        if extra.symbolic {
+            put_u64(bytes, slot, DT_SYMBOLIC, data);
+            put_u64(bytes, slot + 8, 0, data);
+            slot += 16;
+        }
+        if extra.textrel {
+            put_u64(bytes, slot, DT_TEXTREL, data);
+            put_u64(bytes, slot + 8, 0, data);
+            slot += 16;
+        }
+        if extra.bind_now {
+            put_u64(bytes, slot, DT_BIND_NOW, data);
+            put_u64(bytes, slot + 8, 0, data);
             slot += 16;
         }
         put_u64(bytes, slot, DT_NULL, data);

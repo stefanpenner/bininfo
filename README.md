@@ -14,6 +14,8 @@ how: The reader opens this file in the repo.
 It prints one page for that file.
 The page uses the same words for each format.
 The page has type, load, symbols, sizes, where, and sections.
+The load rung also shows soname, filter, auxiliary, and flags.
+The sign rung says whether a Mach-O or PE signature is valid.
 
 ## Why does it exist?
 

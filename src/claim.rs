@@ -2,7 +2,8 @@
 ---
 why: This file checks one start claim against header facts.
 uses: bininfo
-how: bininfo calls this file to judge hermetic, kind, pie, interp, and needed.
+how: bininfo calls this file to judge a start claim.
+The same file names soname, filter, auxiliary, and flags.
 ---
 */
 
@@ -116,6 +117,36 @@ pub fn runpath_note(format: &str) -> &'static str {
     }
 }
 
+pub fn soname_note(format: &str) -> &'static str {
+    match format {
+        "elf" => "[DT_SONAME] Name other files use for this object.",
+        "macho" => "[LC_ID_DYLIB] Install name of this library.",
+        "pe" => "[IMAGE_EXPORT_DIRECTORY] DLL name in the export directory.",
+        _ => "Name other files use for this object.",
+    }
+}
+
+pub fn filter_note(format: &str) -> &'static str {
+    match format {
+        "elf" => "[DT_FILTER] Shared objects this file filters.",
+        _ => "[none] This format has no DT_FILTER record.",
+    }
+}
+
+pub fn auxiliary_note(format: &str) -> &'static str {
+    match format {
+        "elf" => "[DT_AUXILIARY] Optional shared objects.",
+        _ => "[none] This format has no DT_AUXILIARY record.",
+    }
+}
+
+pub fn flags_note(format: &str) -> &'static str {
+    match format {
+        "elf" => "[DT_FLAGS] [DT_FLAGS_1] Loader flag words.",
+        _ => "[none] This format has no DT_FLAGS record.",
+    }
+}
+
 pub fn rpath_note(format: &str) -> &'static str {
     match format {
         "elf" => "[DT_RPATH] Old search directories.",
@@ -201,6 +232,96 @@ pub fn write_dlopen(out: &mut String, color: bool, indent: usize, format: &str, 
     );
 }
 
+pub fn write_soname(
+    out: &mut String,
+    color: bool,
+    indent: usize,
+    format: &str,
+    soname: Option<&str>,
+) {
+    let text = soname.unwrap_or("null");
+    let fg = if soname.is_some() {
+        style::WHITE
+    } else {
+        style::LABEL
+    };
+    style::field(
+        out,
+        color,
+        indent,
+        "soname",
+        text,
+        soname_note(format),
+        fg,
+        false,
+    );
+}
+
+pub fn write_filter(out: &mut String, color: bool, indent: usize, format: &str, filter: &[String]) {
+    name_list(out, color, indent, "filter", filter, filter_note(format));
+}
+
+pub fn write_auxiliary(
+    out: &mut String,
+    color: bool,
+    indent: usize,
+    format: &str,
+    auxiliary: &[String],
+) {
+    name_list(
+        out,
+        color,
+        indent,
+        "auxiliary",
+        auxiliary,
+        auxiliary_note(format),
+    );
+}
+
+pub fn write_flags(out: &mut String, color: bool, indent: usize, format: &str, flags: &[String]) {
+    let fg = if flags.is_empty() {
+        style::LABEL
+    } else {
+        style::WHITE
+    };
+    style::list_field(
+        out,
+        color,
+        indent,
+        "flags",
+        flags,
+        flags_note(format),
+        fg,
+        false,
+    );
+}
+
+fn name_list(
+    out: &mut String,
+    color: bool,
+    indent: usize,
+    key: &str,
+    items: &[String],
+    note: &str,
+) {
+    let fg = if items.is_empty() {
+        style::LABEL
+    } else {
+        style::WHITE
+    };
+    style::noted_list(
+        out,
+        color,
+        indent,
+        key,
+        items,
+        note,
+        fg,
+        false,
+        crate::library::note,
+    );
+}
+
 pub fn write_search(
     out: &mut String,
     color: bool,
@@ -245,9 +366,13 @@ pub fn write_load(
     out: &mut Json,
     kind: Kind,
     interp: Option<&str>,
+    soname: Option<&str>,
     needed: &[String],
+    filter: &[String],
+    auxiliary: &[String],
     runpath: &[String],
     rpath: &[String],
+    flags: &[String],
     delay: &[String],
     format: &str,
     pie: bool,
@@ -255,9 +380,13 @@ pub fn write_load(
     out.load(
         kind::name(kind),
         interp,
+        soname,
         needed,
+        filter,
+        auxiliary,
         runpath,
         rpath,
+        flags,
         delay,
         dlopen_fact(format, needed),
         pie,

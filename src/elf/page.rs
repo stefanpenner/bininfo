@@ -252,6 +252,7 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
         fg,
         bold,
     );
+    claim::write_soname(out, color, 2, "elf", load.soname.as_deref());
     style::noted_list(
         out,
         color,
@@ -267,7 +268,10 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
         false,
         crate::library::note,
     );
+    claim::write_filter(out, color, 2, "elf", &load.filter);
+    claim::write_auxiliary(out, color, 2, "elf", &load.auxiliary);
     claim::write_search(out, color, 2, "elf", &load.runpath, &load.rpath);
+    claim::write_flags(out, color, 2, "elf", &load.flags);
     claim::write_delay(out, color, 2, "elf", &load.delay);
     claim::write_dlopen(out, color, 2, "elf", &load.needed);
     style::field(
@@ -445,13 +449,27 @@ fn write_symbols(out: &mut String, symbols: &Symbols, color: bool) {
                 false,
             );
         } else {
-            key_line(out, color, 2, "undef", undef_note);
+            style::field(
+                out,
+                color,
+                2,
+                "undef",
+                &symbols.undef.to_string(),
+                undef_note,
+                style::WHITE,
+                false,
+            );
             for row in &symbols.undef_rows {
                 let _ = writeln!(out, "    - name: {}", style::yaml_scalar(&row.name));
                 let version = row.version.as_deref().unwrap_or("null");
                 let _ = writeln!(out, "      version: {}", style::yaml_scalar(version));
                 let _ = writeln!(out, "      binding: {}", row.binding);
             }
+            style::more_row(
+                out,
+                4,
+                (symbols.undef as usize).saturating_sub(symbols.undef_rows.len()),
+            );
         }
     } else {
         let (fg, bold) = style::number_tone(u64::from(symbols.undef), style::WHITE, false);
@@ -615,9 +633,13 @@ mod tests {
         Load {
             kind: Kind::Static,
             interp: None,
+            soname: None,
             needed: Vec::new(),
+            filter: Vec::new(),
+            auxiliary: Vec::new(),
             runpath: Vec::new(),
             rpath: Vec::new(),
+            flags: Vec::new(),
             delay: Vec::new(),
             pie: false,
         }
@@ -772,26 +794,41 @@ mod tests {
             lines[at + 2]
         );
         assert!(
-            lines[at + 3].starts_with("  runpath: []"),
+            lines[at + 3].starts_with("  filter: []"),
             "{}",
             lines[at + 3]
         );
         assert!(
-            lines[at + 4].starts_with("  rpath: []"),
+            lines[at + 4].starts_with("  auxiliary: []"),
             "{}",
             lines[at + 4]
         );
         assert!(
-            lines[at + 5].starts_with("  delay: []"),
+            lines[at + 5].starts_with("  runpath: []"),
             "{}",
             lines[at + 5]
         );
         assert!(
-            lines[at + 6].starts_with("  dlopen: false"),
+            lines[at + 6].starts_with("  rpath: []"),
             "{}",
             lines[at + 6]
         );
-        assert!(lines[at + 7].starts_with("  pie:"), "{}", lines[at + 7]);
+        assert!(
+            lines[at + 7].starts_with("  flags: []"),
+            "{}",
+            lines[at + 7]
+        );
+        assert!(
+            lines[at + 8].starts_with("  delay: []"),
+            "{}",
+            lines[at + 8]
+        );
+        assert!(
+            lines[at + 9].starts_with("  dlopen: false"),
+            "{}",
+            lines[at + 9]
+        );
+        assert!(lines[at + 10].starts_with("  pie:"), "{}", lines[at + 10]);
     }
 
     #[test]
@@ -819,16 +856,21 @@ mod tests {
         );
         assert_eq!(lines[at + 4], "    - /old");
         assert!(
-            lines[at + 5].starts_with("  delay: []"),
+            lines[at + 5].starts_with("  flags: []"),
             "{}",
             lines[at + 5]
         );
         assert!(
-            lines[at + 6].starts_with("  dlopen: false"),
+            lines[at + 6].starts_with("  delay: []"),
             "{}",
             lines[at + 6]
         );
-        assert!(lines[at + 7].starts_with("  pie:"), "{}", lines[at + 7]);
+        assert!(
+            lines[at + 7].starts_with("  dlopen: false"),
+            "{}",
+            lines[at + 7]
+        );
+        assert!(lines[at + 8].starts_with("  pie:"), "{}", lines[at + 8]);
     }
 
     #[test]

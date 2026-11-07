@@ -4,6 +4,7 @@ why: This file names the section or segment that holds a certificate hit.
 uses: bininfo
 how: The certificate scan calls this file with the same file bytes.
 A byte past the last section is named overlay.
+A Mach-O section records the segment name.
 ---
 */
 
@@ -25,6 +26,7 @@ struct Span {
     start: usize,
     end: usize,
     name: String,
+    parent: Option<String>,
 }
 
 pub(super) struct Map {
@@ -82,12 +84,12 @@ impl Map {
         }
     }
 
-    /// Segments, then sections, as (is_section, name, start, end).
-    pub(super) fn spans(&self) -> Vec<(bool, String, usize, usize)> {
+    /// Segments, then sections, as (is_section, name, start, end, parent).
+    pub(super) fn spans(&self) -> Vec<(bool, String, usize, usize, Option<String>)> {
         let segs = self.segments.iter().map(|s| (false, s));
         let secs = self.sections.iter().map(|s| (true, s));
         segs.chain(secs)
-            .map(|(sec, s)| (sec, s.name.clone(), s.start, s.end))
+            .map(|(sec, s)| (sec, s.name.clone(), s.start, s.end, s.parent.clone()))
             .collect()
     }
 
@@ -99,7 +101,7 @@ impl Map {
         contains(&self.sea, offset)
     }
 
-    fn push_section(&mut self, start: usize, end: usize, name: String) {
+    fn push_section(&mut self, start: usize, end: usize, name: String, parent: Option<String>) {
         if end <= start {
             return;
         }
@@ -108,7 +110,12 @@ impl Map {
             self.mark_sea(start, end);
         }
         if self.sections.len() < REGION_CAP {
-            self.sections.push(Span { start, end, name });
+            self.sections.push(Span {
+                start,
+                end,
+                name,
+                parent,
+            });
         }
     }
 
@@ -121,7 +128,12 @@ impl Map {
             self.mark_sea(start, end);
         }
         if self.segments.len() < REGION_CAP {
-            self.segments.push(Span { start, end, name });
+            self.segments.push(Span {
+                start,
+                end,
+                name,
+                parent: None,
+            });
         }
     }
 
@@ -258,7 +270,7 @@ fn elf_map(bytes: &[u8], header: &ElfHeader, map: &mut Map) {
                 continue;
             }
             if let Some((start, end)) = clamp(offset, size, bytes.len()) {
-                map.push_section(start, end, elf_name(strtab, name_off));
+                map.push_section(start, end, elf_name(strtab, name_off), None);
             }
         }
     }
@@ -358,7 +370,7 @@ fn pe_map(bytes: &[u8], header: &PeHeader, map: &mut Map) {
         let raw = crate::pe::header::u32_at(bytes, at + 16).unwrap_or(0) as usize;
         let ptr = crate::pe::header::u32_at(bytes, at + 20).unwrap_or(0) as usize;
         if raw > 0 && ptr < bytes.len() {
-            map.push_section(ptr, ptr.saturating_add(raw).min(bytes.len()), name);
+            map.push_section(ptr, ptr.saturating_add(raw).min(bytes.len()), name, None);
         }
         at += 40;
     }
@@ -562,6 +574,7 @@ fn macho_segment(
             break;
         }
         let sect_name = ascii_name(&bytes[sect..sect + 16]);
+        let seg_name = ascii_name(&bytes[sect + 16..sect + 32]);
         let (offset, size, flags) = if wide {
             (
                 u64::from(crate::macho::header::u32_at(bytes, sect + 48, data).unwrap_or(0)),
@@ -582,6 +595,7 @@ fn macho_segment(
                     start,
                     end,
                     sect_name.unwrap_or_else(|| "section".to_string()),
+                    seg_name,
                 );
             }
         }

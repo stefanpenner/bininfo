@@ -52,9 +52,13 @@ pub fn render_with(file: &str, header: &Header, load: &Load, symbols: &Symbols) 
         &mut out,
         load.kind,
         load.interp.as_deref(),
+        load.soname.as_deref(),
         &load.needed,
+        &load.filter,
+        &load.auxiliary,
         &load.runpath,
         &load.rpath,
+        &load.flags,
         &load.delay,
         "elf",
         load.pie,
@@ -123,9 +127,13 @@ mod tests {
         Load {
             kind: Kind::Static,
             interp: None,
+            soname: None,
             needed: Vec::new(),
+            filter: Vec::new(),
+            auxiliary: Vec::new(),
             runpath: Vec::new(),
             rpath: Vec::new(),
+            flags: Vec::new(),
             delay: Vec::new(),
             pie: false,
         }
@@ -143,7 +151,7 @@ mod tests {
                 r#""e_machine_name":"x86-64","e_version":1,"e_entry":4096,"entry_name":null,"e_phoff":64,"#,
                 r#""e_shoff":0,"e_flags":0,"e_ehsize":64,"e_phentsize":56,"e_phnum":1,"#,
                 r#""e_shentsize":0,"e_shnum":0,"e_shstrndx":0,"#,
-                r#""load":{"kind":"static","interp":null,"needed":[],"runpath":[],"rpath":[],"delay":[],"dlopen":false,"pie":false},"#,
+                r#""load":{"kind":"static","interp":null,"soname":null,"needed":[],"filter":[],"auxiliary":[],"runpath":[],"rpath":[],"flags":[],"delay":[],"dlopen":false,"pie":false},"#,
                 r#""symbols":{"undef":0,"defined":0,"symtab":false}}"#,
                 "\n"
             )

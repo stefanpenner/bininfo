@@ -4,6 +4,7 @@ why: This file is the library a caller uses.
 uses: bininfo
 how: The bininfo command calls open, render, and facts.
 A caller uses certs to scan file bytes.
+sign checks a Mach-O or PE signature.
 ---
 */
 
@@ -11,6 +12,7 @@ A caller uses certs to scan file bytes.
 //! `open` reads the bytes. `render` prints the page. `facts` feeds a claim.
 //! `elf`, `macho`, and `pe` read one format each.
 //! `certs` finds embedded certificates in file bytes.
+//! `sign` checks a Mach-O or PE signature.
 
 pub mod certs;
 pub mod claim;
@@ -19,9 +21,11 @@ pub mod kind;
 pub mod links;
 pub mod macho;
 pub mod pe;
+pub mod sign;
 pub mod summary;
 pub mod trust;
 
+mod hash;
 mod library;
 mod style;
 

@@ -1,3 +1,11 @@
+/*
+---
+why: This file checks the bininfo command.
+uses: cargo test
+how: cargo test runs the built bininfo command.
+---
+*/
+
 use std::fs;
 use std::process::Command;
 
@@ -62,7 +70,13 @@ fn prints_a_header() {
         json_text.contains(r#""symbols":{"undef":0,"defined":0,"symtab":false}"#),
         "{json_text}"
     );
-    assert_eq!(json_text.matches('{').count(), 3, "{json_text}");
+    assert!(
+        json_text.contains(
+            r#""sign":{"status":"absent","kind":"none","reason":"ELF has no signature record."}"#
+        ),
+        "{json_text}"
+    );
+    assert_eq!(json_text.matches('{').count(), 4, "{json_text}");
 
     let rows = bin().arg("--symbols").arg(&path).output().unwrap();
     let rows_text = String::from_utf8(rows.stdout).unwrap();
@@ -122,7 +136,13 @@ fn prints_macho_and_pe_with_the_same_shape() {
     assert!(json_text.contains(r#""format":"macho""#), "{json_text}");
     assert!(json_text.contains(r#""kind":"static""#), "{json_text}");
     assert!(json_text.contains(r#""entry_name":null"#), "{json_text}");
-    assert_eq!(json_text.matches('{').count(), 3, "{json_text}");
+    assert!(
+        json_text.contains(
+            r#""sign":{"status":"absent","kind":"macho","reason":"No LC_CODE_SIGNATURE command."}"#
+        ),
+        "{json_text}"
+    );
+    assert_eq!(json_text.matches('{').count(), 4, "{json_text}");
     let _ = fs::remove_file(macho);
 
     let pe = std::env::temp_dir().join(format!("elf-header-pe-{}", std::process::id()));
@@ -155,7 +175,12 @@ fn prints_macho_and_pe_with_the_same_shape() {
     assert!(json_text.contains(r#""kind":"static""#), "{json_text}");
     assert!(text.contains("os_version: 0.0"), "{text}");
     assert!(text.contains("subsystem_version: 0.0"), "{text}");
-    assert_eq!(json_text.matches('{').count(), 3, "{json_text}");
+    assert!(
+        json_text
+            .contains(r#""sign":{"status":"absent","kind":"pe","reason":"No certificate table."}"#),
+        "{json_text}"
+    );
+    assert_eq!(json_text.matches('{').count(), 4, "{json_text}");
     let _ = fs::remove_file(pe);
 }
 
@@ -380,7 +405,11 @@ fn features_lists_certs_and_match() {
 #[test]
 fn certs_json_has_a_version_and_a_list() {
     let (path, _) = padded_bundle("certs-json");
-    let out = bin().args(["--certs", "--json"]).arg(&path).output().unwrap();
+    let out = bin()
+        .args(["--certs", "--json"])
+        .arg(&path)
+        .output()
+        .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(out.status.success(), "{text}");
     assert!(text.starts_with(r#"{"version":1,"file":""#), "{text}");
@@ -391,7 +420,12 @@ fn certs_json_has_a_version_and_a_list() {
 #[test]
 fn match_keeps_only_matches_and_exits_1() {
     let (path, pem) = padded_bundle("certs-match");
-    let hit = bin().args(["--certs", "--json", "--match"]).arg(&pem).arg(&path).output().unwrap();
+    let hit = bin()
+        .args(["--certs", "--json", "--match"])
+        .arg(&pem)
+        .arg(&path)
+        .output()
+        .unwrap();
     let text = String::from_utf8(hit.stdout).unwrap();
     assert_eq!(hit.status.code(), Some(1), "{text}");
     assert!(text.contains(r#""matched_by":"sha256""#), "{text}");
@@ -478,16 +512,41 @@ fn a_cached_bad_list_flags_a_cert_by_hash() {
     let path = elf_with_pem("bad-certs");
     let cache = std::env::temp_dir().join(format!("bad-{}.tsv", std::process::id()));
     fs::write(&cache, "c3cf2905\t\tTest advisory\n").unwrap();
-    let hit = bin().arg("--certs").arg("--json").arg(&path).output().unwrap();
+    let hit = bin()
+        .arg("--certs")
+        .arg("--json")
+        .arg(&path)
+        .output()
+        .unwrap();
     let all = String::from_utf8(hit.stdout).unwrap();
-    let sha = all.split(r#""sha256":""#).nth(1).unwrap().split('"').next().unwrap().to_string();
-    fs::write(&cache, format!("{sha}\t\tTest advisory\thttps://example.test/x\n")).unwrap();
-    let out = bin().env("BININFO_BAD_CACHE", &cache).arg("--json").arg(&path).output().unwrap();
+    let sha = all
+        .split(r#""sha256":""#)
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_string();
+    fs::write(
+        &cache,
+        format!("{sha}\t\tTest advisory\thttps://example.test/x\n"),
+    )
+    .unwrap();
+    let out = bin()
+        .env("BININFO_BAD_CACHE", &cache)
+        .arg("--json")
+        .arg(&path)
+        .output()
+        .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("Test advisory"), "{text}");
     assert!(text.contains(r#""status":"distrusted""#), "{text}");
     assert!(text.contains(r#""url":"https://example.test/x""#), "{text}");
-    let out = bin().env("BININFO_BAD_CACHE", &cache).arg(&path).output().unwrap();
+    let out = bin()
+        .env("BININFO_BAD_CACHE", &cache)
+        .arg(&path)
+        .output()
+        .unwrap();
     let page = String::from_utf8(out.stdout).unwrap();
     assert!(page.contains("distrusted: 1"), "{page}");
     assert!(page.contains("✗ cn:"), "{page}");

@@ -111,7 +111,10 @@ mod tests {
 
     #[test]
     fn a_group_of_certs_has_no_cert_link() {
-        let block = format!("certs:\n  sha256: {SHA}\n  sha256: {}\n", SHA.replace('8', "9"));
+        let block = format!(
+            "certs:\n  sha256: {SHA}\n  sha256: {}\n",
+            SHA.replace('8', "9")
+        );
         assert_eq!(for_block(&block), None);
     }
 

@@ -3,6 +3,7 @@
 why: This file reads how a Mach-O file starts.
 uses: bininfo
 how: bininfo calls this file to read load commands.
+This file reads LC_ID_DYLIB as the soname.
 This file does not print the page.
 ---
 */
@@ -53,6 +54,7 @@ pub struct Dylib {
 
 const LC_SYMTAB: u32 = 0x2;
 const LC_UNIXTHREAD: u32 = 0x5;
+const LC_ID_DYLIB: u32 = 0xd;
 const LC_LOAD_DYLIB: u32 = 0xc;
 const LC_LOAD_DYLINKER: u32 = 0xe;
 const LC_RPATH: u32 = 0x1c;
@@ -74,9 +76,13 @@ const NAME_CAP: usize = 4096;
 pub struct Load {
     pub kind: Kind,
     pub interp: Option<String>, // LC_LOAD_DYLINKER path. None means this file starts itself.
+    pub soname: Option<String>, // LC_ID_DYLIB install name. None means this file has none.
     pub needed: Vec<Dylib>,     // One row is one load command.
+    pub filter: Vec<String>,    // Always empty. Mach-O has no DT_FILTER record.
+    pub auxiliary: Vec<String>, // Always empty. Mach-O has no DT_AUXILIARY record.
     pub runpath: Vec<String>,   // Always empty. Mach-O has no RUNPATH record.
     pub rpath: Vec<String>,     // LC_RPATH directories, in file order.
+    pub flags: Vec<String>,     // Always empty. Mach-O has no DT_FLAGS record.
     pub delay: Vec<String>,     // Always empty. Mach-O has no delay-import record.
     pub pie: bool,              // MH_PIE bit in the header flags.
 }
@@ -242,9 +248,13 @@ fn same_names(left: &[Dylib], right: &[Dylib]) -> bool {
 fn same_load(left: &Load, right: &Load) -> bool {
     left.kind == right.kind
         && left.interp == right.interp
+        && left.soname == right.soname
         && same_names(&left.needed, &right.needed)
+        && left.filter == right.filter
+        && left.auxiliary == right.auxiliary
         && left.runpath == right.runpath
         && left.rpath == right.rpath
+        && left.flags == right.flags
         && left.delay == right.delay
         && left.pie == right.pie
 }
@@ -283,6 +293,15 @@ fn read_thin(bytes: &[u8], thin: &Thin, rows: bool) -> Commands {
             LC_LOAD_DYLINKER => {
                 if let Some(path) = cmd_name(bytes, at, size, thin.data) {
                     commands.load.interp = Some(path);
+                }
+            }
+            LC_ID_DYLIB => {
+                if commands.load.soname.is_none() {
+                    if let Some(name) = cmd_name(bytes, at, size, thin.data) {
+                        if !name.is_empty() {
+                            commands.load.soname = Some(name);
+                        }
+                    }
                 }
             }
             LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB | LC_LOAD_UPWARD_DYLIB => {
@@ -428,9 +447,13 @@ fn blank(kind: Kind) -> Commands {
         load: Load {
             kind,
             interp: None,
+            soname: None,
             needed: Vec::new(),
+            filter: Vec::new(),
+            auxiliary: Vec::new(),
             runpath: Vec::new(),
             rpath: Vec::new(),
+            flags: Vec::new(),
             delay: Vec::new(),
             pie: false,
         },
@@ -554,6 +577,7 @@ mod tests {
         let commands = read(&bytes, &image);
         assert_eq!(commands.load.kind, Kind::Static);
         assert!(commands.load.interp.is_none());
+        assert!(commands.load.soname.is_none());
         assert!(commands.load.needed.is_empty());
         assert!(!commands.load.pie);
     }
@@ -603,6 +627,17 @@ mod tests {
     }
 
     #[test]
+    fn id_dylib_is_the_soname_and_not_a_needed_row() {
+        let mut bytes = header(6, 0, Data::Little);
+        push_text(&mut bytes, LC_ID_DYLIB, 24, "liba.dylib", Data::Little);
+        push_text(&mut bytes, LC_LOAD_DYLIB, 24, "libb.dylib", Data::Little);
+        finish(&mut bytes, Data::Little, 2);
+        let image = header::parse(&bytes).unwrap();
+        let commands = read(&bytes, &image);
+        assert_eq!(commands.load.soname.as_deref(), Some("liba.dylib"));
+        assert_eq!(commands.load.names(), ["libb.dylib"]);
+    }
+
     fn dynamic_without_the_pie_bit() {
         let mut bytes = header(2, 0, Data::Little);
         push_text(
@@ -1161,6 +1196,10 @@ mod tests {
         let text = super::super::page::render("a", &image, &commands, &[], false);
         assert!(text.contains("bind: 1"), "{text}");
         assert!(!text.contains("chained_fixups"), "{text}");
+        let rows = read_at(&bytes, &image, true);
+        let row_text = super::super::page::render("a", &image, &rows, &[], false);
+        assert!(row_text.contains("bind: 1"), "{row_text}");
+        assert!(row_text.contains("name: _printf"), "{row_text}");
     }
 
     #[test]
@@ -1183,6 +1222,9 @@ mod tests {
         assert_eq!(commands.extra.exports, 1);
         assert_eq!(commands.extra.export_names, ["_foo"]);
         assert_eq!(commands.extra.export_cmd, "LC_DYLD_EXPORTS_TRIE");
+        let text = super::super::page::render("a", &image, &commands, &[], false);
+        assert!(text.contains("exports: 1"), "{text}");
+        assert!(text.contains("    - _foo"), "{text}");
     }
 
     #[test]

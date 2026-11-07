@@ -163,14 +163,18 @@ fn write_load(out: &mut Json, commands: &Commands, names_only: bool) {
     let mut one = Json::new();
     one.str("kind", load::kind_name(commands.load.kind));
     one.opt("interp", commands.load.interp.as_deref());
+    one.opt("soname", commands.load.soname.as_deref());
     if names_only {
         one.strings("needed", &names);
     } else {
         let rows: Vec<String> = commands.load.needed.iter().map(needed_json).collect();
         one.raw_array("needed", &rows);
     }
+    one.strings("filter", &commands.load.filter);
+    one.strings("auxiliary", &commands.load.auxiliary);
     one.strings("runpath", &commands.load.runpath);
     one.strings("rpath", &commands.load.rpath);
+    one.strings("flags", &commands.load.flags);
     one.strings("delay", &commands.load.delay);
     match claim::dlopen_fact("macho", &names) {
         Some(value) => one.flag("dlopen", value),
@@ -202,9 +206,13 @@ mod tests {
             load: Load {
                 kind: Kind::Static,
                 interp: None,
+                soname: None,
                 needed: Vec::new(),
+                filter: Vec::new(),
+                auxiliary: Vec::new(),
                 runpath: Vec::new(),
                 rpath: Vec::new(),
+                flags: Vec::new(),
                 delay: Vec::new(),
                 pie: false,
             },
@@ -228,7 +236,7 @@ mod tests {
         assert!(text.contains(r#""cputype_name":"AArch64""#), "{text}");
         assert!(text.contains(r#""cpusubtype_name":"ARM64_ALL""#), "{text}");
         assert!(
-            text.contains(r#""load":{"kind":"static","interp":null,"needed":[],"runpath":[],"rpath":[],"delay":[],"dlopen":null,"pie":false}"#),
+            text.contains(r#""load":{"kind":"static","interp":null,"soname":null,"needed":[],"filter":[],"auxiliary":[],"runpath":[],"rpath":[],"flags":[],"delay":[],"dlopen":null,"pie":false}"#),
             "{text}"
         );
         assert!(text.contains(r#""entry_name":null"#), "{text}");
@@ -293,9 +301,13 @@ mod tests {
                 load: Load {
                     kind: Kind::DynamicPie,
                     interp: Some("/usr/lib/dyld".into()),
+                    soname: None,
                     needed: vec![load::link(needed)],
+                    filter: Vec::new(),
+                    auxiliary: Vec::new(),
                     runpath: Vec::new(),
                     rpath: vec!["@executable_path/../Frameworks".into()],
+                    flags: Vec::new(),
                     delay: Vec::new(),
                     pie: true,
                 },

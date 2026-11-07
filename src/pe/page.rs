@@ -256,6 +256,7 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
         style::LABEL,
         false,
     );
+    claim::write_soname(out, color, 2, "pe", load.soname.as_deref());
     style::noted_list(
         out,
         color,
@@ -271,7 +272,10 @@ fn load_rung(out: &mut String, load: &Load, color: bool) {
         false,
         crate::library::note,
     );
+    claim::write_filter(out, color, 2, "pe", &load.filter);
+    claim::write_auxiliary(out, color, 2, "pe", &load.auxiliary);
     claim::write_search(out, color, 2, "pe", &load.runpath, &load.rpath);
+    claim::write_flags(out, color, 2, "pe", &load.flags);
     claim::write_delay(out, color, 2, "pe", &load.delay);
     claim::write_dlopen(out, color, 2, "pe", &load.needed);
     style::field(
@@ -412,7 +416,16 @@ fn write_symbols(out: &mut String, symbols: &Symbols, color: bool) {
                 false,
             );
         } else {
-            key_line(out, color, 2, "import", import_note);
+            style::field(
+                out,
+                color,
+                2,
+                "import",
+                &symbols.import_count.to_string(),
+                import_note,
+                style::WHITE,
+                false,
+            );
             for row in &symbols.imports {
                 let _ = writeln!(out, "    - dll: {}", style::yaml_scalar(&row.dll));
                 if let Some(name) = &row.name {
@@ -425,6 +438,11 @@ fn write_symbols(out: &mut String, symbols: &Symbols, color: bool) {
                     let _ = writeln!(out, "      ordinal: {ordinal}");
                 }
             }
+            style::more_row(
+                out,
+                4,
+                (symbols.import_count as usize).saturating_sub(symbols.imports.len()),
+            );
         }
     } else {
         let (fg, bold) = style::number_tone(u64::from(symbols.import_count), style::WHITE, false);
@@ -475,13 +493,6 @@ fn write_symbols(out: &mut String, symbols: &Symbols, color: bool) {
         },
         false,
     );
-}
-
-fn key_line(out: &mut String, color: bool, indent: usize, key: &str, note: &str) {
-    let gap = " ".repeat(indent);
-    let painted = style::paint(color, &format!("{key}:"), style::LABEL, false);
-    let plain = indent + key.len() + 1;
-    style::align_note(out, color, &format!("{gap}{painted}"), plain, note);
 }
 
 fn section_rung(out: &mut String, header: &Header, color: bool) {
@@ -547,9 +558,13 @@ mod tests {
         Load {
             kind: Kind::StaticPie,
             interp: None,
+            soname: None,
             needed: Vec::new(),
+            filter: Vec::new(),
+            auxiliary: Vec::new(),
             runpath: Vec::new(),
             rpath: Vec::new(),
+            flags: Vec::new(),
             delay: Vec::new(),
             pie: true,
         }
@@ -615,27 +630,42 @@ mod tests {
             lines[at + 2]
         );
         assert!(
-            lines[at + 3].starts_with("  runpath: []"),
+            lines[at + 3].starts_with("  filter: []"),
             "{}",
             lines[at + 3]
         );
         assert!(
-            lines[at + 4].starts_with("  rpath: []"),
+            lines[at + 4].starts_with("  auxiliary: []"),
             "{}",
             lines[at + 4]
         );
         assert!(
-            lines[at + 5].starts_with("  delay: []"),
+            lines[at + 5].starts_with("  runpath: []"),
             "{}",
             lines[at + 5]
         );
         assert!(
-            lines[at + 6]
-                .contains("[none] kernel32 is common. That name does not prove LoadLibrary."),
+            lines[at + 6].starts_with("  rpath: []"),
             "{}",
             lines[at + 6]
         );
-        assert!(lines[at + 7].starts_with("  pie:"), "{}", lines[at + 7]);
+        assert!(
+            lines[at + 7].starts_with("  flags: []"),
+            "{}",
+            lines[at + 7]
+        );
+        assert!(
+            lines[at + 8].starts_with("  delay: []"),
+            "{}",
+            lines[at + 8]
+        );
+        assert!(
+            lines[at + 9]
+                .contains("[none] kernel32 is common. That name does not prove LoadLibrary."),
+            "{}",
+            lines[at + 9]
+        );
+        assert!(lines[at + 10].starts_with("  pie:"), "{}", lines[at + 10]);
     }
 
     #[test]

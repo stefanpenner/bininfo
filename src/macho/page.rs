@@ -470,8 +470,11 @@ fn write_load_fields(
         fg,
         bold,
     );
+    claim::write_soname(out, color, indent, "macho", commands.load.soname.as_deref());
     let names = commands.load.names();
     write_needed(out, commands, &names, color, indent, names_only);
+    claim::write_filter(out, color, indent, "macho", &commands.load.filter);
+    claim::write_auxiliary(out, color, indent, "macho", &commands.load.auxiliary);
     claim::write_search(
         out,
         color,
@@ -480,6 +483,7 @@ fn write_load_fields(
         &commands.load.runpath,
         &commands.load.rpath,
     );
+    claim::write_flags(out, color, indent, "macho", &commands.load.flags);
     claim::write_delay(out, color, indent, "macho", &commands.load.delay);
     claim::write_dlopen(out, color, indent, "macho", &names);
     style::field(
@@ -759,7 +763,7 @@ fn write_extra(out: &mut String, commands: &Commands, color: bool, indent: usize
     group(out, color, indent, "symbols", "Loader symbol records.");
     if let Some(count) = extra.chained {
         if extra.rows {
-            write_chained(out, color, field, extra);
+            write_chained(out, color, field, count, extra);
         } else {
             let (fg, bold) = style::number_tone(u64::from(count), style::WHITE, false);
             style::field(
@@ -776,7 +780,7 @@ fn write_extra(out: &mut String, commands: &Commands, color: bool, indent: usize
     }
     if let Some(count) = extra.bind {
         if extra.rows {
-            write_bind(out, color, field, extra);
+            write_bind(out, color, field, count, extra);
         } else {
             let (fg, bold) = style::number_tone(u64::from(count), style::WHITE, false);
             style::field(
@@ -792,7 +796,17 @@ fn write_extra(out: &mut String, commands: &Commands, color: bool, indent: usize
         }
     }
     let export_note = format!("[{}] Exported symbols.", extra.export_cmd);
-    if extra.rows {
+    if extra.rows && !extra.export_names.is_empty() {
+        style::members(
+            out,
+            color,
+            field,
+            "exports",
+            u64::from(extra.exports),
+            &extra.export_names,
+            &export_note,
+        );
+    } else if extra.rows {
         named_list(
             out,
             color,
@@ -844,13 +858,16 @@ fn write_extra(out: &mut String, commands: &Commands, color: bool, indent: usize
     }
 }
 
-fn write_chained(out: &mut String, color: bool, indent: usize, extra: &symbols::Extra) {
-    key_note(
+fn write_chained(out: &mut String, color: bool, indent: usize, count: u32, extra: &symbols::Extra) {
+    style::field(
         out,
         color,
         indent,
         "chained_fixups",
+        &count.to_string(),
         "[LC_DYLD_CHAINED_FIXUPS] Imported symbols.",
+        style::WHITE,
+        false,
     );
     let dash = " ".repeat(indent + 2);
     let sub = " ".repeat(indent + 4);
@@ -863,15 +880,23 @@ fn write_chained(out: &mut String, color: bool, indent: usize, extra: &symbols::
             if row.weak { "true" } else { "false" }
         );
     }
+    style::more_row(
+        out,
+        indent + 2,
+        (count as usize).saturating_sub(extra.chained_rows.len()),
+    );
 }
 
-fn write_bind(out: &mut String, color: bool, indent: usize, extra: &symbols::Extra) {
-    key_note(
+fn write_bind(out: &mut String, color: bool, indent: usize, count: u32, extra: &symbols::Extra) {
+    style::field(
         out,
         color,
         indent,
         "bind",
+        &count.to_string(),
         "[LC_DYLD_INFO] Imported symbols.",
+        style::WHITE,
+        false,
     );
     let dash = " ".repeat(indent + 2);
     let sub = " ".repeat(indent + 4);
@@ -879,6 +904,11 @@ fn write_bind(out: &mut String, color: bool, indent: usize, extra: &symbols::Ext
         let _ = writeln!(out, "{dash}- ordinal: {}", row.ordinal);
         let _ = writeln!(out, "{sub}name: {}", style::yaml_scalar(&row.name));
     }
+    style::more_row(
+        out,
+        indent + 2,
+        (count as usize).saturating_sub(extra.bind_rows.len()),
+    );
 }
 
 fn named_list(
@@ -929,9 +959,13 @@ mod tests {
             load: Load {
                 kind: Kind::Static,
                 interp: None,
+                soname: None,
                 needed: Vec::new(),
+                filter: Vec::new(),
+                auxiliary: Vec::new(),
                 runpath: Vec::new(),
                 rpath: Vec::new(),
+                flags: Vec::new(),
                 delay: Vec::new(),
                 pie: false,
             },
@@ -1110,26 +1144,41 @@ mod tests {
         assert_eq!(lines[at + 7], "      current: 1351.0.0");
         assert!(!text.contains("dylib:"), "{text}");
         assert!(
-            lines[at + 8].starts_with("  runpath: []"),
+            lines[at + 8].starts_with("  filter: []"),
             "{}",
             lines[at + 8]
         );
         assert!(
-            lines[at + 9].starts_with("  rpath: []"),
+            lines[at + 9].starts_with("  auxiliary: []"),
             "{}",
             lines[at + 9]
         );
         assert!(
-            lines[at + 10].starts_with("  delay: []"),
+            lines[at + 10].starts_with("  runpath: []"),
             "{}",
             lines[at + 10]
         );
         assert!(
-            lines[at + 11].starts_with("  dlopen: null"),
+            lines[at + 11].starts_with("  rpath: []"),
             "{}",
             lines[at + 11]
         );
-        assert!(lines[at + 12].starts_with("  pie:"), "{}", lines[at + 12]);
+        assert!(
+            lines[at + 12].starts_with("  flags: []"),
+            "{}",
+            lines[at + 12]
+        );
+        assert!(
+            lines[at + 13].starts_with("  delay: []"),
+            "{}",
+            lines[at + 13]
+        );
+        assert!(
+            lines[at + 14].starts_with("  dlopen: null"),
+            "{}",
+            lines[at + 14]
+        );
+        assert!(lines[at + 15].starts_with("  pie:"), "{}", lines[at + 15]);
     }
 
     #[test]
@@ -1156,16 +1205,21 @@ mod tests {
         assert_eq!(lines[at + 2], "    - @executable_path/../lib");
         assert_eq!(lines[at + 3], "    - /opt/lib");
         assert!(
-            lines[at + 4].starts_with("  delay: []"),
+            lines[at + 4].starts_with("  flags: []"),
             "{}",
             lines[at + 4]
         );
         assert!(
-            lines[at + 5].contains("[none] libSystem is common. That name does not prove dlopen."),
+            lines[at + 5].starts_with("  delay: []"),
             "{}",
             lines[at + 5]
         );
-        assert!(lines[at + 6].starts_with("  pie:"), "{}", lines[at + 6]);
+        assert!(
+            lines[at + 6].contains("[none] libSystem is common. That name does not prove dlopen."),
+            "{}",
+            lines[at + 6]
+        );
+        assert!(lines[at + 7].starts_with("  pie:"), "{}", lines[at + 7]);
     }
 
     fn pie_slice(cpu: u32, sub: u32, offset: u64, needed: &str, rpath: &str) -> Slice {
@@ -1190,9 +1244,13 @@ mod tests {
                 load: Load {
                     kind: Kind::DynamicPie,
                     interp: Some("/usr/lib/dyld".into()),
+                    soname: None,
                     needed: vec![load::link(needed)],
+                    filter: Vec::new(),
+                    auxiliary: Vec::new(),
                     runpath: Vec::new(),
                     rpath: vec![rpath.into()],
+                    flags: Vec::new(),
                     delay: Vec::new(),
                     pie: true,
                 },

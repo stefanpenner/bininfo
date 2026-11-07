@@ -6,6 +6,7 @@ how: Each page file calls this file to align a field and a note.
 A long value keeps its note on the same line.
 A file list paints the directory gray and the library name white.
 A note is a light blue.
+A counted list keeps the count and one row per name.
 ---
 */
 
@@ -159,6 +160,44 @@ pub fn noted_list(
         Some(note_of),
         true,
     );
+}
+
+/// The count stays on the key. Each name is one row under that key.
+pub fn members(
+    out: &mut String,
+    color: bool,
+    indent: usize,
+    key: &str,
+    count: u64,
+    names: &[String],
+    note: &str,
+) {
+    field(
+        out,
+        color,
+        indent,
+        key,
+        &count.to_string(),
+        note,
+        WHITE,
+        false,
+    );
+    let gap = " ".repeat(indent + 2);
+    for name in names {
+        let _ = writeln!(out, "{gap}- {}", yaml_scalar(name));
+    }
+    more_row(
+        out,
+        indent + 2,
+        (count as usize).saturating_sub(names.len()),
+    );
+}
+
+pub(crate) fn more_row(out: &mut String, indent: usize, hidden: usize) {
+    if hidden == 0 {
+        return;
+    }
+    let _ = writeln!(out, "{}- more: {hidden}", " ".repeat(indent));
 }
 
 fn write_list(
@@ -500,9 +539,13 @@ impl Json {
         &mut self,
         kind: &str,
         interp: Option<&str>,
+        soname: Option<&str>,
         needed: &[String],
+        filter: &[String],
+        auxiliary: &[String],
         runpath: &[String],
         rpath: &[String],
+        flags: &[String],
         delay: &[String],
         dlopen: Option<bool>,
         pie: bool,
@@ -515,12 +558,23 @@ impl Json {
             Some(path) => self.out.push_str(&json_str(path)),
             None => self.out.push_str("null"),
         }
+        self.out.push_str(",\"soname\":");
+        match soname {
+            Some(name) => self.out.push_str(&json_str(name)),
+            None => self.out.push_str("null"),
+        }
         self.out.push_str(",\"needed\":[");
         append_strings(&mut self.out, needed);
+        self.out.push_str("],\"filter\":[");
+        append_strings(&mut self.out, filter);
+        self.out.push_str("],\"auxiliary\":[");
+        append_strings(&mut self.out, auxiliary);
         self.out.push_str("],\"runpath\":[");
         append_strings(&mut self.out, runpath);
         self.out.push_str("],\"rpath\":[");
         append_strings(&mut self.out, rpath);
+        self.out.push_str("],\"flags\":[");
+        append_strings(&mut self.out, flags);
         self.out.push_str("],\"delay\":[");
         append_strings(&mut self.out, delay);
         self.out.push_str("],\"dlopen\":");

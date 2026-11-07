@@ -1,3 +1,12 @@
+/*
+---
+why: This file reads how a PE file starts.
+uses: bininfo
+how: bininfo calls this file to read import and delay names.
+This file reads the export directory name as the soname.
+---
+*/
+
 //! How a PE file starts, and which DLLs it must open.
 //! This module reads the import directory and the delay-import directory. It does not print them.
 
@@ -22,9 +31,13 @@ const DELAY_BYTES: usize = 32;
 pub struct Load {
     pub kind: Kind,
     pub interp: Option<String>, // Always None. The file does not name a loader.
+    pub soname: Option<String>, // Export directory name. None means the file has none.
     pub needed: Vec<String>,    // DLL names the loader opens.
+    pub filter: Vec<String>,    // Always empty. PE has no DT_FILTER record.
+    pub auxiliary: Vec<String>, // Always empty. PE has no DT_AUXILIARY record.
     pub runpath: Vec<String>,   // Always empty. PE has no search-path record.
     pub rpath: Vec<String>,     // Always empty. PE has no search-path record.
+    pub flags: Vec<String>,     // Always empty. PE has no DT_FLAGS record.
     pub delay: Vec<String>,     // Delay-load DLL names. The loader opens them on the first call.
     pub pie: bool,              // DYNAMIC_BASE bit, when relocations remain.
 }
@@ -37,11 +50,35 @@ pub fn read(bytes: &[u8], header: &Header) -> Load {
     Load {
         kind: classify(header, !needed.is_empty(), pie),
         interp: None,
+        soname: export_name(bytes, header),
         needed,
+        filter: Vec::new(),
+        auxiliary: Vec::new(),
         runpath: Vec::new(),
         rpath: Vec::new(),
+        flags: Vec::new(),
         delay,
         pie,
+    }
+}
+
+fn export_name(bytes: &[u8], header: &Header) -> Option<String> {
+    let (rva, size) = data_dir(bytes, header, 0)?;
+    if size < 16 {
+        return None;
+    }
+    let sections = sections(bytes, header);
+    let dir = rva_off(&sections, rva)?;
+    let name_rva = header::u32_at(bytes, dir.checked_add(12)?)?;
+    if name_rva == 0 {
+        return None;
+    }
+    let off = rva_off(&sections, name_rva)?;
+    let name = read_text(bytes, off);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 
@@ -264,6 +301,21 @@ mod tests {
     }
     fn put_u64(buf: &mut [u8], at: usize, v: u64) {
         buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn export_name_is_the_soname() {
+        let mut bytes = image(EXEC, 0, &[]);
+        let opt = 0x58;
+        let body = 0x100;
+        put_u32(&mut bytes, opt + 112, 0x1000);
+        put_u32(&mut bytes, opt + 116, 40);
+        put_u32(&mut bytes, body + 12, 0x1028);
+        let name = b"tiny.dll\0";
+        bytes[body + 0x28..body + 0x28 + name.len()].copy_from_slice(name);
+        let header = header::parse(&bytes).unwrap();
+        let load = read(&bytes, &header);
+        assert_eq!(load.soname.as_deref(), Some("tiny.dll"));
     }
 
     /// PE32+ with one section and two import names.
