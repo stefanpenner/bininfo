@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "Read an ELF, Mach-O, or PE header and check how the file starts. Also read an MPQ archive."
+description = "Read an ELF, Mach-O, or PE header and check how the file starts. Also read a zip, a disk image, a TIFF file, and an MPQ archive."
 
 [dependencies]
 crossterm = "0.28"

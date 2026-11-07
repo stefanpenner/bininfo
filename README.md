@@ -11,8 +11,8 @@ how: The reader opens this file in the repo.
 ## What is this?
 
 `bininfo` reads one ELF, Mach-O, or PE file.
-It also reads one MPQ archive.
-An MPQ archive has no start claim.
+It also reads one zip, one disk image, one TIFF file, and one MPQ archive.
+A container has no start claim.
 It prints one page for that file.
 The page uses the same words for each format.
 The page has type, load, symbols, sizes, where, and sections.
@@ -60,9 +60,9 @@ The crate is not on crates.io. `publish` is false.
 
 The same repo is a library. The command calls that library.
 `elf`, `macho`, and `pe` each read one format.
-`mpq` reads one MPQ archive.
+`zip`, `dmg`, `tiff`, and `mpq` each read one container.
 `claim` checks one claim.
-`open` reads a start file or an MPQ archive.
+`open` reads a start file or a container.
 
 A Rust project can depend on a local checkout.
 

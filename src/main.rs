@@ -7,12 +7,13 @@ A terminal folds the page.
 A terminal loads symbol rows.
 A pipe prints the full page.
 It calls the bininfo library to print a page or check a claim.
-An MPQ archive has no start claim.
+A container has no start claim.
 ---
 */
 
 //! Read an ELF, Mach-O, or PE header and print it.
-//! An MPQ archive prints a page and has no start claim.
+//! A zip, a disk image, a TIFF file, or an MPQ archive prints a page.
+//! A container has no start claim.
 //! A terminal folds the page. A pipe prints the full page.
 //! `--check` asks whether the header names no other file.
 

@@ -4,19 +4,21 @@ why: This file is the library a caller uses.
 uses: bininfo
 how: The bininfo command calls open, render, and facts.
 A caller uses certs to scan file bytes.
-open also reads one MPQ archive.
+sign checks a Mach-O or PE signature.
+open also reads a zip, a disk image, a TIFF file, and an MPQ archive.
 ---
 */
 
-//! Read one ELF, Mach-O, PE, or MPQ file.
-//! `open` reads the bytes. `render` prints the page. `facts` feeds a claim.
-//! An MPQ archive has no start claim.
-//! `elf`, `macho`, `pe`, and `mpq` each read one format.
+//! Read one ELF, Mach-O, or PE file.
+//! `open` also reads a zip, a disk image, a TIFF file, and an MPQ archive.
+//! A container has no start claim.
+//! `render` prints the page. `facts` feeds a claim.
 //! `certs` finds embedded certificates in file bytes.
 //! `sign` checks a Mach-O or PE signature.
 
 pub mod certs;
 pub mod claim;
+pub mod dmg;
 pub mod elf;
 pub mod kind;
 pub mod links;
@@ -25,18 +27,17 @@ pub mod mpq;
 pub mod pe;
 pub mod sign;
 pub mod summary;
+pub mod tiff;
 pub mod trust;
+pub mod zip;
 
 mod hash;
 mod library;
-mod strange;
 mod style;
-
-pub use strange::Opened;
 
 use std::process::Command;
 
-/// One parsed ELF, Mach-O, PE, or MPQ file.
+/// One parsed file. A container has no start claim.
 pub enum Binary {
     Elf {
         header: elf::header::Header,
@@ -53,7 +54,10 @@ pub enum Binary {
         load: pe::load::Load,
         symbols: pe::symbols::Symbols,
     },
-    Strange(Opened),
+    Zip(zip::Archive),
+    Dmg(dmg::Image),
+    Tiff(tiff::Image),
+    Mpq(mpq::Archive),
 }
 
 /// Read one file. `rows` keeps symbol rows.
@@ -91,8 +95,19 @@ pub fn open(bytes: &[u8], rows: bool) -> Result<Binary, String> {
             symbols,
         });
     }
-    if let Some(opened) = strange::open(bytes) {
-        return opened.map(Binary::Strange);
+    if mpq::is_mpq(bytes) {
+        return Ok(Binary::Mpq(mpq::parse(bytes)?));
+    }
+    if tiff::is_tiff(bytes) {
+        return Ok(Binary::Tiff(tiff::parse(bytes)?));
+    }
+    // A koly trailer is checked before a zip end record.
+    // A disk image can hold that record.
+    if dmg::is_dmg(bytes) {
+        return Ok(Binary::Dmg(dmg::parse(bytes)?));
+    }
+    if zip::is_zip(bytes) {
+        return Ok(Binary::Zip(zip::parse(bytes)?));
     }
     Err("not an ELF, Mach-O, or PE file".into())
 }
@@ -133,18 +148,39 @@ pub fn render(path: &str, file: &Binary, json: bool, color: bool) -> String {
                 pe::page::render_with(path, header, load, symbols, color)
             }
         }
-        Binary::Strange(opened) => {
+        Binary::Zip(archive) => {
             if json {
-                opened.json(path)
+                zip::page::render_json(path, archive)
             } else {
-                opened.page(path, color)
+                zip::page::render(path, archive, color)
+            }
+        }
+        Binary::Dmg(image) => {
+            if json {
+                dmg::page::render_json(path, image)
+            } else {
+                dmg::page::render(path, image, color)
+            }
+        }
+        Binary::Tiff(image) => {
+            if json {
+                tiff::page::render_json(path, image)
+            } else {
+                tiff::page::render(path, image, color)
+            }
+        }
+        Binary::Mpq(archive) => {
+            if json {
+                mpq::page::render_json(path, archive)
+            } else {
+                mpq::page::render(path, archive, color)
             }
         }
     }
 }
 
 /// Build the facts a claim checks. `host` does not change the hermetic result.
-/// An MPQ archive has no start claim.
+/// A container has no start claim.
 pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> Result<claim::Facts, String> {
     match file {
         Binary::Elf {
@@ -189,7 +225,9 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> Result<claim::Fac
             fat_hermetic: None,
             host: claim::host_marks(&pe::symbols::floors(header, symbols), host),
         }),
-        Binary::Strange(_) => Err("no start claim".into()),
+        Binary::Zip(_) | Binary::Dmg(_) | Binary::Tiff(_) | Binary::Mpq(_) => {
+            Err("no start claim".into())
+        }
     }
 }
 
