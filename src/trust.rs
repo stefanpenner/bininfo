@@ -21,7 +21,8 @@ const EMUDHRA: [&str; 2] = [
     "https://emudhra.we-have-a-problem.com/impacted-intermediates.json",
 ];
 const EMUDHRA_PAGE: &str = "https://emudhra.we-have-a-problem.com/";
-const MOZILLA_PAGE: &str = "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReport";
+const MOZILLA_PAGE: &str =
+    "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReport";
 const MOZILLA_REMOVED: &str =
     "https://ccadb.my.salesforce-sites.com/mozilla/RemovedCACertificateReportPEMCSV";
 const MOZILLA_REVOKED: &str =
@@ -31,7 +32,8 @@ const MOZILLA_REMOVED_PAGE: &str =
 const ONECRL_PAGE: &str = "https://wiki.mozilla.org/CA/Revocation_Checking_in_Firefox";
 const ONECRL: &str =
     "https://firefox.settings.services.mozilla.com/v1/buckets/security-state/collections/onecrl/records";
-const MOZILLA: &str = "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReportPEMCSV";
+const MOZILLA: &str =
+    "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReportPEMCSV";
 
 /// One cert on the bad list. Hashes are lowercase hex.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,7 +255,12 @@ fn curl(url: &str) -> Option<String> {
 
 fn to_tsv(list: &[Bad]) -> String {
     list.iter()
-        .map(|b| format!("{}\t{}\t{}\t{}\t{}\n", b.sha256, b.spki_sha256, b.why, b.url, b.kind))
+        .map(|b| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                b.sha256, b.spki_sha256, b.why, b.url, b.kind
+            )
+        })
         .collect()
 }
 
@@ -357,7 +364,9 @@ pub fn parse_onecrl(text: &str) -> Vec<Bad> {
             "bug" => bug = value,
             "subject" => subject = value,
             "pubKeyHash" => {
-                let Some(hash) = crate::certs::b64_decode(value.as_bytes()) else { continue };
+                let Some(hash) = crate::certs::b64_decode(value.as_bytes()) else {
+                    continue;
+                };
                 let name = crate::certs::b64_decode(subject.as_bytes())
                     .and_then(|der| der_common_name(&der))
                     .unwrap_or_else(|| "unnamed".into());
@@ -400,7 +409,10 @@ pub fn parse_mozilla(text: &str) -> Vec<Bad> {
     let Some(head) = rows.next() else {
         return Vec::new();
     };
-    let col = |name: &str| head.iter().position(|h| h.trim_start_matches('\u{feff}') == name);
+    let col = |name: &str| {
+        head.iter()
+            .position(|h| h.trim_start_matches('\u{feff}') == name)
+    };
     let (Some(name), Some(sha), Some(tls), Some(mail)) = (
         col("Common Name or Certificate Name"),
         col("SHA-256 Fingerprint"),
@@ -444,10 +456,18 @@ pub fn parse_removed(text: &str) -> Vec<Bad> {
             spki_sha256: String::new(),
             why: format!(
                 "removed from the Mozilla root store{}: {}",
-                if when.is_empty() { String::new() } else { format!(" ({when})") },
+                if when.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({when})")
+                },
                 get("Root Certificate Name")
             ),
-            url: if bug.starts_with("http") { bug.into() } else { MOZILLA_REMOVED_PAGE.into() },
+            url: if bug.starts_with("http") {
+                bug.into()
+            } else {
+                MOZILLA_REMOVED_PAGE.into()
+            },
             kind: "distrusted".into(),
         });
     }
@@ -467,7 +487,10 @@ pub fn parse_revoked(text: &str) -> Vec<Bad> {
         let reason = reason.split(") ").last().unwrap_or("");
         let status = get("Revocation Status").to_lowercase();
         let date = get("Date of Revocation");
-        let mut why = format!("{status} (CCADB): {}", get("Certificate Subject Common Name"));
+        let mut why = format!(
+            "{status} (CCADB): {}",
+            get("Certificate Subject Common Name")
+        );
         if !reason.is_empty() {
             why.push_str(&format!(", {reason}"));
         }
@@ -479,7 +502,12 @@ pub fn parse_revoked(text: &str) -> Vec<Bad> {
             spki_sha256: String::new(),
             why,
             url: ONECRL_PAGE.into(),
-            kind: if reason.contains("Compromise") { "critical" } else { "revoked" }.into(),
+            kind: if reason.contains("Compromise") {
+                "critical"
+            } else {
+                "revoked"
+            }
+            .into(),
         });
     }
     out
@@ -495,7 +523,8 @@ fn records(text: &str) -> Vec<std::collections::HashMap<String, String>> {
         .into_iter()
         .map(|h| h.trim_start_matches('\u{feff}').to_string())
         .collect();
-    rows.map(|row| head.iter().cloned().zip(row).collect()).collect()
+    rows.map(|row| head.iter().cloned().zip(row).collect())
+        .collect()
 }
 
 fn csv_rows(text: &str) -> Vec<Vec<String>> {
@@ -548,7 +577,9 @@ mod tests {
         assert_eq!(bad[0].spki_sha256, "cd34");
         assert_eq!(bad[1].why, "eMudhra CA compromise advisory: Root B");
         assert!(bad[1].url.starts_with("https://"));
-        let other = parse_advisory(r#"[{"name":"AAA","operator":"Sectigo","sha256":"1","spki_sha256":"2"},{"name":"X","sha256":"3","spki_sha256":"4"}]"#);
+        let other = parse_advisory(
+            r#"[{"name":"AAA","operator":"Sectigo","sha256":"1","spki_sha256":"2"},{"name":"X","sha256":"3","spki_sha256":"4"}]"#,
+        );
         assert!(other[0].why.contains("Sectigo root as a signer"));
         assert_eq!(other[1].why, "eMudhra CA compromise advisory: X");
         assert_eq!(bad[0].kind, "critical");
@@ -594,14 +625,20 @@ mod tests {
 
     #[test]
     fn verdict_follows_list_then_dates() {
-        let mut hit = crate::certs::scan(include_bytes!("../tests/fixtures/emsign-ecc-g3.der"))
-            .remove(0);
+        let mut hit =
+            crate::certs::scan(include_bytes!("../tests/fixtures/emsign-ecc-g3.der")).remove(0);
         let none = Bads::default();
-        assert!(matches!(judge(&hit, &none, now()), Verdict::Valid | Verdict::Expired(_)));
+        assert!(matches!(
+            judge(&hit, &none, now()),
+            Verdict::Valid | Verdict::Expired(_)
+        ));
         let (from, to) = (hit.not_before.unwrap(), hit.not_after.unwrap());
         assert_eq!(judge(&hit, &none, from + 1), Verdict::Valid);
         assert!(matches!(judge(&hit, &none, to + 1), Verdict::Expired(_)));
-        assert!(matches!(judge(&hit, &none, from - 1), Verdict::NotYetValid(_)));
+        assert!(matches!(
+            judge(&hit, &none, from - 1),
+            Verdict::NotYetValid(_)
+        ));
         let bads = Bads {
             list: vec![Bad {
                 sha256: crate::summary::hex(&hit.sha256),
@@ -612,7 +649,10 @@ mod tests {
             }],
             source: "cache",
         };
-        assert!(matches!(judge(&hit, &bads, from + 1), Verdict::Distrusted { .. }));
+        assert!(matches!(
+            judge(&hit, &bads, from + 1),
+            Verdict::Distrusted { .. }
+        ));
         hit.not_before = None;
         hit.not_after = None;
         assert_eq!(judge(&hit, &none, 0), Verdict::Unknown);
