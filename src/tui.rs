@@ -4,12 +4,14 @@ why: This file draws the folded page in the terminal.
 uses: bininfo
 how: The bininfo command calls this file when stdout is a terminal.
 This file reads keys and draws the page.
+A cert scan redraws the status line.
 ---
 */
 
 //! Draw the folded page. Keys move, open, close, and search.
 
 use super::fold::{self, View};
+use bininfo::links;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
@@ -19,8 +21,18 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use std::io::{self, Write};
+use std::sync::mpsc;
+use std::time::Duration;
 
-pub(crate) fn run(page: &str) -> io::Result<()> {
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Draw the page. `load` returns the full page and runs on a thread when the user opens `certs`.
+pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) -> io::Result<()> {
+    let mut load = Some(load);
+    let mut pending: Option<mpsc::Receiver<String>> = None;
+    let mut tick = 0usize;
+    let mut g_pending = false;
+    let mut note: Option<String> = None;
     let mut view = View::spine(page);
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
@@ -28,42 +40,123 @@ pub(crate) fn run(page: &str) -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen, Hide, DisableLineWrap)?;
     let mut typed = String::new();
     let mut search = false;
+    let mut dirty = true;
+    let mut size = (0u16, 0u16);
     loop {
-        draw(&mut stdout, &view, search.then_some(typed.as_str()))?;
+        let (cols, rows) = terminal::size()?;
+        if (cols, rows) != size {
+            dirty = true;
+            size = (cols, rows);
+        }
+        let busy = pending.is_some().then(|| SPINNER[tick % SPINNER.len()]);
+        // The page is unchanged while the scan runs. A full clear blanks the screen.
+        paint(
+            &mut stdout,
+            &view,
+            search.then_some(typed.as_str()),
+            busy,
+            note.as_deref(),
+            cols,
+            rows,
+            !dirty && pending.is_some(),
+        )?;
+        dirty = false;
+        if let Some(rx) = &pending {
+            match rx.try_recv() {
+                Ok(full) => {
+                    view = View::spine(&full);
+                    view.focus("certs");
+                    pending = None;
+                    dirty = true;
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => pending = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            tick += 1;
+            if !event::poll(Duration::from_millis(80))? {
+                continue;
+            }
+        }
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            dirty = true;
+            note = None;
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 break;
             }
             if search {
                 match key.code {
                     KeyCode::Enter => {
-                        if typed.is_empty() {
-                            view.find("");
-                        } else {
-                            view.find(&typed);
-                        }
+                        view.accept_search();
                         search = false;
                     }
-                    KeyCode::Esc => search = false,
+                    KeyCode::Esc => {
+                        view.cancel_search();
+                        search = false;
+                    }
                     KeyCode::Backspace => {
                         typed.pop();
+                        view.live(&typed);
                     }
-                    KeyCode::Char(ch) => typed.push(ch),
+                    KeyCode::Char(ch) => {
+                        typed.push(ch);
+                        view.live(&typed);
+                    }
                     _ => {}
                 }
                 continue;
             }
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let page = terminal::size().map_or(10, |(_, rows)| rows as isize / 2);
+            if key.code == KeyCode::Char('g') {
+                if g_pending {
+                    view.top();
+                }
+                g_pending = !g_pending;
+                continue;
+            }
+            g_pending = false;
             match key.code {
+                KeyCode::Char('o') => {
+                    note = Some(match links::for_block(&view.cursor_block()) {
+                        Some(link) => match links::open(&link.url) {
+                            Ok(()) => format!("opened {}: {}", link.label, link.url),
+                            Err(err) => format!("cannot open {}: {err}", link.url),
+                        },
+                        None => "nothing to open here".to_string(),
+                    });
+                }
+                KeyCode::Char('G') | KeyCode::End => view.bottom(),
+                KeyCode::Home | KeyCode::Char('<') => view.top(),
+                KeyCode::Char('>') => view.bottom(),
+                KeyCode::Char('d') if ctrl => view.jump(page),
+                KeyCode::Char('u') if ctrl => view.jump(-page),
+                KeyCode::PageDown | KeyCode::Char(' ') => view.jump(page * 2),
+                KeyCode::PageUp => view.jump(-page * 2),
+                KeyCode::Char('n') if ctrl => view.down(),
+                KeyCode::Char('p') if ctrl => view.up(),
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('j') | KeyCode::Down => view.down(),
                 KeyCode::Char('k') | KeyCode::Up => view.up(),
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => view.open(),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    if view.cursor_key() == "certs" {
+                        if let Some(job) = load.take() {
+                            let (tx, rx) = mpsc::channel();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(job());
+                            });
+                            pending = Some(rx);
+                        }
+                    }
+                    view.open();
+                }
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => view.close(),
                 KeyCode::Char('/') => {
                     typed.clear();
+                    view.begin_search();
                     search = true;
                 }
                 KeyCode::Char('n') => view.next(),
@@ -74,38 +167,79 @@ pub(crate) fn run(page: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn draw(out: &mut io::Stdout, view: &View, query: Option<&str>) -> io::Result<()> {
-    let (cols, rows) = terminal::size()?;
+fn paint(
+    out: &mut impl Write,
+    view: &View,
+    query: Option<&str>,
+    busy: Option<char>,
+    note: Option<&str>,
+    cols: u16,
+    rows: u16,
+    status_only: bool,
+) -> io::Result<()> {
+    let status = status_line(view, query, busy, note);
+    if status_only {
+        return write_status(out, &status, cols, rows);
+    }
     let width = cols as usize;
     let lines = view.slots_text();
     let cursor = view.cursor_slot();
     let body = rows.saturating_sub(1) as usize;
     let start = window_start(cursor, lines.len(), body);
-    queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-    for (row, line) in lines.iter().skip(start).take(body).enumerate() {
+    for row in 0..body {
         queue!(out, MoveTo(0, row as u16))?;
-        if start + row == cursor {
-            let plain = fold::strip_ansi(line);
-            queue!(
-                out,
-                SetAttribute(Attribute::Reverse),
-                Print(fit(&plain, width)),
-                SetAttribute(Attribute::Reset)
-            )?;
+        if let Some(line) = lines.get(start + row) {
+            if start + row == cursor {
+                let plain = fold::strip_ansi(line);
+                queue!(
+                    out,
+                    SetAttribute(Attribute::Reverse),
+                    Print(fit(&plain, width)),
+                    SetAttribute(Attribute::Reset),
+                    Clear(ClearType::UntilNewLine),
+                )?;
+            } else {
+                queue!(
+                    out,
+                    Print(fit(line, width)),
+                    Print("\x1b[0m"),
+                    Clear(ClearType::UntilNewLine),
+                )?;
+            }
         } else {
-            queue!(out, Print(fit(line, width)), Print("\x1b[0m"))?;
+            queue!(out, Clear(ClearType::CurrentLine))?;
         }
     }
-    let status = match query {
+    write_status(out, &status, cols, rows)
+}
+
+fn status_line(view: &View, query: Option<&str>, busy: Option<char>, note: Option<&str>) -> String {
+    match query {
+        None if busy.is_some() => format!(
+            "{} scanning certs and fetching bad lists...    q quit",
+            busy.unwrap_or(' ')
+        ),
+        Some(text) if view.searching_none() => format!("/{text}    no match"),
         Some(text) => format!("/{text}"),
-        None => "j/k move    enter open    h close    / search    n next    q quit".to_string(),
-    };
+        None if note.is_some() => note.unwrap_or("").to_string(),
+        None => {
+            let open = links::for_block(&view.cursor_block())
+                .map_or(String::new(), |link| format!("    o open {}", link.label));
+            format!(
+                "j/k move    gg/G top/bottom    enter fold    / search    n next{open}    q quit"
+            )
+        }
+    }
+}
+
+fn write_status(out: &mut impl Write, status: &str, cols: u16, rows: u16) -> io::Result<()> {
     queue!(
         out,
         MoveTo(0, rows.saturating_sub(1)),
         SetAttribute(Attribute::Reverse),
-        Print(fit(&status, width)),
-        SetAttribute(Attribute::Reset)
+        Print(fit(status, cols as usize)),
+        SetAttribute(Attribute::Reset),
+        Clear(ClearType::UntilNewLine),
     )?;
     out.flush()
 }
@@ -161,5 +295,36 @@ impl Drop for Restorer {
             SetAttribute(Attribute::Reset)
         );
         let _ = terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page() -> View {
+        View::spine("format: elf\n\ncerts:\n")
+    }
+
+    #[test]
+    fn a_cert_scan_tick_does_not_redraw_the_page() {
+        let view = page();
+        let mut out = Vec::new();
+        paint(&mut out, &view, None, Some('⠋'), None, 80, 24, true).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("\u{1b}[2J"), "{text:?}");
+        assert!(text.contains("scanning certs"), "{text:?}");
+        assert!(!text.contains("format:"), "{text:?}");
+    }
+
+    #[test]
+    fn a_frame_does_not_erase_the_whole_screen() {
+        let view = page();
+        let mut out = Vec::new();
+        paint(&mut out, &view, None, None, None, 40, 10, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("\u{1b}[2J"), "{text:?}");
+        assert!(!text.contains("\u{1b}[3J"), "{text:?}");
+        assert!(text.contains("format:"), "{text:?}");
     }
 }

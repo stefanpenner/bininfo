@@ -66,9 +66,13 @@ pub fn render_with(file: &str, header: &Header, load: &Load, symbols: &Symbols) 
         &mut out,
         load.kind,
         load.interp.as_deref(),
+        load.soname.as_deref(),
         &load.needed,
+        &load.filter,
+        &load.auxiliary,
         &load.runpath,
         &load.rpath,
+        &load.flags,
         &load.delay,
         "pe",
         load.pie,
@@ -137,9 +141,13 @@ mod tests {
         Load {
             kind: Kind::StaticPie,
             interp: None,
+            soname: None,
             needed: Vec::new(),
+            filter: Vec::new(),
+            auxiliary: Vec::new(),
             runpath: Vec::new(),
             rpath: Vec::new(),
+            flags: Vec::new(),
             delay: Vec::new(),
             pie: true,
         }
@@ -153,7 +161,7 @@ mod tests {
         assert!(text.contains(r#""class":"PE32+""#), "{text}");
         assert!(text.contains(r#""machine_name":"x86-64""#), "{text}");
         assert!(
-            text.contains(r#""load":{"kind":"static-pie","interp":null,"needed":[],"runpath":[],"rpath":[],"delay":[],"dlopen":null,"pie":true}"#),
+            text.contains(r#""load":{"kind":"static-pie","interp":null,"soname":null,"needed":[],"filter":[],"auxiliary":[],"runpath":[],"rpath":[],"flags":[],"delay":[],"dlopen":null,"pie":true}"#),
             "{text}"
         );
         assert!(text.contains(r#""entry_name":null"#), "{text}");

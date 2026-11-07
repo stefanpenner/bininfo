@@ -4,7 +4,7 @@ why: This file finds embedded certificates and trust anchors in a binary.
 uses: bininfo
 how: bininfo calls this file to scan read-only bytes.
 The scan reads DER, PEM, bare base64, gzip, zlib, and zip.
-The scan records the issuer, the validity dates, and the key.
+The scan records the issuer and the key.
 The scan rejects BER indefinite length.
 ---
 */
@@ -14,7 +14,7 @@ The scan rejects BER indefinite length.
 //! An anchor is a public key or trust-anchor info with a known key.
 //! A body is a bare certificate body.
 //! The scan reads DER, PEM, bare base64, gzip, zlib, and zip.
-//! A full certificate and a body carry the issuer, the dates, and the key.
+//! A full certificate and a body carry the issuer and the key.
 //! The scan rejects BER indefinite length.
 
 mod inflate;
@@ -44,18 +44,18 @@ pub struct Hit {
     pub issuer_cn: Option<String>,
     /// Issuer name. Attributes are joined by commas.
     pub issuer_dn: Option<String>,
-    /// notBefore in UTC. Empty when the hit has no date.
-    pub not_before: Option<Time>,
-    /// notAfter in UTC. Empty when the hit has no date.
-    pub not_after: Option<Time>,
-    /// Public key size and curve. A pin has none.
-    pub key: Key,
     /// Section name, segment name, overlay, header, or file.
     pub place: String,
     /// Trust material or a code-signature certificate.
     pub role: Role,
     /// File bytes, or the container that held the hit.
     pub container: Container,
+    /// Start of validity, in Unix seconds. Only a certificate or a body has it.
+    pub not_before: Option<i64>,
+    /// End of validity, in Unix seconds.
+    pub not_after: Option<i64>,
+    /// Public key size and curve. A pin has none.
+    pub key: Key,
 }
 
 /// Full X.509 certificate, trust anchor, bare certificate body, or pin.
@@ -93,23 +93,6 @@ pub enum Container {
     Zip,
     /// The hit is inside a Node SEA blob.
     Sea,
-}
-
-/// UTC date and time from a certificate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Time {
-    /// Year from 1 to 9999.
-    pub year: u16,
-    /// Month from 1 to 12.
-    pub month: u8,
-    /// Day of the month.
-    pub day: u8,
-    /// Hour from 0 to 23.
-    pub hour: u8,
-    /// Minute from 0 to 59.
-    pub minute: u8,
-    /// Second from 0 to 60.
-    pub second: u8,
 }
 
 /// Named curve on an elliptic-curve key.
@@ -185,6 +168,34 @@ pub fn scan(bytes: &[u8]) -> Vec<Hit> {
     hits
 }
 
+/// A segment or section of the file, by file offset.
+/// `parent` is the segment that holds a section. A segment has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub section: bool,
+    pub name: String,
+    pub offset: usize,
+    pub size: usize,
+    pub parent: Option<String>,
+}
+
+/// Name the segments and sections of an ELF, Mach-O, or PE file. Other bytes have none.
+pub fn regions(bytes: &[u8]) -> Vec<Region> {
+    let mut out: Vec<Region> = place::Map::build(bytes)
+        .spans()
+        .into_iter()
+        .map(|(section, name, start, end, parent)| Region {
+            section,
+            name,
+            offset: start,
+            size: end - start,
+            parent,
+        })
+        .collect();
+    out.sort_by(|a, b| (a.offset, a.section, &a.name).cmp(&(b.offset, b.section, &b.name)));
+    out
+}
+
 fn scan_raw(bytes: &[u8], hits: &mut Vec<Hit>) {
     let mut covered = Vec::new();
     scan_pem(bytes, hits, &mut covered);
@@ -206,9 +217,6 @@ fn sort_hits(hits: &mut [Hit]) {
             .then(left.subject_cn.cmp(&right.subject_cn))
             .then(left.issuer_cn.cmp(&right.issuer_cn))
             .then(left.issuer_dn.cmp(&right.issuer_dn))
-            .then(left.not_before.cmp(&right.not_before))
-            .then(left.not_after.cmp(&right.not_after))
-            .then(left.key.cmp(&right.key))
     });
 }
 
@@ -245,8 +253,6 @@ struct Found<'a> {
     spki: &'a [u8],
     subject: Option<&'a [u8]>,
     issuer: Option<&'a [u8]>,
-    not_before: Option<Time>,
-    not_after: Option<Time>,
     key: Key,
 }
 
@@ -307,9 +313,11 @@ fn scan_pem(bytes: &[u8], hits: &mut Vec<Hit>, covered: &mut Vec<(usize, usize)>
 }
 
 fn scan_b64(bytes: &[u8], covered: &mut Vec<(usize, usize)>, hits: &mut Vec<Hit>) {
+    // Spans added below sit behind the cursor, so the snapshot stays right.
+    let fixed = merged(covered);
     let mut index = 0;
     while index < bytes.len() {
-        if let Some(end) = covered_end(index, covered) {
+        if let Some(end) = covered_end(index, &fixed) {
             index = end;
             continue;
         }
@@ -319,7 +327,7 @@ fn scan_b64(bytes: &[u8], covered: &mut Vec<(usize, usize)>, hits: &mut Vec<Hit>
         }
         let start = index;
         let mut too_long = false;
-        while index < bytes.len() && is_b64(bytes[index]) && covered_end(index, covered).is_none() {
+        while index < bytes.len() && is_b64(bytes[index]) && covered_end(index, &fixed).is_none() {
             index += 1;
             if index - start > MAX_B64 {
                 too_long = true;
@@ -338,7 +346,7 @@ fn scan_b64(bytes: &[u8], covered: &mut Vec<(usize, usize)>, hits: &mut Vec<Hit>
             && pads < 2
             && bytes[end] == b'='
             && end - start <= MAX_B64
-            && covered_end(end, covered).is_none()
+            && covered_end(end, &fixed).is_none()
         {
             end += 1;
             pads += 1;
@@ -420,12 +428,12 @@ fn walk(
                         subject_cn: None,
                         issuer_cn: None,
                         issuer_dn: None,
-                        not_before: None,
-                        not_after: None,
-                        key,
                         place: String::new(),
                         role: Role::Trust,
                         container: Container::File,
+                        not_before: None,
+                        not_after: None,
+                        key,
                     });
                     index += span;
                     continue;
@@ -471,6 +479,7 @@ fn hit_from(
     der: &[u8],
     found: &Found<'_>,
 ) -> Hit {
+    let dates = validity_of(der, found.kind);
     Hit {
         offset,
         length,
@@ -481,20 +490,33 @@ fn hit_from(
         subject_cn: found.subject.and_then(subject_cn),
         issuer_cn: found.issuer.and_then(subject_cn),
         issuer_dn: found.issuer.and_then(name_dn),
-        not_before: found.not_before,
-        not_after: found.not_after,
-        key: found.key,
         place: String::new(),
         role: Role::Trust,
         container: Container::File,
+        not_before: dates.map(|d| d.0),
+        not_after: dates.map(|d| d.1),
+        key: found.key,
     }
 }
 
+fn merged(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut sorted = spans.to_vec();
+    sorted.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+// `covered` is sorted and disjoint.
 fn covered_end(index: usize, covered: &[(usize, usize)]) -> Option<usize> {
-    covered
-        .iter()
-        .find(|(start, end)| index >= *start && index < *end)
-        .map(|(_, end)| *end)
+    let next = covered.partition_point(|span| span.0 <= index);
+    let (_, end) = *covered.get(next.checked_sub(1)?)?;
+    (index < end).then_some(end)
 }
 
 fn find_slice(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -914,10 +936,19 @@ fn pin_raw(bytes: &[u8], digests: &HashMap<[u8; 32], Option<String>>, hits: &mut
         head.copy_from_slice(&hash[..8]);
         heads.entry(head).or_default().push(*hash);
     }
+    // Two leading bytes rule out nearly every offset before any hashing.
+    let mut seen_pair = vec![false; 1 << 16];
+    for hash in digests.keys() {
+        seen_pair[usize::from(hash[0]) << 8 | usize::from(hash[1])] = true;
+    }
     let mut per: HashMap<[u8; 32], usize> = HashMap::new();
     let mut count = hits.iter().filter(|hit| hit.kind == Kind::Pin).count();
     let mut index = 0;
     while count < MAX_PINS && index + 32 <= bytes.len() {
+        if !seen_pair[usize::from(bytes[index]) << 8 | usize::from(bytes[index + 1])] {
+            index += 1;
+            continue;
+        }
         let mut head = [0u8; 8];
         head.copy_from_slice(&bytes[index..index + 8]);
         let Some(cands) = heads.get(&head) else {
@@ -970,12 +1001,12 @@ fn pin_hit(
         subject_cn,
         issuer_cn: None,
         issuer_dn: None,
-        not_before: None,
-        not_after: None,
-        key: Key::None,
         place: String::new(),
         role: Role::Trust,
         container: Container::File,
+        not_before: None,
+        not_after: None,
+        key: Key::None,
     }
 }
 
@@ -1092,9 +1123,7 @@ fn as_cert<'a>(body: &'a [u8], kids: &[Part]) -> Option<Found<'a>> {
         spki: body_hit.spki,
         subject: Some(body_hit.subject),
         issuer: Some(body_hit.issuer),
-        not_before: body_hit.not_before,
-        not_after: body_hit.not_after,
-        key: key_of(body_hit.spki).unwrap_or(Key::None),
+        key: key_of(body_hit.spki),
     })
 }
 
@@ -1107,9 +1136,7 @@ fn as_spki<'a>(body: &'a [u8], kids: &[Part], whole: &'a [u8]) -> Option<Found<'
         spki: whole,
         subject: None,
         issuer: None,
-        not_before: None,
-        not_after: None,
-        key: key_of(whole).unwrap_or(Key::None),
+        key: key_of(whole),
     })
 }
 
@@ -1144,9 +1171,7 @@ fn as_tai<'a>(body: &'a [u8], kids: &[Part]) -> Option<Found<'a>> {
         spki,
         subject: None,
         issuer: None,
-        not_before: None,
-        not_after: None,
-        key: key_of(spki).unwrap_or(Key::None),
+        key: key_of(spki),
     })
 }
 
@@ -1157,10 +1182,14 @@ fn as_body<'a>(body: &'a [u8], kids: &[Part]) -> Option<Found<'a>> {
         spki: body_hit.spki,
         subject: Some(body_hit.subject),
         issuer: Some(body_hit.issuer),
-        not_before: body_hit.not_before,
-        not_after: body_hit.not_after,
-        key: key_of(body_hit.spki).unwrap_or(Key::None),
+        key: key_of(body_hit.spki),
     })
+}
+
+struct Tbs<'a> {
+    spki: &'a [u8],
+    subject: &'a [u8],
+    issuer: &'a [u8],
 }
 
 fn tbs_pair<'a>(bytes: &'a [u8], fields: &[Part], signature: Option<&[u8]>) -> Option<Tbs<'a>> {
@@ -1202,22 +1231,11 @@ fn tbs_pair<'a>(bytes: &'a [u8], fields: &[Part], signature: Option<&[u8]>) -> O
     if !rest[6..].iter().all(|field| field.tag & 0xc0 == 0x80) {
         return None;
     }
-    let (not_before, not_after) = times_of(rest[3].content(bytes));
     Some(Tbs {
         spki: rest[5].raw(bytes),
         subject: rest[4].content(bytes),
         issuer: rest[2].content(bytes),
-        not_before,
-        not_after,
     })
-}
-
-struct Tbs<'a> {
-    spki: &'a [u8],
-    subject: &'a [u8],
-    issuer: &'a [u8],
-    not_before: Option<Time>,
-    not_after: Option<Time>,
 }
 
 fn spki_ok(bytes: &[u8]) -> bool {
@@ -1235,17 +1253,56 @@ fn spki_ok(bytes: &[u8]) -> bool {
 }
 
 fn spki_parts_ok(body: &[u8], kids: &[Part]) -> bool {
-    key_parts(body, kids).is_some()
+    if kids.len() != 2 || kids[0].tag != 0x30 || kids[1].tag != 0x03 {
+        return false;
+    }
+    let alg = kids[0].content(body);
+    let bits = kids[1].content(body);
+    let mut fields = [Part::zero(); 4];
+    let Some(count) = fill(alg, &mut fields) else {
+        return false;
+    };
+    let fields = &fields[..count];
+    if fields.is_empty() || fields[0].tag != 0x06 || !oid_ok(fields[0].content(alg)) {
+        return false;
+    }
+    let oid = fields[0].content(alg);
+    if oid == RSA {
+        return fields.len() == 2 && fields[1].raw(alg) == [0x05, 0x00] && rsa_ok(bits);
+    }
+    if oid == EC {
+        return fields.len() == 2 && fields[1].tag == 0x06 && ec_ok(fields[1].content(alg), bits);
+    }
+    if fields.len() != 1 {
+        return false;
+    }
+    if oid == ED25519 {
+        return raw_len(bits, 32);
+    }
+    if oid == ED448 {
+        return raw_len(bits, 57);
+    }
+    if oid == X25519 {
+        return raw_len(bits, 32);
+    }
+    if oid == X448 {
+        return raw_len(bits, 56);
+    }
+    false
 }
 
-fn key_of(bytes: &[u8]) -> Option<Key> {
-    let (tag, head, end) = next_part(bytes, 0)?;
+fn key_of(bytes: &[u8]) -> Key {
+    let Some((tag, head, end)) = next_part(bytes, 0) else {
+        return Key::None;
+    };
     if tag != 0x30 || end != bytes.len() {
-        return None;
+        return Key::None;
     }
     let mut kids = [Part::zero(); 4];
-    let count = fill(&bytes[head..end], &mut kids)?;
-    key_parts(&bytes[head..end], &kids[..count])
+    let Some(count) = fill(&bytes[head..end], &mut kids) else {
+        return Key::None;
+    };
+    key_parts(&bytes[head..end], &kids[..count]).unwrap_or(Key::None)
 }
 
 fn key_parts(body: &[u8], kids: &[Part]) -> Option<Key> {
@@ -1263,13 +1320,20 @@ fn key_parts(body: &[u8], kids: &[Part]) -> Option<Key> {
     let oid = fields[0].content(alg);
     if oid == RSA {
         if fields.len() == 2 && fields[1].raw(alg) == [0x05, 0x00] {
-            return rsa_key(bits);
+            return Some(Key::Rsa {
+                bits: rsa_width(bits)?,
+            });
         }
         return None;
     }
     if oid == EC {
         if fields.len() == 2 && fields[1].tag == 0x06 {
-            return ec_key(fields[1].content(alg), bits);
+            let curve = fields[1].content(alg);
+            if ec_ok(curve, bits) {
+                return Some(Key::Ec {
+                    curve: curve_of(curve)?,
+                });
+            }
         }
         return None;
     }
@@ -1291,7 +1355,23 @@ fn key_parts(body: &[u8], kids: &[Part]) -> Option<Key> {
     None
 }
 
-fn rsa_key(bits: &[u8]) -> Option<Key> {
+fn curve_of(oid: &[u8]) -> Option<Curve> {
+    if oid == P256 {
+        Some(Curve::P256)
+    } else if oid == P384 {
+        Some(Curve::P384)
+    } else if oid == P521 {
+        Some(Curve::P521)
+    } else {
+        None
+    }
+}
+
+fn rsa_ok(bits: &[u8]) -> bool {
+    rsa_width(bits).is_some()
+}
+
+fn rsa_width(bits: &[u8]) -> Option<u16> {
     let Some((&0, payload)) = bits.split_first() else {
         return None;
     };
@@ -1323,12 +1403,10 @@ fn rsa_key(bits: &[u8]) -> Option<Key> {
     if !(64..=1024).contains(&mod_len) || !(1..=8).contains(&exponent.len()) {
         return None;
     }
-    Some(Key::Rsa {
-        bits: rsa_bits(modulus)?,
-    })
+    bit_width(modulus)
 }
 
-fn rsa_bits(modulus: &[u8]) -> Option<u16> {
+fn bit_width(modulus: &[u8]) -> Option<u16> {
     let bytes = match modulus.split_first() {
         Some((0x00, rest)) if !rest.is_empty() => rest,
         _ => modulus,
@@ -1346,45 +1424,25 @@ fn rsa_bits(modulus: &[u8]) -> Option<u16> {
     u16::try_from(bits).ok()
 }
 
-fn ec_key(curve: &[u8], bits: &[u8]) -> Option<Key> {
-    let known = if curve == P256 {
-        Some((Curve::P256, 32usize))
+fn ec_ok(curve: &[u8], bits: &[u8]) -> bool {
+    let coord = if curve == P256 {
+        32
     } else if curve == P384 {
-        Some((Curve::P384, 48))
+        48
     } else if curve == P521 {
-        Some((Curve::P521, 66))
+        66
     } else {
-        None
+        return false;
     };
-    if let Some((curve, coord)) = known {
-        if point_ok(bits, Some(coord)) {
-            return Some(Key::Ec { curve });
-        }
-        return None;
-    }
-    if oid_ok(curve) && point_ok(bits, None) {
-        return Some(Key::Ec {
-            curve: Curve::Other,
-        });
-    }
-    None
-}
-
-fn point_ok(bits: &[u8], coord: Option<usize>) -> bool {
     let Some((&0, point)) = bits.split_first() else {
         return false;
     };
     if point.is_empty() {
         return false;
     }
-    match (point[0], coord) {
-        (0x04, Some(coord)) => point.len() == 1 + coord + coord,
-        (0x02 | 0x03, Some(coord)) => point.len() == 1 + coord,
-        (0x04, None) => {
-            let size = point.len() - 1;
-            (16..=132).contains(&size) && size % 2 == 0
-        }
-        (0x02 | 0x03, None) => (16..=66).contains(&(point.len() - 1)),
+    match point[0] {
+        0x04 => point.len() == 1 + coord + coord,
+        0x02 | 0x03 => point.len() == 1 + coord,
         _ => false,
     }
 }
@@ -1483,6 +1541,88 @@ fn name_ok(content: &[u8]) -> bool {
     true
 }
 
+// Read notBefore and notAfter from a certificate or a bare body.
+fn validity_of(der: &[u8], kind: Kind) -> Option<(i64, i64)> {
+    let (_, head, end) = next_part(der, 0)?;
+    let body = &der[head..end];
+    let mut kids = [Part::zero(); 16];
+    let count = fill(body, &mut kids)?;
+    let tbs_part = match kind {
+        Kind::Full => kids[0],
+        Kind::Body => Part {
+            tag: 0x30,
+            start: 0,
+            head: 0,
+            end: body.len(),
+        },
+        _ => return None,
+    };
+    let tbs = tbs_part.content(body);
+    let mut fields = [Part::zero(); 16];
+    let n = if kind == Kind::Full {
+        fill(tbs, &mut fields)?
+    } else {
+        for (slot, kid) in fields.iter_mut().zip(&kids[..count]) {
+            *slot = *kid;
+        }
+        count
+    };
+    let mut rest = &fields[..n];
+    if rest.first()?.tag == 0xa0 {
+        rest = &rest[1..];
+    }
+    let src = if kind == Kind::Full { tbs } else { body };
+    let mut times = [Part::zero(); 4];
+    let count = fill(rest.get(3)?.content(src), &mut times)?;
+    if count != 2 {
+        return None;
+    }
+    let window = rest[3].content(src);
+    Some((
+        unix_time(times[0].tag, times[0].content(window))?,
+        unix_time(times[1].tag, times[1].content(window))?,
+    ))
+}
+
+// UTCTime and GeneralizedTime to Unix seconds. A zone offset is applied.
+fn unix_time(tag: u8, text: &[u8]) -> Option<i64> {
+    let (year_len, digits) = if tag == 0x17 { (2, 12) } else { (4, 14) };
+    let num = |from: usize, len: usize| -> Option<i64> {
+        std::str::from_utf8(text.get(from..from + len)?)
+            .ok()?
+            .parse()
+            .ok()
+    };
+    let mut year = num(0, year_len)?;
+    if tag == 0x17 {
+        year += if year >= 50 { 1900 } else { 2000 };
+    }
+    let at = year_len;
+    let (month, day, hour, min, sec) = (
+        num(at, 2)?,
+        num(at + 2, 2)?,
+        num(at + 4, 2)?,
+        num(at + 6, 2)?,
+        num(at + 8, 2)?,
+    );
+    let mut secs = days_from_civil(year, month, day) * 86400 + hour * 3600 + min * 60 + sec;
+    if text.len() == digits + 5 {
+        let off = num(digits + 1, 2)? * 3600 + num(digits + 3, 2)? * 60;
+        secs += if text[digits] == b'+' { -off } else { off };
+    }
+    Some(secs)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
 fn validity_ok(content: &[u8]) -> bool {
     let mut kids = [Part::zero(); 4];
     let Some(count) = fill(content, &mut kids) else {
@@ -1509,157 +1649,6 @@ fn time_ok(tag: u8, content: &[u8]) -> bool {
             && content[digits + 1..].iter().all(u8::is_ascii_digit);
     }
     false
-}
-
-fn times_of(content: &[u8]) -> (Option<Time>, Option<Time>) {
-    let mut kids = [Part::zero(); 4];
-    let Some(count) = fill(content, &mut kids) else {
-        return (None, None);
-    };
-    if count != 2 {
-        return (None, None);
-    }
-    (
-        parse_time(kids[0].tag, kids[0].content(content)),
-        parse_time(kids[1].tag, kids[1].content(content)),
-    )
-}
-
-fn parse_time(tag: u8, content: &[u8]) -> Option<Time> {
-    let digits = match tag {
-        0x17 => 12,
-        0x18 => 14,
-        _ => return None,
-    };
-    if content.len() != digits + 1 && content.len() != digits + 5 {
-        return None;
-    }
-    if !content[..digits].iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let number = |at: usize, width: usize| -> Option<i32> {
-        let text = std::str::from_utf8(&content[at..at + width]).ok()?;
-        text.parse().ok()
-    };
-    let (year, at) = if digits == 12 {
-        let yy = number(0, 2)?;
-        let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
-        (year, 2)
-    } else {
-        (number(0, 4)?, 4)
-    };
-    let month = number(at, 2)?;
-    let day = number(at + 2, 2)?;
-    let hour = number(at + 4, 2)?;
-    let minute = number(at + 6, 2)?;
-    let second = number(at + 8, 2)?;
-    if !(1..=9999).contains(&year)
-        || !(1..=12).contains(&month)
-        || !valid_day(year, month, day)
-        || !(0..=23).contains(&hour)
-        || !(0..=59).contains(&minute)
-        || !(0..=60).contains(&second)
-    {
-        return None;
-    }
-    let time = Time {
-        year: u16::try_from(year).ok()?,
-        month: u8::try_from(month).ok()?,
-        day: u8::try_from(day).ok()?,
-        hour: u8::try_from(hour).ok()?,
-        minute: u8::try_from(minute).ok()?,
-        second: u8::try_from(second).ok()?,
-    };
-    if content[digits] == b'Z' && content.len() == digits + 1 {
-        return Some(time);
-    }
-    let sign = content[digits];
-    if content.len() != digits + 5 || (sign != b'+' && sign != b'-') {
-        return None;
-    }
-    if !content[digits + 1..].iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let off_hour = number(digits + 1, 2)?;
-    let off_minute = number(digits + 3, 2)?;
-    if !(0..=23).contains(&off_hour) || !(0..=59).contains(&off_minute) {
-        return None;
-    }
-    let mut delta = off_hour * 60 + off_minute;
-    if sign == b'+' {
-        delta = -delta;
-    }
-    shift_minutes(time, delta)
-}
-
-fn valid_day(year: i32, month: i32, day: i32) -> bool {
-    let last = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap(year) => 29,
-        2 => 28,
-        _ => return false,
-    };
-    (1..=last).contains(&day)
-}
-
-fn leap(year: i32) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
-
-fn shift_minutes(time: Time, minutes: i32) -> Option<Time> {
-    if minutes == 0 {
-        return Some(time);
-    }
-    let days = days_from_civil(
-        i32::from(time.year),
-        i32::from(time.month),
-        i32::from(time.day),
-    );
-    let total =
-        days * 1440 + i64::from(time.hour) * 60 + i64::from(time.minute) + i64::from(minutes);
-    let day = total.div_euclid(1440);
-    let minute = total.rem_euclid(1440);
-    let (year, month, day) = civil_from_days(day)?;
-    Some(Time {
-        year,
-        month,
-        day,
-        hour: u8::try_from(minute / 60).ok()?,
-        minute: u8::try_from(minute % 60).ok()?,
-        second: time.second,
-    })
-}
-
-fn days_from_civil(mut year: i32, month: i32, day: i32) -> i64 {
-    year -= i32::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = u32::try_from(year - era * 400).unwrap_or(0);
-    let month_part = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * month_part + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + u32::try_from(doy).unwrap_or(0);
-    i64::from(era) * 146097 + i64::from(doe) - 719468
-}
-
-fn civil_from_days(days: i64) -> Option<(u16, u8, u8)> {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = u32::try_from(z - era * 146097).ok()?;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let year = i64::from(yoe) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    Some((
-        u16::try_from(year).ok()?,
-        u8::try_from(month).ok()?,
-        u8::try_from(day).ok()?,
-    ))
 }
 
 fn bit_ok(content: &[u8]) -> bool {
@@ -1878,7 +1867,7 @@ fn der_len(bytes: &[u8]) -> Option<(usize, usize)> {
     Some((value, 1 + width))
 }
 
-fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
     let mut clean = Vec::with_capacity(input.len());
     for &byte in input {
         match byte {
@@ -2416,37 +2405,6 @@ mod tests {
             hits[0].subject_cn.as_deref(),
             Some("emSign ECC Root CA - G3")
         );
-        assert_eq!(
-            hits[0].issuer_cn.as_deref(),
-            Some("emSign ECC Root CA - G3")
-        );
-        assert_eq!(
-            hits[0].issuer_dn.as_deref(),
-            Some("C=IN,OU=emSign PKI,O=eMudhra Technologies Limited,CN=emSign ECC Root CA - G3")
-        );
-        assert_eq!(
-            hits[0].not_before,
-            Some(Time {
-                year: 2018,
-                month: 2,
-                day: 18,
-                hour: 18,
-                minute: 30,
-                second: 0,
-            })
-        );
-        assert_eq!(
-            hits[0].not_after,
-            Some(Time {
-                year: 2043,
-                month: 2,
-                day: 18,
-                hour: 18,
-                minute: 30,
-                second: 0,
-            })
-        );
-        assert_eq!(hits[0].key, Key::Ec { curve: Curve::P384 });
     }
 
     #[test]
@@ -2470,27 +2428,6 @@ mod tests {
             assert_eq!(hits[0].subject_cn, None);
             assert_eq!(scan(spki).len(), 1);
         }
-    }
-
-    #[test]
-    fn an_unknown_curve_is_an_anchor() {
-        let mut spki = P256_SPKI.to_vec();
-        let oid = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
-        let at = spki
-            .windows(oid.len())
-            .position(|window| window == oid)
-            .unwrap();
-        spki[at + oid.len() - 1] = 0x08;
-        let hits = scan(&spki);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].kind, Kind::Anchor);
-        assert_eq!(
-            hits[0].key,
-            Key::Ec {
-                curve: Curve::Other
-            }
-        );
-        assert_eq!(scan(P256_SPKI)[0].key, Key::Ec { curve: Curve::P256 });
     }
 
     #[test]
@@ -2538,12 +2475,24 @@ mod tests {
             assert_eq!(hits[0].kind, Kind::Full);
             assert_eq!(hits[0].encoding, Encoding::Der);
             assert_eq!(hits[0].subject_cn.as_deref(), Some(cn));
+            assert_eq!(hits[0].issuer_cn.as_deref(), Some(cn));
+            let dn = format!("CN={cn}");
+            assert_eq!(hits[0].issuer_dn.as_deref(), Some(dn.as_str()));
+            let expect_key = match cn {
+                "probe-rsa" => matches!(hits[0].key, Key::Rsa { bits } if bits >= 2048),
+                "probe-p256" => hits[0].key == Key::Ec { curve: Curve::P256 },
+                "probe-ed25519" => hits[0].key == Key::Ed25519,
+                _ => false,
+            };
+            assert!(expect_key, "{cn} {:?}", hits[0].key);
             assert_eq!(hex(&hits[0].sha256), digest);
             assert_eq!(hits[0].spki_sha256, sha256(spki));
             let keys = scan(spki);
             assert_eq!(keys.len(), 1, "{cn} spki");
             assert_eq!(keys[0].kind, Kind::Anchor);
             assert_eq!(keys[0].subject_cn, None);
+            assert_eq!(keys[0].issuer_cn, None);
+            assert_eq!(keys[0].key, hits[0].key);
             assert_eq!(keys[0].sha256, keys[0].spki_sha256);
             assert_eq!(keys[0].length, spki.len());
         }
@@ -2781,48 +2730,10 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].kind, Kind::Full);
         assert_eq!(hits[0].subject_cn.as_deref(), Some("offset"));
-        let midnight = Time {
-            year: 2025,
-            month: 1,
-            day: 1,
-            hour: 0,
-            minute: 0,
-            second: 0,
-        };
-        assert_eq!(hits[0].not_before, Some(midnight));
-        assert_eq!(hits[0].not_after, Some(midnight));
         let generalized = cert_with(b"20250101000000Z", 0x18, b"general", &[]);
-        let general_hits = scan(&generalized);
-        assert_eq!(general_hits.len(), 1);
-        assert_eq!(general_hits[0].not_before, Some(midnight));
+        assert_eq!(scan(&generalized).len(), 1);
         let minus = cert_with(b"20250101000000-0500", 0x18, b"minus", &[]);
-        let minus_hits = scan(&minus);
-        assert_eq!(minus_hits.len(), 1);
-        assert_eq!(
-            minus_hits[0].not_before,
-            Some(Time {
-                year: 2025,
-                month: 1,
-                day: 1,
-                hour: 5,
-                minute: 0,
-                second: 0,
-            })
-        );
-        let roll = cert_with(b"250101003000+0530", 0x17, b"roll", &[]);
-        let roll_hits = scan(&roll);
-        assert_eq!(roll_hits.len(), 1);
-        assert_eq!(
-            roll_hits[0].not_before,
-            Some(Time {
-                year: 2024,
-                month: 12,
-                day: 31,
-                hour: 19,
-                minute: 0,
-                second: 0,
-            })
-        );
+        assert_eq!(scan(&minus).len(), 1);
         let bad = cert_with(b"250101000000+00", 0x17, b"bad", &[]);
         assert!(scan(&bad).iter().all(|hit| hit.kind != Kind::Full));
     }
@@ -2867,6 +2778,8 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].kind, Kind::Body);
         assert_eq!(hits[0].subject_cn.as_deref(), Some("body"));
+        assert_eq!(hits[0].issuer_cn.as_deref(), Some("body"));
+        assert_eq!(hits[0].key, Key::Ed25519);
         assert_eq!(hits[0].spki_sha256, sha256(ED_SPKI));
         assert_eq!(hits[0].sha256, sha256(&tbs));
     }

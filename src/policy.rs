@@ -24,7 +24,7 @@ how: The bininfo command reads a policy file and calls this file.
 //! A deny makes the summary fail.
 //! A warn does not.
 
-use crate::certs::{Container, Curve, Encoding, Hit, Key, Kind, Role, Time};
+use crate::certs::{Container, Curve, Encoding, Hit, Key, Kind, Role};
 use std::collections::HashSet;
 use std::fmt::Write;
 
@@ -66,8 +66,8 @@ enum Pred {
     Place(String),
     Role(Role),
     Root,
-    Expired(Time),
-    NotYet(Time),
+    Expired(i64),
+    NotYet(i64),
     RsaBelow(u16),
     UnknownCurve,
     Not(Box<Pred>),
@@ -506,7 +506,7 @@ fn parse_role(text: &str) -> Result<Role, String> {
     }
 }
 
-fn parse_stamp(text: &str) -> Result<Time, String> {
+fn parse_stamp(text: &str) -> Result<i64, String> {
     let bytes = text.as_bytes();
     if bytes.len() != 20
         || bytes[4] != b'-'
@@ -533,14 +533,24 @@ fn parse_stamp(text: &str) -> Result<Time, String> {
     {
         return Err(format!("bad time {text}"));
     }
-    Ok(Time {
-        year: u16::try_from(year).unwrap_or(0),
-        month: u8::try_from(month).unwrap_or(0),
-        day: u8::try_from(day).unwrap_or(0),
-        hour: u8::try_from(hour).unwrap_or(0),
-        minute: u8::try_from(minute).unwrap_or(0),
-        second: u8::try_from(second).unwrap_or(0),
-    })
+    Ok(unix_stamp(year, month, day, hour, minute, second))
+}
+
+fn unix_stamp(year: i32, month: i32, day: i32, hour: i32, minute: i32, second: i32) -> i64 {
+    days_from_civil(i64::from(year), i64::from(month), i64::from(day)) * 86400
+        + i64::from(hour) * 3600
+        + i64::from(minute) * 60
+        + i64::from(second)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 fn number(text: &str) -> Result<i32, String> {
@@ -625,15 +635,8 @@ mod tests {
     const G3B_PEM: &[u8] = include_bytes!("../tests/fixtures/em-dv-tls-g3b.pem");
     const G3B_SECTIGO: &[u8] = include_bytes!("../tests/fixtures/em-dv-tls-g3b-sectigo.pem");
 
-    fn at(year: u16, month: u8, day: u8) -> Time {
-        Time {
-            year,
-            month,
-            day,
-            hour: 0,
-            minute: 0,
-            second: 0,
-        }
+    fn at(year: i32, month: i32, day: i32) -> i64 {
+        unix_stamp(year, month, day, 0, 0, 0)
     }
 
     fn sample() -> Hit {

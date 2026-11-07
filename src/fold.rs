@@ -6,6 +6,7 @@ how: The bininfo command calls this file when stdout is a terminal.
 A short group starts open.
 A long list starts closed.
 A pipe does not call this file.
+A list with a count shows that count.
 ---
 */
 
@@ -19,6 +20,11 @@ const ROW_CAP: usize = 4;
 
 pub(crate) fn interactive(tty: bool, json: bool) -> bool {
     tty && !json
+}
+
+/// A terminal loads symbol rows. `--symbols` loads them on a pipe too.
+pub(crate) fn with_rows(flag: bool, tty: bool, json: bool) -> bool {
+    flag || interactive(tty, json)
 }
 
 struct Item {
@@ -37,6 +43,9 @@ pub(crate) struct View {
     cursor: usize,
     query: String,
     hit: usize,
+    // While a search is being typed: the hits and their ancestors, the only rows drawn.
+    shown: Option<HashSet<usize>>,
+    origin: usize,
 }
 
 enum Slot {
@@ -60,6 +69,8 @@ impl View {
             cursor,
             query: String::new(),
             hit: 0,
+            shown: None,
+            origin: cursor,
         }
     }
 
@@ -106,10 +117,91 @@ impl View {
         self.move_cursor(-1);
     }
 
+    pub(crate) fn top(&mut self) {
+        self.edge(false);
+    }
+
+    pub(crate) fn bottom(&mut self) {
+        self.edge(true);
+    }
+
+    /// Move by many rows, stopping at the first or last.
+    pub(crate) fn jump(&mut self, rows: isize) {
+        for _ in 0..rows.unsigned_abs() {
+            let before = self.cursor;
+            self.move_cursor(rows.signum());
+            if self.cursor == before {
+                break;
+            }
+        }
+    }
+
+    fn edge(&mut self, last: bool) {
+        let ids: Vec<usize> = self
+            .slots()
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Item(id) => Some(*id),
+                Slot::Gap => None,
+            })
+            .collect();
+        let pick = if last { ids.last() } else { ids.first() };
+        if let Some(&id) = pick {
+            self.cursor = id;
+        }
+    }
+
     pub(crate) fn find(&mut self, query: &str) {
         self.query = query.to_lowercase();
         self.hit = 0;
         self.goto_hit();
+    }
+
+    /// Start a search: remember where the cursor was so cancel can return to it.
+    pub(crate) fn begin_search(&mut self) {
+        self.origin = self.cursor;
+    }
+
+    /// Re-run the search on every key: show only the hits and the path down to each, cursor on the first.
+    pub(crate) fn live(&mut self, query: &str) {
+        self.query = query.to_lowercase();
+        self.hit = 0;
+        let hits = self.hits();
+        if self.query.is_empty() {
+            self.shown = None;
+            self.cursor = self.origin;
+            return;
+        }
+        let mut shown = HashSet::new();
+        for &id in &hits {
+            shown.insert(id);
+            let mut parent = self.items[id].parent;
+            while let Some(pid) = parent {
+                shown.insert(pid);
+                parent = self.items[pid].parent;
+            }
+        }
+        self.shown = Some(shown);
+        if let Some(&first) = hits.first() {
+            self.cursor = first;
+        }
+    }
+
+    /// Enter: leave the filtered view, keep the cursor on the hit with its parents open, so `n` walks on.
+    pub(crate) fn accept_search(&mut self) {
+        self.shown = None;
+        self.goto_hit();
+    }
+
+    /// Esc: drop the search and put the cursor back.
+    pub(crate) fn cancel_search(&mut self) {
+        self.shown = None;
+        self.query.clear();
+        self.cursor = self.origin;
+    }
+
+    pub(crate) fn searching_none(&self) -> bool {
+        matches!(&self.shown, Some(s) if s.is_empty())
     }
 
     pub(crate) fn next(&mut self) {
@@ -118,6 +210,34 @@ impl View {
         }
         self.hit = self.hit.saturating_add(1);
         self.goto_hit();
+    }
+
+    /// Put the cursor on the top-level item with this key and open it.
+    pub(crate) fn focus(&mut self, key: &str) {
+        let found = self
+            .items
+            .iter()
+            .position(|item| item.parent.is_none() && item.key == key);
+        if let Some(id) = found {
+            self.cursor = id;
+            if !self.items[id].children.is_empty() {
+                self.open.insert(id);
+            }
+        }
+    }
+
+    /// Plain text of the selected row and every row under it.
+    pub(crate) fn cursor_block(&self) -> String {
+        let mut out = Vec::new();
+        let mut stack = vec![self.cursor];
+        while let Some(id) = stack.pop() {
+            let Some(item) = self.items.get(id) else {
+                continue;
+            };
+            out.push(strip_ansi(&item.raw));
+            stack.extend(item.children.iter().rev());
+        }
+        out.join("\n")
     }
 
     pub(crate) fn cursor_key(&self) -> &str {
@@ -227,7 +347,7 @@ impl View {
         let mut gapped = false;
         let mut saw_header = false;
         for id in 0..self.items.len() {
-            if self.items[id].parent.is_some() {
+            if self.items[id].parent.is_some() || !self.is_shown(id) {
                 continue;
             }
             if is_header(&self.items[id]) {
@@ -246,12 +366,19 @@ impl View {
 
     fn push_node(&self, out: &mut Vec<Slot>, id: usize) {
         out.push(Slot::Item(id));
-        if self.items[id].children.is_empty() || !self.open.contains(&id) {
+        if self.items[id].children.is_empty() || (self.shown.is_none() && !self.open.contains(&id))
+        {
             return;
         }
         for &child in &self.items[id].children {
-            self.push_node(out, child);
+            if self.is_shown(child) {
+                self.push_node(out, child);
+            }
         }
+    }
+
+    fn is_shown(&self, id: usize) -> bool {
+        self.shown.as_ref().is_none_or(|shown| shown.contains(&id))
     }
 
     fn text(&self, id: usize) -> String {
@@ -265,7 +392,7 @@ impl View {
             return insert_mark(&item.raw, item.indent, mark);
         }
         let indent = " ".repeat(item.indent);
-        format!("{indent}{mark} {}", self.label(id))
+        tint_marks(&format!("{indent}{mark} {}", self.label(id)))
     }
 
     fn label(&self, id: usize) -> String {
@@ -277,7 +404,12 @@ impl View {
             return format!("- {}: {}", item.key, item.value);
         }
         if list_like(&self.items, id) {
-            return format!("{:<PAD$}{}", item.key, item.children.len());
+            let shown = if item.value.is_empty() {
+                item.children.len().to_string()
+            } else {
+                item.value.clone()
+            };
+            return format!("{:<PAD$}{}", item.key, shown);
         }
         format!("{:<PAD$}{}", item.key, self.rung_summary(id))
             .trim_end()
@@ -545,6 +677,15 @@ fn split_line(plain: &str) -> (usize, bool, String, String) {
     }
 }
 
+// A folded row is rebuilt from plain text, so the cert marks get their colour back.
+fn tint_marks(line: &str) -> String {
+    line.replace('✓', "\x1b[1;38;2;37;190;106m✓\x1b[0m")
+        .replace('✗', "\x1b[1;38;2;255;92;92m✗\x1b[0m")
+        .replace('‼', "\x1b[1;38;2;255;45;149m‼\x1b[0m")
+        .replace('⊘', "\x1b[1;38;2;255;92;92m⊘\x1b[0m")
+        .replace('◷', "\x1b[1;38;2;245;176;66m◷\x1b[0m")
+}
+
 pub(crate) fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -586,10 +727,77 @@ load:                           # How this file starts.
 ";
 
     #[test]
+    fn top_bottom_and_jump_move_the_cursor() {
+        let mut view = View::spine(PAGE);
+        view.bottom();
+        let last = view.cursor_slot();
+        assert!(last > 0);
+        view.top();
+        assert_eq!(view.cursor_slot(), 0);
+        view.jump(1000);
+        assert_eq!(view.cursor_slot(), last);
+        view.jump(-1000);
+        assert_eq!(view.cursor_slot(), 0);
+    }
+
+    #[test]
+    fn folded_cert_rows_keep_green_and_red_marks() {
+        let text = tint_marks("  > - ✓ cn: a\n  > - ✗ cn: b");
+        assert!(text.contains("38;2;37;190;106m✓"), "{text}");
+        assert!(text.contains("38;2;255;92;92m✗"), "{text}");
+    }
+
+    #[test]
     fn a_terminal_folds_and_json_stays_text() {
         assert!(interactive(true, false));
         assert!(!interactive(false, false));
         assert!(!interactive(true, true));
+        assert!(with_rows(false, true, false));
+        assert!(!with_rows(false, false, false));
+        assert!(!with_rows(false, true, true));
+        assert!(with_rows(true, false, true));
+    }
+
+    #[test]
+    fn a_count_stays_on_a_closed_list() {
+        let page = "\
+symbols:
+  exports: 9
+    - a
+    - b
+    - c
+    - d
+    - e
+    - more: 4
+";
+        let mut view = View::spine(page);
+        assert!(view.body().contains("> exports   9"), "{}", view.body());
+        assert!(!view.body().contains("- a"), "{}", view.body());
+        view.down();
+        assert_eq!(view.cursor_key(), "exports");
+        view.open();
+        assert!(view.body().contains("- a"), "{}", view.body());
+        assert!(view.body().contains("more: 4"), "{}", view.body());
+    }
+
+    #[test]
+    fn enter_on_a_segment_shows_its_sections() {
+        let page = "\
+regions:
+  - __TEXT: 1 KiB
+    - __text: 4 B
+    - __stubs: 4 B
+    - __const: 4 B
+    - __cstring: 4 B
+    - __unwind: 4 B
+";
+        let mut view = View::spine(page);
+        view.open();
+        assert!(!view.body().contains("__text"), "{}", view.body());
+        view.down();
+        assert_eq!(view.cursor_key(), "__TEXT");
+        view.open();
+        assert!(view.body().contains("__text"), "{}", view.body());
     }
 
     #[test]
@@ -693,6 +901,34 @@ symbols:
         );
         assert!(text.contains("v load"), "{text}");
         assert!(text.contains("v needed"), "{text}");
+    }
+
+    #[test]
+    fn typing_shows_only_the_tree_down_to_each_hit() {
+        let mut view = View::spine(PAGE);
+        view.begin_search();
+        view.live("compat");
+        let text = view.body();
+        assert!(text.contains("compat: 1.0.0"), "{text}");
+        assert!(!text.contains("kind: shared"), "{text}");
+        view.live("");
+        assert!(view.body().contains("kind: shared"), "{}", view.body());
+    }
+
+    #[test]
+    fn cancel_restores_the_cursor_and_accept_keeps_the_hit() {
+        let mut view = View::spine(PAGE);
+        let start = view.cursor_key().to_string();
+        view.begin_search();
+        view.live("compat");
+        assert_eq!(view.cursor_key(), "compat");
+        view.cancel_search();
+        assert_eq!(view.cursor_key(), start);
+        view.begin_search();
+        view.live("compat");
+        view.accept_search();
+        assert_eq!(view.cursor_key(), "compat");
+        assert!(view.body().contains("kind: shared"), "{}", view.body());
     }
 
     #[test]

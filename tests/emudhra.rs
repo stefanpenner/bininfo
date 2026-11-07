@@ -10,7 +10,7 @@ how: cargo test scans each fixture with the distrusted policy.
 //! The check date is 2026-10-24.
 
 use bininfo::certs::{self, Container, Encoding, Hit, Kind};
-use bininfo::policy::{self, Report, Severity};
+use bininfo::policy::{Report, Severity};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

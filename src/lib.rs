@@ -5,30 +5,43 @@ uses: bininfo
 how: The bininfo command calls open, render, and facts.
 A caller uses certs to scan file bytes.
 A caller uses check_policy to judge those hits.
+sign checks a Mach-O or PE signature.
+open also reads a zip, a disk image, a TIFF file, and an MPQ archive.
 ---
 */
 
 //! Read one ELF, Mach-O, or PE file.
-//! `open` reads the bytes. `render` prints the page. `facts` feeds a claim.
-//! `elf`, `macho`, and `pe` read one format each.
+//! `open` also reads a zip, a disk image, a TIFF file, and an MPQ archive.
+//! A container has no start claim.
+//! `render` prints the page. `facts` feeds a claim.
 //! `certs` finds embedded certificates in file bytes.
 //! `policy` judges those hits.
 //! `check_policy` parses a policy and judges one file.
+//! `sign` checks a Mach-O or PE signature.
 
 pub mod certs;
 pub mod claim;
+pub mod dmg;
 pub mod elf;
 pub mod kind;
+pub mod links;
 pub mod macho;
+pub mod mpq;
 pub mod pe;
 pub mod policy;
+pub mod sign;
+pub mod summary;
+pub mod tiff;
+pub mod trust;
+pub mod zip;
 
+mod hash;
 mod library;
 mod style;
 
 use std::process::Command;
 
-/// One parsed ELF, Mach-O, or PE file.
+/// One parsed file. A container has no start claim.
 pub enum Binary {
     Elf {
         header: elf::header::Header,
@@ -45,6 +58,10 @@ pub enum Binary {
         load: pe::load::Load,
         symbols: pe::symbols::Symbols,
     },
+    Zip(zip::Archive),
+    Dmg(dmg::Image),
+    Tiff(tiff::Image),
+    Mpq(mpq::Archive),
 }
 
 /// Read one file. `rows` keeps symbol rows.
@@ -81,6 +98,20 @@ pub fn open(bytes: &[u8], rows: bool) -> Result<Binary, String> {
             load,
             symbols,
         });
+    }
+    if mpq::is_mpq(bytes) {
+        return Ok(Binary::Mpq(mpq::parse(bytes)?));
+    }
+    if tiff::is_tiff(bytes) {
+        return Ok(Binary::Tiff(tiff::parse(bytes)?));
+    }
+    // A koly trailer is checked before a zip end record.
+    // A disk image can hold that record.
+    if dmg::is_dmg(bytes) {
+        return Ok(Binary::Dmg(dmg::parse(bytes)?));
+    }
+    if zip::is_zip(bytes) {
+        return Ok(Binary::Zip(zip::parse(bytes)?));
     }
     Err("not an ELF, Mach-O, or PE file".into())
 }
@@ -121,17 +152,46 @@ pub fn render(path: &str, file: &Binary, json: bool, color: bool) -> String {
                 pe::page::render_with(path, header, load, symbols, color)
             }
         }
+        Binary::Zip(archive) => {
+            if json {
+                zip::page::render_json(path, archive)
+            } else {
+                zip::page::render(path, archive, color)
+            }
+        }
+        Binary::Dmg(image) => {
+            if json {
+                dmg::page::render_json(path, image)
+            } else {
+                dmg::page::render(path, image, color)
+            }
+        }
+        Binary::Tiff(image) => {
+            if json {
+                tiff::page::render_json(path, image)
+            } else {
+                tiff::page::render(path, image, color)
+            }
+        }
+        Binary::Mpq(archive) => {
+            if json {
+                mpq::page::render_json(path, archive)
+            } else {
+                mpq::page::render(path, archive, color)
+            }
+        }
     }
 }
 
 /// Build the facts a claim checks. `host` does not change the hermetic result.
-pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
+/// A container has no start claim.
+pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> Result<claim::Facts, String> {
     match file {
         Binary::Elf {
             header,
             load,
             symbols,
-        } => claim::Facts {
+        } => Ok(claim::Facts {
             file: path.to_string(),
             format: "elf",
             kind: load.kind,
@@ -140,12 +200,12 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
             pie: load.pie,
             fat_hermetic: None,
             host: claim::host_marks(&elf::symbols::floors(header, symbols), host),
-        },
+        }),
         Binary::Macho {
             image,
             commands,
             slices,
-        } => claim::Facts {
+        } => Ok(claim::Facts {
             file: path.to_string(),
             format: "macho",
             kind: commands.load.kind,
@@ -154,12 +214,12 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
             pie: commands.load.pie,
             fat_hermetic: macho::load::fat_hermetic(slices),
             host: claim::host_marks(&macho::symbols::floors(image, commands, slices), host),
-        },
+        }),
         Binary::Pe {
             header,
             load,
             symbols,
-        } => claim::Facts {
+        } => Ok(claim::Facts {
             file: path.to_string(),
             format: "pe",
             kind: load.kind,
@@ -168,7 +228,10 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
             pie: load.pie,
             fat_hermetic: None,
             host: claim::host_marks(&pe::symbols::floors(header, symbols), host),
-        },
+        }),
+        Binary::Zip(_) | Binary::Dmg(_) | Binary::Tiff(_) | Binary::Mpq(_) => {
+            Err("no start claim".into())
+        }
     }
 }
 

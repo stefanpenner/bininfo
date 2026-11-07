@@ -49,7 +49,7 @@ fn a_caller_opens_one_elf_and_checks_a_claim() {
     let json = bininfo::render("tiny", &file, true, false);
     assert!(json.contains(r#""kind":"static""#), "{json}");
 
-    let facts = bininfo::facts("tiny", &file, &host());
+    let facts = bininfo::facts("tiny", &file, &host()).unwrap();
     assert_eq!(facts.kind, Kind::Static);
     assert_eq!(kind::name(facts.kind), "static");
     let claims = bininfo::claim::parse(&["hermetic".to_string()]).unwrap();

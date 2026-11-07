@@ -6,6 +6,7 @@ how: Each page file calls this file to align a field and a note.
 A long value keeps its note on the same line.
 A file list paints the directory gray and the library name white.
 A note is a light blue.
+A counted list keeps the count and one row per name.
 ---
 */
 
@@ -27,6 +28,9 @@ pub const TEAL: Rgb = Rgb(0x08, 0xbd, 0xba);
 pub const BLUE: Rgb = Rgb(0x78, 0xa9, 0xff);
 pub const CYAN: Rgb = Rgb(0x33, 0xb1, 0xff);
 pub const MAGENTA: Rgb = Rgb(0xbe, 0x95, 0xff);
+pub const RED: Rgb = Rgb(0xff, 0x5c, 0x5c);
+pub const CRITICAL: Rgb = Rgb(0xff, 0x2d, 0x95);
+pub const AMBER: Rgb = Rgb(0xf5, 0xb0, 0x42);
 pub const PINK: Rgb = Rgb(0xff, 0x7e, 0xb6);
 pub const WHITE: Rgb = Rgb(0xdf, 0xdf, 0xe0);
 
@@ -76,6 +80,21 @@ pub fn raw_field(
         fg,
         bold,
     );
+}
+
+/// Byte count a person can read: `812 B`, `246.5 KiB`, `1.2 MiB`.
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1023.95 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 /// Header hex. Digits are `A` through `F`, as in `0xCAFEBABE`.
@@ -141,6 +160,44 @@ pub fn noted_list(
         Some(note_of),
         true,
     );
+}
+
+/// The count stays on the key. Each name is one row under that key.
+pub fn members(
+    out: &mut String,
+    color: bool,
+    indent: usize,
+    key: &str,
+    count: u64,
+    names: &[String],
+    note: &str,
+) {
+    field(
+        out,
+        color,
+        indent,
+        key,
+        &count.to_string(),
+        note,
+        WHITE,
+        false,
+    );
+    let gap = " ".repeat(indent + 2);
+    for name in names {
+        let _ = writeln!(out, "{gap}- {}", yaml_scalar(name));
+    }
+    more_row(
+        out,
+        indent + 2,
+        (count as usize).saturating_sub(names.len()),
+    );
+}
+
+pub(crate) fn more_row(out: &mut String, indent: usize, hidden: usize) {
+    if hidden == 0 {
+        return;
+    }
+    let _ = writeln!(out, "{}- more: {hidden}", " ".repeat(indent));
 }
 
 fn write_list(
@@ -482,9 +539,13 @@ impl Json {
         &mut self,
         kind: &str,
         interp: Option<&str>,
+        soname: Option<&str>,
         needed: &[String],
+        filter: &[String],
+        auxiliary: &[String],
         runpath: &[String],
         rpath: &[String],
+        flags: &[String],
         delay: &[String],
         dlopen: Option<bool>,
         pie: bool,
@@ -497,12 +558,23 @@ impl Json {
             Some(path) => self.out.push_str(&json_str(path)),
             None => self.out.push_str("null"),
         }
+        self.out.push_str(",\"soname\":");
+        match soname {
+            Some(name) => self.out.push_str(&json_str(name)),
+            None => self.out.push_str("null"),
+        }
         self.out.push_str(",\"needed\":[");
         append_strings(&mut self.out, needed);
+        self.out.push_str("],\"filter\":[");
+        append_strings(&mut self.out, filter);
+        self.out.push_str("],\"auxiliary\":[");
+        append_strings(&mut self.out, auxiliary);
         self.out.push_str("],\"runpath\":[");
         append_strings(&mut self.out, runpath);
         self.out.push_str("],\"rpath\":[");
         append_strings(&mut self.out, rpath);
+        self.out.push_str("],\"flags\":[");
+        append_strings(&mut self.out, flags);
         self.out.push_str("],\"delay\":[");
         append_strings(&mut self.out, delay);
         self.out.push_str("],\"dlopen\":");
@@ -537,6 +609,18 @@ impl Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_sizes_pick_a_unit() {
+        assert_eq!(human(0), "0 B");
+        assert_eq!(human(1023), "1023 B");
+        assert_eq!(human(1024), "1.0 KiB");
+        assert_eq!(human(253_584), "247.6 KiB");
+        assert_eq!(human(1_572_864), "1.5 MiB");
+        assert_eq!(human(1_048_575), "1.0 MiB");
+        assert_eq!(human(5 * 1024 * 1024 * 1024), "5.0 GiB");
+        assert_eq!(human(u64::MAX), "16384.0 PiB");
+    }
 
     #[test]
     fn hex_uses_uppercase_digits() {
