@@ -6,13 +6,13 @@ how: The bininfo command calls open, render, and facts.
 A caller uses certs to scan file bytes.
 A caller uses check_policy to judge those hits.
 sign checks a Mach-O or PE signature.
-open also reads a zip, a disk image, a TIFF file, and an MPQ archive.
+open also reads each file type in the formats folder.
 ---
 */
 
 //! Read one ELF, Mach-O, or PE file.
-//! `open` also reads a zip, a disk image, a TIFF file, and an MPQ archive.
-//! A container has no start claim.
+//! `open` also reads each file type in the formats folder.
+//! A file in that folder has no start claim.
 //! `render` prints the page. `facts` feeds a claim.
 //! `certs` finds embedded certificates in file bytes.
 //! `policy` judges those hits.
@@ -21,19 +21,18 @@ open also reads a zip, a disk image, a TIFF file, and an MPQ archive.
 
 pub mod certs;
 pub mod claim;
-pub mod dmg;
 pub mod elf;
+pub mod formats;
 pub mod kind;
 pub mod links;
 pub mod macho;
-pub mod mpq;
 pub mod pe;
 pub mod policy;
 pub mod sign;
 pub mod summary;
-pub mod tiff;
 pub mod trust;
-pub mod zip;
+
+pub use formats::{dmg, mpq, tiff, zip};
 
 mod hash;
 mod library;
@@ -58,10 +57,7 @@ pub enum Binary {
         load: pe::load::Load,
         symbols: pe::symbols::Symbols,
     },
-    Zip(zip::Archive),
-    Dmg(dmg::Image),
-    Tiff(tiff::Image),
-    Mpq(mpq::Archive),
+    Format(formats::File),
 }
 
 /// Read one file. `rows` keeps symbol rows.
@@ -99,19 +95,8 @@ pub fn open(bytes: &[u8], rows: bool) -> Result<Binary, String> {
             symbols,
         });
     }
-    if mpq::is_mpq(bytes) {
-        return Ok(Binary::Mpq(mpq::parse(bytes)?));
-    }
-    if tiff::is_tiff(bytes) {
-        return Ok(Binary::Tiff(tiff::parse(bytes)?));
-    }
-    // A koly trailer is checked before a zip end record.
-    // A disk image can hold that record.
-    if dmg::is_dmg(bytes) {
-        return Ok(Binary::Dmg(dmg::parse(bytes)?));
-    }
-    if zip::is_zip(bytes) {
-        return Ok(Binary::Zip(zip::parse(bytes)?));
+    if let Some(found) = formats::open(bytes) {
+        return found.map(Binary::Format);
     }
     Err("not an ELF, Mach-O, or PE file".into())
 }
@@ -152,34 +137,7 @@ pub fn render(path: &str, file: &Binary, json: bool, color: bool) -> String {
                 pe::page::render_with(path, header, load, symbols, color)
             }
         }
-        Binary::Zip(archive) => {
-            if json {
-                zip::page::render_json(path, archive)
-            } else {
-                zip::page::render(path, archive, color)
-            }
-        }
-        Binary::Dmg(image) => {
-            if json {
-                dmg::page::render_json(path, image)
-            } else {
-                dmg::page::render(path, image, color)
-            }
-        }
-        Binary::Tiff(image) => {
-            if json {
-                tiff::page::render_json(path, image)
-            } else {
-                tiff::page::render(path, image, color)
-            }
-        }
-        Binary::Mpq(archive) => {
-            if json {
-                mpq::page::render_json(path, archive)
-            } else {
-                mpq::page::render(path, archive, color)
-            }
-        }
+        Binary::Format(file) => formats::render(path, file, json, color),
     }
 }
 
@@ -229,9 +187,7 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> Result<claim::Fac
             fat_hermetic: None,
             host: claim::host_marks(&pe::symbols::floors(header, symbols), host),
         }),
-        Binary::Zip(_) | Binary::Dmg(_) | Binary::Tiff(_) | Binary::Mpq(_) => {
-            Err("no start claim".into())
-        }
+        Binary::Format(_) => Err("no start claim".into()),
     }
 }
 

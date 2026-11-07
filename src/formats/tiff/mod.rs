@@ -3,13 +3,15 @@
 why: This file reads one TIFF header and the IFD tags.
 uses: bininfo
 how: bininfo calls this file when the bytes are a TIFF file.
-A Sony ARW file is a TIFF file.
+DNG, CR2, NEF, ORF, RW2, PEF, and ARW share this reader.
 This file does not decode the sensor bytes.
 ---
 */
 
-//! One TIFF file. An ARW file is a TIFF file whose make is SONY.
-//! Compression 32767 is also ARW. This module does not decode sensor bytes.
+//! One TIFF file.
+//! DNG, CR2, NEF, ORF, RW2, PEF, and ARW use this reader.
+//! ORF and RW2 use the same IFD walk.
+//! This module does not decode sensor bytes.
 
 pub mod page;
 
@@ -25,8 +27,15 @@ const HEIGHT: u16 = 257;
 const BITS: u16 = 258;
 const COMPRESSION: u16 = 259;
 const STRIP: u16 = 273;
+const ORIENTATION: u16 = 274;
 const SUBIFD: u16 = 330;
 const JPEG: u16 = 513;
+const EXPOSURE: u16 = 33434;
+const FNUMBER: u16 = 33437;
+const ISO: u16 = 34855;
+const DATETIME: u16 = 36867;
+const LENS: u16 = 42036;
+const DNG_VERSION: u16 = 50706;
 
 /// Byte order of the TIFF file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,10 +53,16 @@ impl Order {
     }
 }
 
-/// `arw` is a Sony TIFF. `tiff` is any other TIFF.
+/// TIFF profile word. `tiff` is the fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Arw,
+    Dng,
+    Cr2,
+    Nef,
+    Orf,
+    Rw2,
+    Pef,
     Tiff,
 }
 
@@ -55,9 +70,22 @@ impl Profile {
     pub fn name(self) -> &'static str {
         match self {
             Self::Arw => "arw",
+            Self::Dng => "dng",
+            Self::Cr2 => "cr2",
+            Self::Nef => "nef",
+            Self::Orf => "orf",
+            Self::Rw2 => "rw2",
+            Self::Pef => "pef",
             Self::Tiff => "tiff",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Classic,
+    Orf,
+    Rw2,
 }
 
 /// One IFD. `role` is `ifd` or `subifd`.
@@ -69,14 +97,23 @@ pub struct Ifd {
     pub role: &'static str,
 }
 
-/// One TIFF image. Width and height come from the chosen frame.
-/// The chosen frame is the ARW compression frame, or the widest frame.
+/// One TIFF image.
+/// The chosen frame supplies width, height, bits, compression, strip, and jpeg.
+/// The first frame that has each tag supplies that photo field.
+/// The chosen frame is compression 32767, or the widest frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image {
     pub order: Order,
     pub profile: Profile,
     pub make: Option<String>,
     pub model: Option<String>,
+    pub orientation: Option<u64>,
+    pub iso: Option<u64>,
+    pub exposure: Option<String>,
+    pub fnumber: Option<String>,
+    pub lens: Option<String>,
+    pub datetime: Option<String>,
+    pub dng_version: Option<String>,
     pub compression: Option<u16>,
     pub width: Option<u64>,
     pub height: Option<u64>,
@@ -92,6 +129,14 @@ struct Frame {
     ifd: Ifd,
     make: Option<String>,
     model: Option<String>,
+    orientation: Option<u64>,
+    iso: Option<u64>,
+    exposure: Option<String>,
+    fnumber: Option<String>,
+    lens: Option<String>,
+    datetime: Option<String>,
+    dng_version: Option<String>,
+    has_dng: bool,
     compression: Option<u16>,
     width: Option<u64>,
     height: Option<u64>,
@@ -100,14 +145,14 @@ struct Frame {
     jpeg: Option<u64>,
 }
 
-/// True when the bytes start with a classic TIFF header.
+/// True when the bytes have a TIFF, ORF, or RW2 header.
 pub fn is_tiff(bytes: &[u8]) -> bool {
     header(bytes).is_some()
 }
 
 /// Read the header and the IFD tags. This function does not decode sensor bytes.
 pub fn parse(bytes: &[u8]) -> Result<Image, String> {
-    let (order, ifd0) = header(bytes).ok_or("not a tiff file")?;
+    let (order, ifd0, kind) = header(bytes).ok_or("not a tiff file")?;
     let (frames, more) = walk(bytes, order, ifd0)?;
     if frames.is_empty() {
         return Err("tiff ifd is outside this file".into());
@@ -115,20 +160,19 @@ pub fn parse(bytes: &[u8]) -> Result<Image, String> {
     let chosen = choose(&frames);
     let make = frames.iter().find_map(|frame| frame.make.clone());
     let model = frames.iter().find_map(|frame| frame.model.clone());
-    let profile = if make
-        .as_deref()
-        .is_some_and(|text| text.eq_ignore_ascii_case("SONY"))
-        || frames.iter().any(|frame| frame.compression == Some(32767))
-    {
-        Profile::Arw
-    } else {
-        Profile::Tiff
-    };
+    let profile = profile_of(bytes, kind, &frames, make.as_deref());
     Ok(Image {
         order,
         profile,
         make,
         model,
+        orientation: frames.iter().find_map(|frame| frame.orientation),
+        iso: frames.iter().find_map(|frame| frame.iso),
+        exposure: frames.iter().find_map(|frame| frame.exposure.clone()),
+        fnumber: frames.iter().find_map(|frame| frame.fnumber.clone()),
+        lens: frames.iter().find_map(|frame| frame.lens.clone()),
+        datetime: frames.iter().find_map(|frame| frame.datetime.clone()),
+        dng_version: frames.iter().find_map(|frame| frame.dng_version.clone()),
         compression: chosen.compression,
         width: chosen.width,
         height: chosen.height,
@@ -150,21 +194,51 @@ pub fn compression_name(value: u16) -> Option<&'static str> {
         8 => "deflate",
         32767 => "sony-arw",
         32773 => "packbits",
+        34713 => "nikon-nef",
+        65535 => "pentax",
         _ => return None,
     })
 }
 
-fn header(bytes: &[u8]) -> Option<(Order, u64)> {
+fn profile_of(bytes: &[u8], kind: Kind, frames: &[Frame], make: Option<&str>) -> Profile {
+    // The CR2 mark is at bytes 8..10. That mark is not the IFD.
+    if kind == Kind::Classic && bytes.get(8..10).is_some_and(|mark| mark == b"CR") {
+        return Profile::Cr2;
+    }
+    if frames.iter().any(|frame| frame.has_dng) {
+        return Profile::Dng;
+    }
+    if kind == Kind::Orf {
+        return Profile::Orf;
+    }
+    if kind == Kind::Rw2 {
+        return Profile::Rw2;
+    }
+    if make.is_some_and(|text| text.eq_ignore_ascii_case("SONY"))
+        || frames.iter().any(|frame| frame.compression == Some(32767))
+    {
+        return Profile::Arw;
+    }
+    if make.is_some_and(|text| ascii_prefix(text, "NIKON")) {
+        return Profile::Nef;
+    }
+    if make.is_some_and(|text| ascii_prefix(text, "PENTAX")) {
+        return Profile::Pef;
+    }
+    Profile::Tiff
+}
+
+fn ascii_prefix(text: &str, prefix: &str) -> bool {
+    let raw = text.as_bytes();
+    let head = prefix.as_bytes();
+    raw.len() >= head.len() && raw[..head.len()].eq_ignore_ascii_case(head)
+}
+
+fn header(bytes: &[u8]) -> Option<(Order, u64, Kind)> {
     if bytes.len() < 8 {
         return None;
     }
-    let order = if bytes.starts_with(b"II*\0") {
-        Order::Little
-    } else if bytes.starts_with(b"MM\0*") {
-        Order::Big
-    } else {
-        return None;
-    };
+    let (order, kind) = header_kind(bytes)?;
     let off = u64::from(u32_at(bytes, 4, order)?);
     if off < 8 {
         return None;
@@ -173,7 +247,23 @@ fn header(bytes: &[u8]) -> Option<(Order, u64)> {
     if at.checked_add(2)? > bytes.len() {
         return None;
     }
-    Some((order, off))
+    Some((order, off, kind))
+}
+
+fn header_kind(bytes: &[u8]) -> Option<(Order, Kind)> {
+    if bytes.starts_with(b"II*\0") {
+        Some((Order::Little, Kind::Classic))
+    } else if bytes.starts_with(b"MM\0*") {
+        Some((Order::Big, Kind::Classic))
+    } else if bytes.starts_with(b"IIRS") {
+        Some((Order::Little, Kind::Orf))
+    } else if bytes.starts_with(b"MMOR") {
+        Some((Order::Big, Kind::Orf))
+    } else if bytes.starts_with(b"IIU\0") {
+        Some((Order::Little, Kind::Rw2))
+    } else {
+        None
+    }
 }
 
 fn walk(bytes: &[u8], order: Order, ifd0: u64) -> Result<(Vec<Frame>, bool), String> {
@@ -241,6 +331,14 @@ fn read_ifd(
         },
         make: None,
         model: None,
+        orientation: None,
+        iso: None,
+        exposure: None,
+        fnumber: None,
+        lens: None,
+        datetime: None,
+        dng_version: None,
+        has_dng: false,
         compression: None,
         width: None,
         height: None,
@@ -255,6 +353,20 @@ fn read_ifd(
         match tag {
             MAKE => frame.make = ascii(bytes, order, entry),
             MODEL => frame.model = ascii(bytes, order, entry),
+            ORIENTATION => {
+                if u16_at(bytes, entry + 2, order) == Some(3) {
+                    frame.orientation = first_int(bytes, order, entry);
+                }
+            }
+            ISO => frame.iso = first_int(bytes, order, entry),
+            EXPOSURE => frame.exposure = ratio(bytes, order, entry),
+            FNUMBER => frame.fnumber = ratio(bytes, order, entry),
+            LENS => frame.lens = ascii(bytes, order, entry),
+            DATETIME => frame.datetime = ascii(bytes, order, entry),
+            DNG_VERSION => {
+                frame.has_dng = true;
+                frame.dng_version = dng_version(bytes, order, entry);
+            }
             WIDTH => frame.width = first_int(bytes, order, entry),
             HEIGHT => frame.height = first_int(bytes, order, entry),
             BITS => frame.bits = first_int(bytes, order, entry),
@@ -316,6 +428,47 @@ fn choose(frames: &[Frame]) -> &Frame {
         .iter()
         .max_by_key(|frame| frame.width.unwrap_or(0))
         .unwrap_or(&frames[0])
+}
+
+fn ratio(bytes: &[u8], order: Order, entry: usize) -> Option<String> {
+    let kind = u16_at(bytes, entry + 2, order)?;
+    if kind != 5 && kind != 10 {
+        return None;
+    }
+    let count = u32_at(bytes, entry + 4, order)?;
+    if count == 0 {
+        return None;
+    }
+    let off = u32_at(bytes, entry + 8, order)? as usize;
+    let raw = bytes.get(off..off.checked_add(8)?)?;
+    let num = word(&raw[..4], order)?;
+    let den = word(&raw[4..8], order)?;
+    if den == 0 {
+        return None;
+    }
+    if kind == 5 {
+        return Some(format!("{num}/{den}"));
+    }
+    Some(format!("{}/{}", num as i32, den as i32))
+}
+
+fn word(raw: &[u8], order: Order) -> Option<u32> {
+    let raw: [u8; 4] = raw.get(..4)?.try_into().ok()?;
+    Some(match order {
+        Order::Little => u32::from_le_bytes(raw),
+        Order::Big => u32::from_be_bytes(raw),
+    })
+}
+
+fn dng_version(bytes: &[u8], order: Order, entry: usize) -> Option<String> {
+    if u16_at(bytes, entry + 2, order)? != 1 {
+        return None;
+    }
+    if u32_at(bytes, entry + 4, order)? != 4 {
+        return None;
+    }
+    let raw = bytes.get(entry + 8..entry + 12)?;
+    Some(format!("{}.{}.{}.{}", raw[0], raw[1], raw[2], raw[3]))
 }
 
 fn ascii(bytes: &[u8], order: Order, entry: usize) -> Option<String> {
@@ -510,5 +663,141 @@ mod tests {
         let mut junk = vec![0u8; 4096];
         junk[..4].copy_from_slice(b"II*\0");
         let _ = parse(&junk);
+    }
+
+    fn little(magic: &[u8], entries: u16, extra: usize) -> Vec<u8> {
+        let body = 2 + usize::from(entries) * 12 + 4;
+        let mut bytes = vec![0u8; 8 + body + extra];
+        bytes[..4].copy_from_slice(magic);
+        bytes[4] = 8;
+        bytes[8..10].copy_from_slice(&entries.to_le_bytes());
+        bytes
+    }
+
+    fn put_text(bytes: &mut [u8], make: &[u8]) {
+        let at = (bytes.len() - make.len()) as u32;
+        put_entry(bytes, 10, 271, 2, make.len() as u32, at);
+        let end = bytes.len();
+        bytes[end - make.len()..].copy_from_slice(make);
+    }
+
+    #[test]
+    fn a_dng_version_beats_a_sony_make() {
+        let mut bytes = little(b"II*\0", 2, 0);
+        put_entry(&mut bytes, 10, 271, 2, 4, u32::from_le_bytes(*b"SONY"));
+        put_entry(
+            &mut bytes,
+            22,
+            50706,
+            1,
+            4,
+            u32::from_le_bytes([1, 4, 0, 0]),
+        );
+        let image = parse(&bytes).unwrap();
+        assert_eq!(image.profile, Profile::Dng);
+        assert_eq!(image.make.as_deref(), Some("SONY"));
+        assert_eq!(image.dng_version.as_deref(), Some("1.4.0.0"));
+        let page = page::render("a.dng", &image, false);
+        assert!(page.contains("format: dng"), "{page}");
+        assert!(page.contains("dng_version: 1.4.0.0"), "{page}");
+        assert!(!page.contains("format: arw"), "{page}");
+        let json = page::render_json("a.dng", &image);
+        assert!(json.contains(r#""format":"dng""#), "{json}");
+        assert!(json.contains(r#""dng_version":"1.4.0.0""#), "{json}");
+        assert!(!json.contains(r#""format":"arw""#), "{json}");
+    }
+
+    #[test]
+    fn a_cr2_mark_is_cr2() {
+        let mut bytes = vec![0u8; 34];
+        bytes[..4].copy_from_slice(b"II*\0");
+        bytes[4] = 16;
+        bytes[8] = b'C';
+        bytes[9] = b'R';
+        bytes[16] = 1;
+        put_entry(&mut bytes, 18, 256, 3, 1, 8);
+        let image = parse(&bytes).unwrap();
+        assert_eq!(image.profile, Profile::Cr2);
+        assert_eq!(image.ifd0, 16);
+        assert_eq!(image.width, Some(8));
+        let page = page::render("a.cr2", &image, false);
+        assert!(page.contains("format: cr2"), "{page}");
+    }
+
+    #[test]
+    fn a_nikon_make_is_nef() {
+        let make = b"NIKON CORPORATION";
+        let mut bytes = little(b"II*\0", 2, make.len());
+        put_text(&mut bytes, make);
+        put_entry(&mut bytes, 22, 259, 3, 1, 34713);
+        let image = parse(&bytes).unwrap();
+        assert_eq!(image.profile, Profile::Nef);
+        assert_eq!(image.compression, Some(34713));
+        let page = page::render("a.nef", &image, false);
+        assert!(page.contains("format: nef"), "{page}");
+        assert!(page.contains("compression: nikon-nef (34713)"), "{page}");
+    }
+
+    #[test]
+    fn an_orf_header_is_orf() {
+        let make = b"OLYMPUS";
+        let mut bytes = little(b"IIRS", 1, make.len());
+        put_text(&mut bytes, make);
+        let image = parse(&bytes).unwrap();
+        assert_eq!(image.profile, Profile::Orf);
+        assert_eq!(image.make.as_deref(), Some("OLYMPUS"));
+        let page = page::render("a.orf", &image, false);
+        assert!(page.contains("format: orf"), "{page}");
+    }
+
+    #[test]
+    fn an_rw2_header_is_rw2() {
+        let mut bytes = little(b"IIU\0", 1, 0);
+        put_entry(&mut bytes, 10, 256, 3, 1, 4);
+        let image = parse(&bytes).unwrap();
+        assert_eq!(image.profile, Profile::Rw2);
+        let page = page::render("a.rw2", &image, false);
+        assert!(page.contains("format: rw2"), "{page}");
+    }
+
+    #[test]
+    fn a_pentax_make_is_pef() {
+        let make = b"PENTAX";
+        let mut bytes = little(b"II*\0", 1, make.len());
+        put_text(&mut bytes, make);
+        let image = parse(&bytes).unwrap();
+        assert_eq!(image.profile, Profile::Pef);
+        assert_eq!(image.make.as_deref(), Some("PENTAX"));
+        let page = page::render("a.pef", &image, false);
+        assert!(page.contains("format: pef"), "{page}");
+    }
+
+    #[test]
+    fn an_exposure_fraction_prints_or_stays_null() {
+        let mut ok = little(b"II*\0", 1, 8);
+        put_entry(&mut ok, 10, 33434, 5, 1, 26);
+        ok[26..30].copy_from_slice(&1u32.to_le_bytes());
+        ok[30..34].copy_from_slice(&100u32.to_le_bytes());
+        let image = parse(&ok).unwrap();
+        assert_eq!(image.exposure.as_deref(), Some("1/100"));
+        let page = page::render("a.tif", &image, false);
+        assert!(page.contains("exposure: 1/100"), "{page}");
+
+        let mut bad = little(b"II*\0", 1, 8);
+        put_entry(&mut bad, 10, 33434, 5, 1, 26);
+        bad[26..30].copy_from_slice(&1u32.to_le_bytes());
+        let image = parse(&bad).unwrap();
+        assert_eq!(image.exposure, None);
+        let page = page::render("a.tif", &image, false);
+        assert!(page.contains("exposure: null"), "{page}");
+        let json = page::render_json("a.tif", &image);
+        assert!(json.contains(r#""exposure":null"#), "{json}");
+    }
+
+    #[test]
+    fn a_truncated_orf_header_returns_an_error() {
+        assert!(parse(b"IIR").is_err());
+        assert!(parse(b"IIRS").is_err());
+        assert!(parse(b"IIRS\x08\x00\x00\x00").is_err());
     }
 }

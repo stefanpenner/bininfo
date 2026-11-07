@@ -3,6 +3,7 @@
 why: This file tells a reader what bininfo prints and how to run it.
 uses: a reader
 how: The reader opens this file in the repo.
+The type list links each type to its reader.
 ---
 -->
 
@@ -10,14 +11,52 @@ how: The reader opens this file in the repo.
 
 ## What is this?
 
-`bininfo` reads one ELF, Mach-O, or PE file.
-It also reads one zip, one disk image, one TIFF file, and one MPQ archive.
-A container has no start claim.
-It prints one page for that file.
-The page uses the same words for each format.
-The page has type, load, symbols, sizes, where, and sections.
+`bininfo` reads one file and prints one page.
+ELF, Mach-O, and PE have a start claim.
+Each other type has no start claim.
+A start page has type, load, symbols, sizes, where, and sections.
 The load rung also shows soname, filter, auxiliary, and flags.
 The sign rung says whether a Mach-O or PE signature is valid.
+
+## File types
+
+The format word is the type name.
+The link opens the reader for that type.
+Several raw words share one TIFF reader.
+Several media words share one ISOBMFF reader.
+The sniff list is [`src/formats/mod.rs`](src/formats/mod.rs).
+
+| type | claim | reader |
+| --- | --- | --- |
+| `7z` | none | [`src/formats/sevenz/mod.rs`](src/formats/sevenz/mod.rs) |
+| `ar` | none | [`src/formats/ar/mod.rs`](src/formats/ar/mod.rs) |
+| `arw` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `avif` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `cpio` | none | [`src/formats/cpio/mod.rs`](src/formats/cpio/mod.rs) |
+| `cr2` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `cr3` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `dmg` | none | [`src/formats/dmg/mod.rs`](src/formats/dmg/mod.rs) |
+| `dng` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `elf` | start | [`src/elf/mod.rs`](src/elf/mod.rs) |
+| `heic` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `heif` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `jpeg` | none | [`src/formats/jpeg/mod.rs`](src/formats/jpeg/mod.rs) |
+| `macho` | start | [`src/macho/mod.rs`](src/macho/mod.rs) |
+| `mov` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `mp4` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `mpq` | none | [`src/formats/mpq/mod.rs`](src/formats/mpq/mod.rs) |
+| `nef` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `orf` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `pe` | start | [`src/pe/mod.rs`](src/pe/mod.rs) |
+| `pef` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `rw2` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `tar` | none | [`src/formats/tar/mod.rs`](src/formats/tar/mod.rs) |
+| `tiff` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `wasm` | none | [`src/formats/wasm/mod.rs`](src/formats/wasm/mod.rs) |
+| `zip` | none | [`src/formats/zip/mod.rs`](src/formats/zip/mod.rs) |
+
+A printable ISO brand that is not in this table keeps that brand as the type word.
+The word `isobmff` means the brand is not text.
 
 ## Why does it exist?
 
@@ -59,10 +98,9 @@ The crate is not on crates.io. `publish` is false.
 ## Use the library
 
 The same repo is a library. The command calls that library.
-`elf`, `macho`, and `pe` each read one format.
-`zip`, `dmg`, `tiff`, and `mpq` each read one container.
+Each type in the list above has one reader.
 `claim` checks one claim.
-`open` reads a start file or a container.
+`open` reads one file.
 
 A Rust project can depend on a local checkout.
 

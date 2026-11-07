@@ -3,6 +3,7 @@
 why: This file writes one TIFF file as one text page.
 uses: bininfo
 how: bininfo calls this file after it reads the IFD tags.
+This file prints the profile and the photo fields.
 This file does not read TIFF bytes.
 ---
 */
@@ -16,27 +17,13 @@ use std::fmt::Write;
 
 pub fn render(file: &str, image: &Image, color: bool) -> String {
     let mut out = String::new();
-    style::field(
+    crate::formats::chrome::head(
         &mut out,
         color,
-        0,
-        "file",
         file,
-        "Path of this file.",
-        style::WHITE,
-        false,
-    );
-    style::field(
-        &mut out,
-        color,
-        0,
-        "format",
         image.profile.name(),
         format_note(image.profile),
-        style::FG,
-        true,
     );
-    style::blank(&mut out);
     type_rung(&mut out, image, color);
     style::blank(&mut out);
     image_rung(&mut out, image, color);
@@ -49,11 +36,17 @@ pub fn render(file: &str, image: &Image, color: bool) -> String {
 
 pub fn render_json(file: &str, image: &Image) -> String {
     let mut out = Json::new();
-    out.str("file", file);
-    out.str("format", image.profile.name());
+    crate::formats::chrome::json_head(&mut out, file, image.profile.name());
     out.str("order", image.order.name());
     out.opt("make", image.make.as_deref());
     out.opt("model", image.model.as_deref());
+    opt_u64(&mut out, "orientation", image.orientation);
+    opt_u64(&mut out, "iso", image.iso);
+    out.opt("exposure", image.exposure.as_deref());
+    out.opt("fnumber", image.fnumber.as_deref());
+    out.opt("lens", image.lens.as_deref());
+    out.opt("datetime", image.datetime.as_deref());
+    out.opt("dng_version", image.dng_version.as_deref());
     match image.compression {
         Some(value) => {
             out.opt("compression", compression_name(value));
@@ -78,7 +71,7 @@ fn type_rung(out: &mut String, image: &Image, color: bool) {
         out,
         color,
         "type",
-        "Byte order, make, and compression.",
+        "Byte order, make, photo fields, and compression.",
         style::GREEN,
         true,
     );
@@ -88,7 +81,7 @@ fn type_rung(out: &mut String, image: &Image, color: bool) {
         2,
         "profile",
         image.profile.name(),
-        "arw when the make is SONY or compression is 32767.",
+        "Profile name of this TIFF file.",
         style::FG,
         true,
     );
@@ -105,27 +98,44 @@ fn type_rung(out: &mut String, image: &Image, color: bool) {
         },
         false,
     );
-    let (make, make_fg, make_bold) = text_or_null(image.make.as_deref());
-    style::field(
+    text_field(out, color, "make", image.make.as_deref(), "Camera make.");
+    text_field(out, color, "model", image.model.as_deref(), "Camera model.");
+    number_field(
         out,
         color,
-        2,
-        "make",
-        make,
-        "Camera make. SONY marks an ARW.",
-        make_fg,
-        make_bold,
+        "orientation",
+        image.orientation,
+        "Orientation of the photo.",
     );
-    let (model, model_fg, model_bold) = text_or_null(image.model.as_deref());
-    style::field(
+    number_field(out, color, "iso", image.iso, "ISO of the photo.");
+    text_field(
         out,
         color,
-        2,
-        "model",
-        model,
-        "Camera model.",
-        model_fg,
-        model_bold,
+        "exposure",
+        image.exposure.as_deref(),
+        "Exposure time as a fraction.",
+    );
+    text_field(
+        out,
+        color,
+        "fnumber",
+        image.fnumber.as_deref(),
+        "F number as a fraction.",
+    );
+    text_field(out, color, "lens", image.lens.as_deref(), "Lens name.");
+    text_field(
+        out,
+        color,
+        "datetime",
+        image.datetime.as_deref(),
+        "Date and time of the photo.",
+    );
+    text_field(
+        out,
+        color,
+        "dng_version",
+        image.dng_version.as_deref(),
+        "DNG version tag 50706.",
     );
     let compression = match image.compression {
         Some(value) => style::named(compression_name(value), u64::from(value)),
@@ -272,6 +282,11 @@ fn number_field(out: &mut String, color: bool, key: &str, value: Option<u64>, no
     style::field(out, color, 2, key, &text, note, fg, bold);
 }
 
+fn text_field(out: &mut String, color: bool, key: &str, value: Option<&str>, note: &str) {
+    let (text, fg, bold) = text_or_null(value);
+    style::field(out, color, 2, key, text, note, fg, bold);
+}
+
 fn text_or_null(value: Option<&str>) -> (&str, style::Rgb, bool) {
     match value {
         Some(text) => (text, style::WHITE, false),
@@ -282,6 +297,12 @@ fn text_or_null(value: Option<&str>) -> (&str, style::Rgb, bool) {
 fn format_note(profile: Profile) -> &'static str {
     match profile {
         Profile::Arw => "Sony ARW. This TIFF file has no start claim.",
+        Profile::Dng => "DNG raw. This TIFF file has no start claim.",
+        Profile::Cr2 => "Canon CR2. This TIFF file has no start claim.",
+        Profile::Nef => "Nikon NEF. This TIFF file has no start claim.",
+        Profile::Orf => "Olympus ORF. This TIFF file has no start claim.",
+        Profile::Rw2 => "Panasonic RW2. This TIFF file has no start claim.",
+        Profile::Pef => "Pentax PEF. This TIFF file has no start claim.",
         Profile::Tiff => "A TIFF file has no start claim.",
     }
 }
