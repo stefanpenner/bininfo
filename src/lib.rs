@@ -4,13 +4,14 @@ why: This file is the library a caller uses.
 uses: bininfo
 how: The bininfo command calls open, render, and facts.
 A caller uses certs to scan file bytes.
-sign checks a Mach-O or PE signature.
+open also reads one MPQ archive.
 ---
 */
 
-//! Read one ELF, Mach-O, or PE file.
+//! Read one ELF, Mach-O, PE, or MPQ file.
 //! `open` reads the bytes. `render` prints the page. `facts` feeds a claim.
-//! `elf`, `macho`, and `pe` read one format each.
+//! An MPQ archive has no start claim.
+//! `elf`, `macho`, `pe`, and `mpq` each read one format.
 //! `certs` finds embedded certificates in file bytes.
 //! `sign` checks a Mach-O or PE signature.
 
@@ -20,6 +21,7 @@ pub mod elf;
 pub mod kind;
 pub mod links;
 pub mod macho;
+pub mod mpq;
 pub mod pe;
 pub mod sign;
 pub mod summary;
@@ -27,11 +29,14 @@ pub mod trust;
 
 mod hash;
 mod library;
+mod strange;
 mod style;
+
+pub use strange::Opened;
 
 use std::process::Command;
 
-/// One parsed ELF, Mach-O, or PE file.
+/// One parsed ELF, Mach-O, PE, or MPQ file.
 pub enum Binary {
     Elf {
         header: elf::header::Header,
@@ -48,6 +53,7 @@ pub enum Binary {
         load: pe::load::Load,
         symbols: pe::symbols::Symbols,
     },
+    Strange(Opened),
 }
 
 /// Read one file. `rows` keeps symbol rows.
@@ -84,6 +90,9 @@ pub fn open(bytes: &[u8], rows: bool) -> Result<Binary, String> {
             load,
             symbols,
         });
+    }
+    if let Some(opened) = strange::open(bytes) {
+        return opened.map(Binary::Strange);
     }
     Err("not an ELF, Mach-O, or PE file".into())
 }
@@ -124,17 +133,25 @@ pub fn render(path: &str, file: &Binary, json: bool, color: bool) -> String {
                 pe::page::render_with(path, header, load, symbols, color)
             }
         }
+        Binary::Strange(opened) => {
+            if json {
+                opened.json(path)
+            } else {
+                opened.page(path, color)
+            }
+        }
     }
 }
 
 /// Build the facts a claim checks. `host` does not change the hermetic result.
-pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
+/// An MPQ archive has no start claim.
+pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> Result<claim::Facts, String> {
     match file {
         Binary::Elf {
             header,
             load,
             symbols,
-        } => claim::Facts {
+        } => Ok(claim::Facts {
             file: path.to_string(),
             format: "elf",
             kind: load.kind,
@@ -143,12 +160,12 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
             pie: load.pie,
             fat_hermetic: None,
             host: claim::host_marks(&elf::symbols::floors(header, symbols), host),
-        },
+        }),
         Binary::Macho {
             image,
             commands,
             slices,
-        } => claim::Facts {
+        } => Ok(claim::Facts {
             file: path.to_string(),
             format: "macho",
             kind: commands.load.kind,
@@ -157,12 +174,12 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
             pie: commands.load.pie,
             fat_hermetic: macho::load::fat_hermetic(slices),
             host: claim::host_marks(&macho::symbols::floors(image, commands, slices), host),
-        },
+        }),
         Binary::Pe {
             header,
             load,
             symbols,
-        } => claim::Facts {
+        } => Ok(claim::Facts {
             file: path.to_string(),
             format: "pe",
             kind: load.kind,
@@ -171,7 +188,8 @@ pub fn facts(path: &str, file: &Binary, host: &claim::Host) -> claim::Facts {
             pie: load.pie,
             fat_hermetic: None,
             host: claim::host_marks(&pe::symbols::floors(header, symbols), host),
-        },
+        }),
+        Binary::Strange(_) => Err("no start claim".into()),
     }
 }
 

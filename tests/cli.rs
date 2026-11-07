@@ -552,3 +552,42 @@ fn a_cached_bad_list_flags_a_cert_by_hash() {
     assert!(page.contains("✗ cn:"), "{page}");
     assert!(page.contains("read: https://example.test/x"), "{page}");
 }
+
+fn tiny_mpq() -> Vec<u8> {
+    const HEX: &str = "4d50511a20000000400000000000030020000000300000000100000001000000ddde2d97cb15fc5ab8e1e5b5637bb116ab67483da1d308cad3ba35f8c97133e8";
+    (0..HEX.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&HEX[at..at + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn an_mpq_archive_prints_a_page_and_has_no_start_claim() {
+    let path = std::env::temp_dir().join(format!("tiny-mpq-{}", std::process::id()));
+    fs::write(&path, tiny_mpq()).unwrap();
+
+    let out = bin().arg(&path).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("format: mpq"), "{text}");
+    assert!(text.contains("files: 1"), "{text}");
+    assert!(text.contains("sector: 4096"), "{text}");
+    assert!(text.contains("no start claim"), "{text}");
+    assert!(!text.contains("\nload:"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text}");
+
+    let json = bin().arg("--json").arg(&path).output().unwrap();
+    let json_text = String::from_utf8(json.stdout).unwrap();
+    assert!(json.status.success(), "{json_text}");
+    assert!(json_text.contains(r#""format":"mpq""#), "{json_text}");
+    assert!(json_text.contains(r#""files":1"#), "{json_text}");
+
+    let check = bin().arg("--check").arg(&path).output().unwrap();
+    assert!(!check.status.success());
+    assert!(String::from_utf8_lossy(&check.stderr).contains("no start claim"));
+    let _ = fs::remove_file(path);
+}

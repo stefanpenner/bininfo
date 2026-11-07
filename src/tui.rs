@@ -4,6 +4,7 @@ why: This file draws the folded page in the terminal.
 uses: bininfo
 how: The bininfo command calls this file when stdout is a terminal.
 This file reads keys and draws the page.
+A cert scan redraws the status line.
 ---
 */
 
@@ -39,15 +40,34 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
     execute!(stdout, EnterAlternateScreen, Hide, DisableLineWrap)?;
     let mut typed = String::new();
     let mut search = false;
+    let mut dirty = true;
+    let mut size = (0u16, 0u16);
     loop {
+        let (cols, rows) = terminal::size()?;
+        if (cols, rows) != size {
+            dirty = true;
+            size = (cols, rows);
+        }
         let busy = pending.is_some().then(|| SPINNER[tick % SPINNER.len()]);
-        draw(&mut stdout, &view, search.then_some(typed.as_str()), busy, note.as_deref())?;
+        // The page is unchanged while the scan runs. A full clear blanks the screen.
+        paint(
+            &mut stdout,
+            &view,
+            search.then_some(typed.as_str()),
+            busy,
+            note.as_deref(),
+            cols,
+            rows,
+            !dirty && pending.is_some(),
+        )?;
+        dirty = false;
         if let Some(rx) = &pending {
             match rx.try_recv() {
                 Ok(full) => {
                     view = View::spine(&full);
                     view.focus("certs");
                     pending = None;
+                    dirty = true;
                     continue;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => pending = None,
@@ -62,6 +82,7 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            dirty = true;
             note = None;
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 break;
@@ -146,35 +167,54 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
     Ok(())
 }
 
-fn draw(
-    out: &mut io::Stdout,
+fn paint(
+    out: &mut impl Write,
     view: &View,
     query: Option<&str>,
     busy: Option<char>,
     note: Option<&str>,
+    cols: u16,
+    rows: u16,
+    status_only: bool,
 ) -> io::Result<()> {
-    let (cols, rows) = terminal::size()?;
+    let status = status_line(view, query, busy, note);
+    if status_only {
+        return write_status(out, &status, cols, rows);
+    }
     let width = cols as usize;
     let lines = view.slots_text();
     let cursor = view.cursor_slot();
     let body = rows.saturating_sub(1) as usize;
     let start = window_start(cursor, lines.len(), body);
-    queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-    for (row, line) in lines.iter().skip(start).take(body).enumerate() {
+    for row in 0..body {
         queue!(out, MoveTo(0, row as u16))?;
-        if start + row == cursor {
-            let plain = fold::strip_ansi(line);
-            queue!(
-                out,
-                SetAttribute(Attribute::Reverse),
-                Print(fit(&plain, width)),
-                SetAttribute(Attribute::Reset)
-            )?;
+        if let Some(line) = lines.get(start + row) {
+            if start + row == cursor {
+                let plain = fold::strip_ansi(line);
+                queue!(
+                    out,
+                    SetAttribute(Attribute::Reverse),
+                    Print(fit(&plain, width)),
+                    SetAttribute(Attribute::Reset),
+                    Clear(ClearType::UntilNewLine),
+                )?;
+            } else {
+                queue!(
+                    out,
+                    Print(fit(line, width)),
+                    Print("\x1b[0m"),
+                    Clear(ClearType::UntilNewLine),
+                )?;
+            }
         } else {
-            queue!(out, Print(fit(line, width)), Print("\x1b[0m"))?;
+            queue!(out, Clear(ClearType::CurrentLine))?;
         }
     }
-    let status = match query {
+    write_status(out, &status, cols, rows)
+}
+
+fn status_line(view: &View, query: Option<&str>, busy: Option<char>, note: Option<&str>) -> String {
+    match query {
         None if busy.is_some() => format!(
             "{} scanning certs and fetching bad lists...    q quit",
             busy.unwrap_or(' ')
@@ -189,13 +229,17 @@ fn draw(
                 "j/k move    gg/G top/bottom    enter fold    / search    n next{open}    q quit"
             )
         }
-    };
+    }
+}
+
+fn write_status(out: &mut impl Write, status: &str, cols: u16, rows: u16) -> io::Result<()> {
     queue!(
         out,
         MoveTo(0, rows.saturating_sub(1)),
         SetAttribute(Attribute::Reverse),
-        Print(fit(&status, width)),
-        SetAttribute(Attribute::Reset)
+        Print(fit(status, cols as usize)),
+        SetAttribute(Attribute::Reset),
+        Clear(ClearType::UntilNewLine),
     )?;
     out.flush()
 }
@@ -251,5 +295,36 @@ impl Drop for Restorer {
             SetAttribute(Attribute::Reset)
         );
         let _ = terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page() -> View {
+        View::spine("format: elf\n\ncerts:\n")
+    }
+
+    #[test]
+    fn a_cert_scan_tick_does_not_redraw_the_page() {
+        let view = page();
+        let mut out = Vec::new();
+        paint(&mut out, &view, None, Some('⠋'), None, 80, 24, true).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("\u{1b}[2J"), "{text:?}");
+        assert!(text.contains("scanning certs"), "{text:?}");
+        assert!(!text.contains("format:"), "{text:?}");
+    }
+
+    #[test]
+    fn a_frame_does_not_erase_the_whole_screen() {
+        let view = page();
+        let mut out = Vec::new();
+        paint(&mut out, &view, None, None, None, 40, 10, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("\u{1b}[2J"), "{text:?}");
+        assert!(!text.contains("\u{1b}[3J"), "{text:?}");
+        assert!(text.contains("format:"), "{text:?}");
     }
 }

@@ -6,6 +6,7 @@ how: The bininfo command calls this file when stdout is a terminal.
 A short group starts open.
 A long list starts closed.
 A pipe does not call this file.
+A list with a count shows that count.
 ---
 */
 
@@ -19,6 +20,11 @@ const ROW_CAP: usize = 4;
 
 pub(crate) fn interactive(tty: bool, json: bool) -> bool {
     tty && !json
+}
+
+/// A terminal loads symbol rows. `--symbols` loads them on a pipe too.
+pub(crate) fn with_rows(flag: bool, tty: bool, json: bool) -> bool {
+    flag || interactive(tty, json)
 }
 
 struct Item {
@@ -398,7 +404,12 @@ impl View {
             return format!("- {}: {}", item.key, item.value);
         }
         if list_like(&self.items, id) {
-            return format!("{:<PAD$}{}", item.key, item.children.len());
+            let shown = if item.value.is_empty() {
+                item.children.len().to_string()
+            } else {
+                item.value.clone()
+            };
+            return format!("{:<PAD$}{}", item.key, shown);
         }
         format!("{:<PAD$}{}", item.key, self.rung_summary(id))
             .trim_end()
@@ -741,6 +752,52 @@ load:                           # How this file starts.
         assert!(interactive(true, false));
         assert!(!interactive(false, false));
         assert!(!interactive(true, true));
+        assert!(with_rows(false, true, false));
+        assert!(!with_rows(false, false, false));
+        assert!(!with_rows(false, true, true));
+        assert!(with_rows(true, false, true));
+    }
+
+    #[test]
+    fn a_count_stays_on_a_closed_list() {
+        let page = "\
+symbols:
+  exports: 9
+    - a
+    - b
+    - c
+    - d
+    - e
+    - more: 4
+";
+        let mut view = View::spine(page);
+        assert!(view.body().contains("> exports   9"), "{}", view.body());
+        assert!(!view.body().contains("- a"), "{}", view.body());
+        view.down();
+        assert_eq!(view.cursor_key(), "exports");
+        view.open();
+        assert!(view.body().contains("- a"), "{}", view.body());
+        assert!(view.body().contains("more: 4"), "{}", view.body());
+    }
+
+    #[test]
+    fn enter_on_a_segment_shows_its_sections() {
+        let page = "\
+regions:
+  - __TEXT: 1 KiB
+    - __text: 4 B
+    - __stubs: 4 B
+    - __const: 4 B
+    - __cstring: 4 B
+    - __unwind: 4 B
+";
+        let mut view = View::spine(page);
+        view.open();
+        assert!(!view.body().contains("__text"), "{}", view.body());
+        view.down();
+        assert_eq!(view.cursor_key(), "__TEXT");
+        view.open();
+        assert!(view.body().contains("__text"), "{}", view.body());
     }
 
     #[test]

@@ -4,12 +4,15 @@ why: This file is the bininfo command.
 uses: bininfo
 how: The command reads arguments and one file.
 A terminal folds the page.
+A terminal loads symbol rows.
 A pipe prints the full page.
 It calls the bininfo library to print a page or check a claim.
+An MPQ archive has no start claim.
 ---
 */
 
 //! Read an ELF, Mach-O, or PE header and print it.
+//! An MPQ archive prints a page and has no start claim.
 //! A terminal folds the page. A pipe prints the full page.
 //! `--check` asks whether the header names no other file.
 
@@ -82,7 +85,8 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
             symbols,
         } => {
             let bytes = read_file(&path)?;
-            let file = bininfo::open(&bytes, symbols)?;
+            let rows = fold::with_rows(symbols, io::stdout().is_terminal(), json);
+            let file = bininfo::open(&bytes, rows)?;
             let color = color_stdout();
             let page = bininfo::render(&path, &file, json, color);
             let online = env::var_os("BININFO_OFFLINE").is_none();
@@ -198,7 +202,7 @@ fn certs_page(path: &str, bytes: &[u8], json: bool, want: &Want) -> (String, usi
 fn check_one(path: &str, claims: &[bininfo::claim::Claim], json: bool) -> Result<ExitCode, String> {
     let bytes = read_file(path)?;
     let file = bininfo::open(&bytes, false)?;
-    let facts = bininfo::facts(path, &file, &bininfo::current_host());
+    let facts = bininfo::facts(path, &file, &bininfo::current_host())?;
     let misses = bininfo::claim::judge(&facts, claims);
     print_report(&facts, &misses, json);
     Ok(code_of(&misses))
@@ -244,7 +248,14 @@ fn check_file(path: &str, json: bool) -> Result<ExitCode, String> {
                 continue;
             }
         };
-        let facts = bininfo::facts(file, &opened, &bininfo::current_host());
+        let facts = match bininfo::facts(file, &opened, &bininfo::current_host()) {
+            Ok(facts) => facts,
+            Err(err) => {
+                eprintln!("{file}: {err}");
+                code = ExitCode::from(1);
+                continue;
+            }
+        };
         let misses = bininfo::claim::judge(&facts, &claims);
         if !misses.is_empty() {
             code = ExitCode::from(1);

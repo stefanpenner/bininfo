@@ -1052,7 +1052,7 @@ mod tests {
 
         let load = load::read(&bytes, &header);
         let text = page::render_with("dyn", &header, &load, &symbols, false);
-        assert!(text.contains("undef:"), "{text}");
+        assert!(text.contains("undef: 1"), "{text}");
         assert!(text.contains("name: printf"), "{text}");
         assert!(text.contains("version: GLIBC_2.2.5"), "{text}");
         assert!(text.contains("binding: global"), "{text}");
