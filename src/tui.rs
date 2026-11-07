@@ -5,6 +5,7 @@ uses: bininfo
 how: The bininfo command calls this file when stdout is a terminal.
 This file reads keys and draws the page.
 A cert scan redraws the status line.
+Enter on a member reads that one file.
 ---
 */
 
@@ -27,8 +28,14 @@ use std::time::Duration;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Draw the page. `load` returns the full page and runs on a thread when the user opens `certs`.
-pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) -> io::Result<()> {
+/// `step` reads one member when the user opens that row.
+pub(crate) fn run(
+    page: &str,
+    load: impl FnOnce() -> String + Send + 'static,
+    step: impl Fn(&[String]) -> Option<String> + 'static,
+) -> io::Result<()> {
     let mut load = Some(load);
+    let mut opened: Vec<Vec<String>> = Vec::new();
     let mut pending: Option<mpsc::Receiver<String>> = None;
     let mut tick = 0usize;
     let mut g_pending = false;
@@ -65,6 +72,7 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
             match rx.try_recv() {
                 Ok(full) => {
                     view = View::spine(&full);
+                    restore_steps(&mut view, &opened, &step);
                     view.focus("certs");
                     pending = None;
                     dirty = true;
@@ -151,6 +159,7 @@ pub(crate) fn run(page: &str, load: impl FnOnce() -> String + Send + 'static) ->
                             pending = Some(rx);
                         }
                     }
+                    open_member(&mut view, &mut opened, &step);
                     view.open();
                 }
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => view.close(),
@@ -225,9 +234,12 @@ fn status_line(view: &View, query: Option<&str>, busy: Option<char>, note: Optio
         None => {
             let open = links::for_block(&view.cursor_block())
                 .map_or(String::new(), |link| format!("    o open {}", link.label));
-            format!(
-                "j/k move    gg/G top/bottom    enter fold    / search    n next{open}    q quit"
-            )
+            let act = if view.step_target().is_some() {
+                "enter opens this file"
+            } else {
+                "enter fold"
+            };
+            format!("j/k move    gg/G top/bottom    {act}    / search    n next{open}    q quit")
         }
     }
 }
@@ -242,6 +254,39 @@ fn write_status(out: &mut impl Write, status: &str, cols: u16, rows: u16) -> io:
         Clear(ClearType::UntilNewLine),
     )?;
     out.flush()
+}
+
+fn open_member(
+    view: &mut View,
+    opened: &mut Vec<Vec<String>>,
+    step: &impl Fn(&[String]) -> Option<String>,
+) {
+    let Some((id, path)) = view.step_target() else {
+        return;
+    };
+    if opened.iter().any(|row| row == &path) {
+        return;
+    }
+    opened.push(path.clone());
+    if let Some(child) = step(&path) {
+        view.graft(id, &child);
+    }
+}
+
+fn restore_steps(
+    view: &mut View,
+    opened: &[Vec<String>],
+    step: &impl Fn(&[String]) -> Option<String>,
+) {
+    for path in opened {
+        let Some(child) = step(path) else {
+            continue;
+        };
+        let Some(id) = view.find_member(path) else {
+            continue;
+        };
+        view.graft(id, &child);
+    }
 }
 
 fn window_start(cursor: usize, len: usize, height: usize) -> usize {

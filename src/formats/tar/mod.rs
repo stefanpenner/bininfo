@@ -3,7 +3,7 @@
 why: This file reads one ustar archive.
 uses: bininfo
 how: bininfo calls this file when the bytes are ustar.
-This file reads each header and skips each file body.
+This file records the body offset and skips the body bytes.
 ---
 */
 
@@ -25,6 +25,8 @@ pub struct Member {
     pub size: u64,
     pub kind: &'static str,
     pub mode: String,
+    /// Start of the member body. The body is not copied.
+    pub offset: u64,
 }
 
 /// One ustar archive. `more` is true when the member cap stops the walk.
@@ -95,10 +97,22 @@ pub fn parse(bytes: &[u8]) -> Result<Archive, String> {
             size: head.size,
             kind: head.kind,
             mode: head.mode,
+            offset: body_at as u64,
         });
     }
 
     Ok(Archive { members, more })
+}
+
+/// Body bytes of one file member. A directory has no body.
+pub fn body<'a>(bytes: &'a [u8], member: &Member) -> Option<&'a [u8]> {
+    if member.kind != "file" {
+        return None;
+    }
+    let at = usize::try_from(member.offset).ok()?;
+    let len = usize::try_from(member.size).ok()?;
+    let end = at.checked_add(len)?;
+    bytes.get(at..end)
 }
 
 fn next_block(bytes: &[u8], at: usize) -> Result<Option<&[u8]>, String> {

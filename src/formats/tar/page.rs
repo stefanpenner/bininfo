@@ -16,6 +16,16 @@ use crate::style::{self, Json};
 use std::fmt::Write;
 
 pub fn render(file: &str, archive: &Archive, color: bool) -> String {
+    render_held(file, archive, color, false, &[])
+}
+
+pub fn render_held(
+    file: &str,
+    archive: &Archive,
+    color: bool,
+    more: bool,
+    nested: &[Option<String>],
+) -> String {
     let mut out = String::new();
     chrome::head(
         &mut out,
@@ -24,20 +34,42 @@ pub fn render(file: &str, archive: &Archive, color: bool) -> String {
         "tar",
         "A tar archive has no start claim.",
     );
-    members_rung(&mut out, archive, color);
+    members_rung(&mut out, archive, color, more, nested);
     out
 }
 
 pub fn render_json(file: &str, archive: &Archive) -> String {
+    render_json_held(file, archive, false, &[])
+}
+
+pub fn render_json_held(
+    file: &str,
+    archive: &Archive,
+    more: bool,
+    nested: &[Option<String>],
+) -> String {
     let mut out = Json::new();
     chrome::json_head(&mut out, file, "tar");
-    out.flag("more", archive.more);
-    let rows: Vec<String> = archive.members.iter().map(member_json).collect();
+    out.flag("more", archive.more || more);
+    let rows: Vec<String> = archive
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            member_json(member, nested.get(index).and_then(|row| row.as_deref()))
+        })
+        .collect();
     out.raw_array("members", &rows);
     out.finish()
 }
 
-fn members_rung(out: &mut String, archive: &Archive, color: bool) {
+fn members_rung(
+    out: &mut String,
+    archive: &Archive,
+    color: bool,
+    more: bool,
+    nested: &[Option<String>],
+) {
     style::rung(
         out,
         color,
@@ -71,8 +103,23 @@ fn members_rung(out: &mut String, archive: &Archive, color: bool) {
         );
         return;
     }
-    for member in &archive.members {
+    if more {
+        style::field(
+            out,
+            color,
+            2,
+            "more",
+            "true",
+            "The nested walk stopped at the cap.",
+            style::PINK,
+            false,
+        );
+    }
+    for (index, member) in archive.members.iter().enumerate() {
         write_member(out, member, color);
+        if let Some(Some(text)) = nested.get(index) {
+            out.push_str(&chrome::nest(text));
+        }
     }
 }
 
@@ -114,12 +161,15 @@ fn write_member(out: &mut String, member: &Member, color: bool) {
     );
 }
 
-fn member_json(member: &Member) -> String {
+fn member_json(member: &Member, inner: Option<&str>) -> String {
     let mut out = Json::new();
     out.str("name", &member.name);
     out.u64("size", member.size);
     out.str("kind", member.kind);
     out.str("mode", &member.mode);
+    if let Some(json) = inner.map(str::trim_end) {
+        out.raw("inner", json);
+    }
     out.finish_inline()
 }
 

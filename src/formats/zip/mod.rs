@@ -266,6 +266,39 @@ fn read_members(bytes: &[u8], dir: &Dir) -> Result<Vec<Member>, String> {
     Ok(members)
 }
 
+/// Uncompressed bytes of one stored member.
+/// `None` means the member is encrypted, compressed, or outside the file.
+pub fn stored<'a>(bytes: &'a [u8], member: &Member) -> Option<&'a [u8]> {
+    if member.encrypted || member.method != 0 {
+        return None;
+    }
+    local_data(bytes, member)
+}
+
+/// Deflate bytes of one member. This function does not inflate them.
+pub fn deflated<'a>(bytes: &'a [u8], member: &Member) -> Option<&'a [u8]> {
+    if member.encrypted || member.method != 8 {
+        return None;
+    }
+    local_data(bytes, member)
+}
+
+fn local_data<'a>(bytes: &'a [u8], member: &Member) -> Option<&'a [u8]> {
+    let at = usize::try_from(member.offset).ok()?;
+    if bytes.get(at..at.checked_add(4)?) != Some(b"PK\x03\x04".as_slice()) {
+        return None;
+    }
+    let name_len = u16_le(bytes, at.checked_add(26)?)? as usize;
+    let extra_len = u16_le(bytes, at.checked_add(28)?)? as usize;
+    let start = at
+        .checked_add(30)?
+        .checked_add(name_len)?
+        .checked_add(extra_len)?;
+    let len = usize::try_from(member.compressed).ok()?;
+    let end = start.checked_add(len)?;
+    bytes.get(start..end)
+}
+
 fn zip64_sizes(extra: &[u8], size: u64, compressed: u64, offset: u64) -> (u64, u64, u64) {
     let mut size = size;
     let mut compressed = compressed;
@@ -492,6 +525,79 @@ mod tests {
         assert!(json.contains(r#""format":"zip""#), "{json}");
         assert!(json.contains(r#""profile":"jar""#), "{json}");
         assert!(!json.contains(r#""load""#), "{json}");
+    }
+
+    fn jpeg() -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 8, 0, 2, 0, 3, 3];
+        out.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 0xff, 0xd9]);
+        out
+    }
+
+    #[test]
+    fn a_stored_jpeg_stays_closed_until_a_step() {
+        let bytes = store_zip(&[("photo.jpg", &jpeg()), ("other.jpg", &jpeg())]);
+        let file = crate::open(&bytes, false).unwrap();
+        let page = crate::render("a.zip", &file, false, false);
+        assert!(page.contains("format: zip"), "{page}");
+        assert!(page.contains("photo.jpg"), "{page}");
+        assert!(!page.contains("format: jpeg"), "{page}");
+        let one = crate::step(&bytes, &["photo.jpg"], false, false).unwrap();
+        assert!(one.contains("format: jpeg"), "{one}");
+        assert!(one.contains("width: 3"), "{one}");
+        assert!(!one.contains("other.jpg"), "{one}");
+        assert_eq!(one.matches("format:").count(), 1, "{one}");
+    }
+
+    #[test]
+    fn each_step_opens_one_zip() {
+        let mut bytes = jpeg();
+        for _ in 0..4 {
+            bytes = store_zip(&[("inner.zip", &bytes)]);
+        }
+        let file = crate::open(&bytes, false).unwrap();
+        let page = crate::render("a.zip", &file, false, false);
+        assert_eq!(page.matches("format: zip").count(), 1, "{page}");
+        assert!(!page.contains("format: jpeg"), "{page}");
+        let one = crate::step(&bytes, &["inner.zip"], false, false).unwrap();
+        assert!(one.contains("format: zip"), "{one}");
+        assert!(!one.contains("format: jpeg"), "{one}");
+        let deep = crate::step(
+            &bytes,
+            &["inner.zip", "inner.zip", "inner.zip", "inner.zip"],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(deep.contains("format: jpeg"), "{deep}");
+        assert!(deep.contains("width: 3"), "{deep}");
+        assert!(!deep.contains("format: zip"), "{deep}");
+    }
+
+    #[test]
+    fn a_plain_or_short_member_does_not_panic() {
+        let bytes = store_zip(&[("hello.txt", b"hi")]);
+        assert!(crate::step(&bytes, &[], false, false).is_none());
+        assert!(crate::step(&bytes, &["missing"], false, false).is_none());
+        assert!(crate::step(&bytes, &["hello.txt"], false, false).is_none());
+        let mut short = store_zip(&[("photo.jpg", &jpeg())]);
+        short.truncate(20);
+        assert!(crate::step(&short, &["photo.jpg"], false, false).is_none());
+    }
+
+    #[test]
+    fn a_large_deflate_member_stops_at_the_cap() {
+        let mut bytes = store_zip(&[("big.bin", b"xxxx")]);
+        let cd = bytes
+            .windows(4)
+            .position(|mark| mark == [0x50, 0x4b, 0x01, 0x02])
+            .unwrap();
+        bytes[cd + 10] = 8;
+        bytes[cd + 11] = 0;
+        let big = (2u32 << 20).to_le_bytes();
+        bytes[cd + 24..cd + 28].copy_from_slice(&big);
+        let page = crate::step(&bytes, &["big.bin"], false, false).unwrap();
+        assert!(page.contains("1 MiB"), "{page}");
+        assert!(!page.contains("format: jpeg"), "{page}");
     }
 
     #[test]

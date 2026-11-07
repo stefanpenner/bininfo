@@ -4,23 +4,27 @@ why: This file routes each extra file type.
 uses: bininfo
 how: bininfo calls open after the start-file checks.
 Each type folder adds one arm here.
-This file does not parse those bytes.
+step reads one named member and does not read the next file.
 ---
 */
 
 //! Extra file types. ELF, Mach-O, and PE stay outside this folder.
 //! Each type adds one arm in `open`. A type here has no start claim.
+//! `step` reads one named member. It does not read the next file.
 
 pub mod ar;
 pub mod chrome;
 pub mod cpio;
 pub mod dmg;
+pub mod hit;
 pub mod isobmff;
 pub mod jpeg;
 pub mod mpq;
+pub mod oci;
 pub mod sevenz;
 pub mod tar;
 pub mod tiff;
+pub mod walk;
 pub mod wasm;
 pub mod zip;
 
@@ -32,6 +36,7 @@ pub enum File {
     Isobmff(isobmff::Movie),
     Jpeg(jpeg::Image),
     Mpq(mpq::Archive),
+    Oci(oci::Image),
     Sevenz(sevenz::Archive),
     Tar(tar::Archive),
     Tiff(tiff::Image),
@@ -43,10 +48,15 @@ pub enum File {
 /// `None` means the bytes match no type here.
 /// `Some(Err)` means the bytes match a type and the parse failed.
 pub fn open(bytes: &[u8]) -> Option<Result<File, String>> {
+    sniff(bytes)
+}
+
+/// Match one extra type. This function does not open a nested file.
+pub(crate) fn sniff(bytes: &[u8]) -> Option<Result<File, String>> {
     // A strong prefix wins.
     // A koly trailer wins over a zip end record.
     // A disk image can hold that record.
-    // ustar sits at offset 257, so tar is last.
+    // An OCI layout is a tar, so it wins over a plain tar.
     if mpq::is_mpq(bytes) {
         return Some(mpq::parse(bytes).map(File::Mpq));
     }
@@ -76,6 +86,9 @@ pub fn open(bytes: &[u8]) -> Option<Result<File, String>> {
     }
     if zip::is_zip(bytes) {
         return Some(zip::parse(bytes).map(File::Zip));
+    }
+    if oci::is_oci(bytes) {
+        return Some(oci::parse(bytes).map(File::Oci));
     }
     if tar::is_tar(bytes) {
         return Some(tar::parse(bytes).map(File::Tar));
@@ -126,6 +139,13 @@ pub fn render(path: &str, file: &File, json: bool, color: bool) -> String {
                 mpq::page::render_json(path, archive)
             } else {
                 mpq::page::render(path, archive, color)
+            }
+        }
+        File::Oci(image) => {
+            if json {
+                oci::page::render_json(path, image, false, &[], &[])
+            } else {
+                oci::page::render(path, image, color, false, &[], &[])
             }
         }
         File::Sevenz(archive) => {

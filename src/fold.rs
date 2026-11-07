@@ -7,6 +7,7 @@ A short group starts open.
 A long list starts closed.
 A pipe does not call this file.
 A list with a count shows that count.
+graft attaches one opened file under a member row.
 ---
 */
 
@@ -562,6 +563,109 @@ impl View {
         }
         None
     }
+
+    /// The member row under the cursor, and each name from the outer file to it.
+    pub(crate) fn step_target(&self) -> Option<(usize, Vec<String>)> {
+        let id = self.cursor;
+        if !self.is_step_row(id) {
+            return None;
+        }
+        let mut names = Vec::new();
+        let mut cur = Some(id);
+        while let Some(at) = cur {
+            if self.is_step_row(at) {
+                names.push(dash_name(&self.items[at].raw));
+            }
+            cur = self.items[at].parent;
+        }
+        names.reverse();
+        Some((id, names))
+    }
+
+    /// Find one member row by the same name path `step_target` builds.
+    pub(crate) fn find_member(&self, path: &[String]) -> Option<usize> {
+        let mut ancestor = None;
+        let mut found = 0usize;
+        if path.is_empty() {
+            return None;
+        }
+        for name in path {
+            found = self
+                .items
+                .iter()
+                .enumerate()
+                .find(|(id, _)| {
+                    self.is_step_row(*id)
+                        && dash_name(&self.items[*id].raw) == *name
+                        && self.is_under(*id, ancestor)
+                })?
+                .0;
+            ancestor = Some(found);
+        }
+        Some(found)
+    }
+
+    /// Attach one rendered file under a member row. The new rows stay in this view.
+    pub(crate) fn graft(&mut self, parent: usize, page: &str) {
+        if self.items.get(parent).is_none() {
+            return;
+        }
+        let shift = self.items[parent].indent.saturating_add(2);
+        let mut extra = parse(page);
+        if extra.is_empty() {
+            return;
+        }
+        let base = self.items.len();
+        let pad = " ".repeat(shift);
+        for item in &mut extra {
+            if let Some(pid) = item.parent.as_mut() {
+                *pid += base;
+            }
+            item.indent += shift;
+            item.raw.insert_str(0, &pad);
+        }
+        self.items.append(&mut extra);
+        let mut roots = Vec::new();
+        for id in base..self.items.len() {
+            if self.items[id].parent.is_none() {
+                self.items[id].parent = Some(parent);
+                roots.push(id);
+            }
+        }
+        self.items[parent].children.extend(roots);
+        for id in base..self.items.len() {
+            if starts_open(&self.items, id) {
+                self.open.insert(id);
+            }
+        }
+    }
+
+    fn is_step_row(&self, id: usize) -> bool {
+        let Some(item) = self.items.get(id) else {
+            return false;
+        };
+        if !item.dash {
+            return false;
+        }
+        let Some(pid) = item.parent else {
+            return false;
+        };
+        matches!(self.items[pid].key.as_str(), "members" | "layers" | "files")
+    }
+
+    fn is_under(&self, id: usize, ancestor: Option<usize>) -> bool {
+        let Some(ancestor) = ancestor else {
+            return true;
+        };
+        let mut cur = self.items[id].parent;
+        while let Some(pid) = cur {
+            if pid == ancestor {
+                return true;
+            }
+            cur = self.items[pid].parent;
+        }
+        false
+    }
 }
 
 fn is_header(item: &Item) -> bool {
@@ -617,6 +721,36 @@ fn insert_mark(raw: &str, indent: usize, mark: &str) -> String {
     } else {
         format!("{mark} {raw}")
     }
+}
+
+fn dash_name(raw: &str) -> String {
+    let plain = strip_ansi(raw);
+    let body = plain.trim();
+    let body = body.strip_prefix("- ").unwrap_or(body).trim();
+    if let Some(name) = unquote(body) {
+        return name;
+    }
+    body.split(" # ").next().unwrap_or(body).trim().to_string()
+}
+
+fn unquote(body: &str) -> Option<String> {
+    if !body.starts_with('"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = body[1..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            },
+            '"' => return Some(out),
+            other => out.push(other),
+        }
+    }
+    None
 }
 
 fn parse(page: &str) -> Vec<Item> {
@@ -996,5 +1130,58 @@ load:
             "{text}"
         );
         assert!(text.contains("kind: static"), "{text}");
+    }
+
+    #[test]
+    fn graft_puts_one_file_under_the_member() {
+        let page = "\
+format: zip
+
+members:
+  - photo.jpg
+    method: store (0)
+  - readme.txt
+    method: store (0)
+";
+        let mut view = View::spine(page);
+        let photo = view
+            .items
+            .iter()
+            .position(|item| item.dash && dash_name(&item.raw) == "photo.jpg")
+            .unwrap();
+        view.cursor = photo;
+        let (id, path) = view.step_target().unwrap();
+        assert_eq!(id, photo);
+        assert_eq!(path, vec!["photo.jpg".to_string()]);
+        view.graft(id, "file: photo.jpg\nformat: jpeg\nwidth: 3\n");
+        let raw: String = view.items.iter().map(|item| item.raw.as_str()).collect();
+        assert!(raw.contains("format: jpeg"), "{raw}");
+        assert!(view.find_member(&path).is_some());
+        let readme = view
+            .items
+            .iter()
+            .position(|item| item.dash && dash_name(&item.raw) == "readme.txt")
+            .unwrap();
+        view.cursor = readme;
+        assert_eq!(
+            view.step_target().map(|(_, names)| names),
+            Some(vec!["readme.txt".to_string()])
+        );
+        view.cursor = view.items[photo].children[0];
+        assert!(view.step_target().is_none());
+    }
+
+    #[test]
+    fn a_quoted_digest_is_the_step_name() {
+        let page = "\
+layers:
+  - \"sha256:abc\"
+    media: tar
+";
+        let mut view = View::spine(page);
+        let id = view.items.iter().position(|item| item.dash).unwrap();
+        view.cursor = id;
+        let (_, path) = view.step_target().unwrap();
+        assert_eq!(path, vec!["sha256:abc".to_string()]);
     }
 }

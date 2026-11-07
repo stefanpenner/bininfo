@@ -6,7 +6,8 @@ how: The bininfo command calls open, render, and facts.
 A caller uses certs to scan file bytes.
 A caller uses check_policy to judge those hits.
 sign checks a Mach-O or PE signature.
-open also reads each file type in the formats folder.
+open reads each file type in the formats folder.
+step reads one named member and does not read the next file.
 ---
 */
 
@@ -139,6 +140,14 @@ pub fn render(path: &str, file: &Binary, json: bool, color: bool) -> String {
         }
         Binary::Format(file) => formats::render(path, file, json, color),
     }
+}
+
+/// Read one nested file.
+/// `path` is each member name from the outer file to that file.
+/// `rows` keeps symbol rows for a nested ELF, Mach-O, or PE file.
+/// The page lists the next names. This function does not read those files.
+pub fn step(bytes: &[u8], path: &[&str], rows: bool, color: bool) -> Option<String> {
+    formats::walk::step(bytes, path, rows, color)
 }
 
 /// Build the facts a claim checks. `host` does not change the hermetic result.

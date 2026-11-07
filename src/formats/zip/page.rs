@@ -15,6 +15,16 @@ use crate::style::{self, Json};
 use std::fmt::Write;
 
 pub fn render(file: &str, archive: &Archive, color: bool) -> String {
+    render_held(file, archive, color, false, &[])
+}
+
+pub fn render_held(
+    file: &str,
+    archive: &Archive,
+    color: bool,
+    more: bool,
+    nested: &[Option<String>],
+) -> String {
     let mut out = String::new();
     style::field(
         &mut out,
@@ -39,11 +49,20 @@ pub fn render(file: &str, archive: &Archive, color: bool) -> String {
     style::blank(&mut out);
     type_rung(&mut out, archive, color);
     style::blank(&mut out);
-    members_rung(&mut out, archive, color);
+    members_rung(&mut out, archive, color, more, nested);
     out
 }
 
 pub fn render_json(file: &str, archive: &Archive) -> String {
+    render_json_held(file, archive, false, &[])
+}
+
+pub fn render_json_held(
+    file: &str,
+    archive: &Archive,
+    more: bool,
+    nested: &[Option<String>],
+) -> String {
     let mut out = Json::new();
     out.str("file", file);
     out.str("format", "zip");
@@ -54,7 +73,17 @@ pub fn render_json(file: &str, archive: &Archive) -> String {
     out.u64("count", archive.count);
     out.u64("listed", archive.listed as u64);
     out.u64("comment", u64::from(archive.comment));
-    let rows: Vec<String> = archive.members.iter().map(member_json).collect();
+    if more {
+        out.flag("more", true);
+    }
+    let rows: Vec<String> = archive
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            member_json(member, nested.get(index).and_then(|row| row.as_deref()))
+        })
+        .collect();
     out.raw_array("members", &rows);
     out.finish()
 }
@@ -140,7 +169,13 @@ fn type_rung(out: &mut String, archive: &Archive, color: bool) {
     );
 }
 
-fn members_rung(out: &mut String, archive: &Archive, color: bool) {
+fn members_rung(
+    out: &mut String,
+    archive: &Archive,
+    color: bool,
+    more: bool,
+    nested: &[Option<String>],
+) {
     style::rung(
         out,
         color,
@@ -162,8 +197,23 @@ fn members_rung(out: &mut String, archive: &Archive, color: bool) {
         );
         return;
     }
-    for member in &archive.members {
+    if more {
+        style::field(
+            out,
+            color,
+            2,
+            "more",
+            "true",
+            "The nested walk stopped at the cap.",
+            style::PINK,
+            false,
+        );
+    }
+    for (index, member) in archive.members.iter().enumerate() {
         write_member(out, member, color);
+        if let Some(Some(text)) = nested.get(index) {
+            out.push_str(&crate::formats::chrome::nest(text));
+        }
     }
 }
 
@@ -224,7 +274,7 @@ fn write_member(out: &mut String, member: &Member, color: bool) {
     );
 }
 
-fn member_json(member: &Member) -> String {
+fn member_json(member: &Member, inner: Option<&str>) -> String {
     let mut out = Json::new();
     out.str("name", &member.name);
     out.opt("method", method_name(member.method));
@@ -234,6 +284,9 @@ fn member_json(member: &Member) -> String {
     out.u64("crc", u64::from(member.crc));
     out.u64("offset", member.offset);
     out.flag("encrypted", member.encrypted);
+    if let Some(json) = inner.map(str::trim_end) {
+        out.raw("inner", json);
+    }
     out.finish_inline()
 }
 

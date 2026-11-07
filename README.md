@@ -4,6 +4,7 @@ why: This file tells a reader what bininfo prints and how to run it.
 uses: a reader
 how: The reader opens this file in the repo.
 The type list links each type to its reader.
+The file also states how enter opens one nested file.
 ---
 -->
 
@@ -12,8 +13,6 @@ The type list links each type to its reader.
 ## What is this?
 
 `bininfo` reads one file and prints one page.
-ELF, Mach-O, and PE have a start claim.
-Each other type has no start claim.
 A start page has type, load, symbols, sizes, where, and sections.
 The load rung also shows soname, filter, auxiliary, and flags.
 The sign rung says whether a Mach-O or PE signature is valid.
@@ -26,37 +25,45 @@ Several raw words share one TIFF reader.
 Several media words share one ISOBMFF reader.
 The sniff list is [`src/formats/mod.rs`](src/formats/mod.rs).
 
-| type | claim | reader |
-| --- | --- | --- |
-| `7z` | none | [`src/formats/sevenz/mod.rs`](src/formats/sevenz/mod.rs) |
-| `ar` | none | [`src/formats/ar/mod.rs`](src/formats/ar/mod.rs) |
-| `arw` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
-| `avif` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
-| `cpio` | none | [`src/formats/cpio/mod.rs`](src/formats/cpio/mod.rs) |
-| `cr2` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
-| `cr3` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
-| `dmg` | none | [`src/formats/dmg/mod.rs`](src/formats/dmg/mod.rs) |
-| `dng` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
-| `elf` | start | [`src/elf/mod.rs`](src/elf/mod.rs) |
-| `heic` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
-| `heif` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
-| `jpeg` | none | [`src/formats/jpeg/mod.rs`](src/formats/jpeg/mod.rs) |
-| `macho` | start | [`src/macho/mod.rs`](src/macho/mod.rs) |
-| `mov` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
-| `mp4` | none | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
-| `mpq` | none | [`src/formats/mpq/mod.rs`](src/formats/mpq/mod.rs) |
-| `nef` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
-| `orf` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
-| `pe` | start | [`src/pe/mod.rs`](src/pe/mod.rs) |
-| `pef` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
-| `rw2` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
-| `tar` | none | [`src/formats/tar/mod.rs`](src/formats/tar/mod.rs) |
-| `tiff` | none | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
-| `wasm` | none | [`src/formats/wasm/mod.rs`](src/formats/wasm/mod.rs) |
-| `zip` | none | [`src/formats/zip/mod.rs`](src/formats/zip/mod.rs) |
+| type | reader |
+| --- | --- |
+| `7z` | [`src/formats/sevenz/mod.rs`](src/formats/sevenz/mod.rs) |
+| `ar` | [`src/formats/ar/mod.rs`](src/formats/ar/mod.rs) |
+| `arw` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `avif` | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `cpio` | [`src/formats/cpio/mod.rs`](src/formats/cpio/mod.rs) |
+| `cr2` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `cr3` | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `dmg` | [`src/formats/dmg/mod.rs`](src/formats/dmg/mod.rs) |
+| `dng` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `elf` | [`src/elf/mod.rs`](src/elf/mod.rs) |
+| `heic` | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `heif` | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `jpeg` | [`src/formats/jpeg/mod.rs`](src/formats/jpeg/mod.rs) |
+| `macho` | [`src/macho/mod.rs`](src/macho/mod.rs) |
+| `mov` | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `mp4` | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `mpq` | [`src/formats/mpq/mod.rs`](src/formats/mpq/mod.rs) |
+| `nef` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `oci` | [`src/formats/oci/mod.rs`](src/formats/oci/mod.rs) |
+| `orf` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `pe` | [`src/pe/mod.rs`](src/pe/mod.rs) |
+| `pef` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `rw2` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `tar` | [`src/formats/tar/mod.rs`](src/formats/tar/mod.rs) |
+| `tiff` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `wasm` | [`src/formats/wasm/mod.rs`](src/formats/wasm/mod.rs) |
+| `zip` | [`src/formats/zip/mod.rs`](src/formats/zip/mod.rs) |
 
 A printable ISO brand that is not in this table keeps that brand as the type word.
 The word `isobmff` means the brand is not text.
+
+Enter opens one member of a zip or an OCI image.
+That page lists the next names.
+The next file stays closed until the next enter.
+A top-level tar lists its members and does not open them.
+A deflate member and a gzip layer must fit in 1 MiB after inflate.
+The compressed input must fit in 8 MiB.
 
 ## Why does it exist?
 

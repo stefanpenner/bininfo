@@ -6,6 +6,7 @@ how: bininfo calls this file to scan read-only bytes.
 The scan reads DER, PEM, bare base64, gzip, zlib, and zip.
 The scan records the issuer and the key.
 The scan rejects BER indefinite length.
+step calls the gzip and deflate readers with a byte cap.
 ---
 */
 
@@ -18,6 +19,14 @@ The scan rejects BER indefinite length.
 //! The scan rejects BER indefinite length.
 
 mod inflate;
+
+pub(crate) fn inflate_deflate(input: &[u8], max_out: usize) -> Option<Vec<u8>> {
+    inflate::raw(input, max_out).map(|(out, _used)| out)
+}
+
+pub(crate) fn inflate_gzip(input: &[u8], max_out: usize) -> Option<Vec<u8>> {
+    inflate::gunzip(input, max_out).map(|(out, _used)| out)
+}
 mod place;
 
 use std::collections::HashMap;

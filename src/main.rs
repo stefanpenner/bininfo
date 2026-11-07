@@ -3,7 +3,7 @@
 why: This file is the bininfo command.
 uses: bininfo
 how: The command reads arguments and one file.
-A terminal folds the page.
+Enter on a member reads that one file.
 A terminal loads symbol rows.
 A pipe prints the full page.
 It calls the bininfo library to print a page, check a claim, or apply a policy.
@@ -100,13 +100,21 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
             let online = env::var_os("BININFO_OFFLINE").is_none();
             if fold::interactive(io::stdout().is_terminal(), json) {
                 // The cert scan is slow. The page opens now and the scan runs when asked.
+                // A nested file stays closed until enter names that one file.
+                let bytes = std::sync::Arc::new(bytes);
+                let scan = std::sync::Arc::clone(&bytes);
+                let kept = std::sync::Arc::clone(&bytes);
                 let cheap = bininfo::summary::read_cheap(&bytes);
                 let text = bininfo::summary::merge(&page, &cheap, json, color);
                 let load = move || {
-                    let full = bininfo::summary::read(&bytes, online);
+                    let full = bininfo::summary::read(&scan, online);
                     bininfo::summary::merge(&page, &full, false, color)
                 };
-                tui::run(&text, load).map_err(|err| err.to_string())?;
+                let step = move |names: &[String]| {
+                    let path: Vec<&str> = names.iter().map(String::as_str).collect();
+                    bininfo::step(&kept, &path, true, color)
+                };
+                tui::run(&text, load, step).map_err(|err| err.to_string())?;
             } else {
                 let summary = bininfo::summary::read(&bytes, online);
                 print!("{}", bininfo::summary::merge(&page, &summary, json, color));
