@@ -7,7 +7,7 @@ A caller uses certs to scan file bytes.
 A caller uses check_policy to judge those hits.
 sign checks a Mach-O or PE signature.
 open reads each file type in the formats folder.
-step reads one named member and does not read the next file.
+step reads one named member, then one file inside it, and stops when asked.
 ---
 */
 
@@ -38,6 +38,10 @@ pub use formats::{dmg, mpq, tiff, zip};
 mod hash;
 mod library;
 mod style;
+mod watch;
+
+pub use style::human;
+pub use watch::Watch;
 
 use std::process::Command;
 
@@ -143,11 +147,22 @@ pub fn render(path: &str, file: &Binary, json: bool, color: bool) -> String {
 }
 
 /// Read one nested file.
-/// `path` is each member name from the outer file to that file.
+/// `path` is one name per container, from the outer file to the member.
 /// `rows` keeps symbol rows for a nested ELF, Mach-O, or PE file.
 /// The page lists the next names. This function does not read those files.
 pub fn step(bytes: &[u8], path: &[&str], rows: bool, color: bool) -> Option<String> {
-    formats::walk::step(bytes, path, rows, color)
+    step_watch(bytes, path, rows, color, &Watch::new())
+}
+
+/// Read one nested file. `watch` counts bytes and can stop the read.
+pub fn step_watch(
+    bytes: &[u8],
+    path: &[&str],
+    rows: bool,
+    color: bool,
+    watch: &Watch,
+) -> Option<String> {
+    formats::walk::step(bytes, path, rows, color, watch)
 }
 
 /// Build the facts a claim checks. `host` does not change the hermetic result.

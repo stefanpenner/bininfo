@@ -4,7 +4,7 @@ why: This file tells a reader what bininfo prints and how to run it.
 uses: a reader
 how: The reader opens this file in the repo.
 The type list links each type to its reader.
-The file also states how enter opens one nested file.
+The file also states how enter opens one file inside another.
 ---
 -->
 
@@ -39,6 +39,7 @@ The sniff list is [`src/formats/mod.rs`](src/formats/mod.rs).
 | `elf` | [`src/elf/mod.rs`](src/elf/mod.rs) |
 | `heic` | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
 | `heif` | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
+| `icns` | [`src/formats/icns/mod.rs`](src/formats/icns/mod.rs) |
 | `jpeg` | [`src/formats/jpeg/mod.rs`](src/formats/jpeg/mod.rs) |
 | `macho` | [`src/macho/mod.rs`](src/macho/mod.rs) |
 | `mov` | [`src/formats/isobmff/mod.rs`](src/formats/isobmff/mod.rs) |
@@ -49,6 +50,7 @@ The sniff list is [`src/formats/mod.rs`](src/formats/mod.rs).
 | `orf` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
 | `pe` | [`src/pe/mod.rs`](src/pe/mod.rs) |
 | `pef` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
+| `png` | [`src/formats/png/mod.rs`](src/formats/png/mod.rs) |
 | `rw2` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
 | `tar` | [`src/formats/tar/mod.rs`](src/formats/tar/mod.rs) |
 | `tiff` | [`src/formats/tiff/mod.rs`](src/formats/tiff/mod.rs) |
@@ -58,12 +60,19 @@ The sniff list is [`src/formats/mod.rs`](src/formats/mod.rs).
 A printable ISO brand that is not in this table keeps that brand as the type word.
 The word `isobmff` means the brand is not text.
 
-Enter opens one member of a zip or an OCI image.
-That page lists the next names.
-The next file stays closed until the next enter.
-A top-level tar lists its members and does not open them.
-A deflate member and a gzip layer must fit in 1 MiB after inflate.
+Enter opens one member of the current file.
+That member stays closed until that enter.
+A known file uses its normal page.
+The next enter opens one file inside that page.
+A 7z archive and an MPQ archive do not open a member.
+
+A deflate member, a gzip layer, and a zlib block must fit in 1 MiB after inflate.
 The compressed input must fit in 8 MiB.
+
+An APFS part states that this reader does not list its files.
+
+A slow open shows a spinner and the byte count.
+Esc stops that open.
 
 ## Why does it exist?
 

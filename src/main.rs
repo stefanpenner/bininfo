@@ -110,9 +110,9 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
                     let full = bininfo::summary::read(&scan, online);
                     bininfo::summary::merge(&page, &full, false, color)
                 };
-                let step = move |names: &[String]| {
+                let step = move |names: &[String], watch: &bininfo::Watch| {
                     let path: Vec<&str> = names.iter().map(String::as_str).collect();
-                    bininfo::step(&kept, &path, true, color)
+                    bininfo::step_watch(&kept, &path, true, color, watch)
                 };
                 tui::run(&text, load, step).map_err(|err| err.to_string())?;
             } else {

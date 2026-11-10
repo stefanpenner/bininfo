@@ -3,6 +3,7 @@
 why: This file writes one disk image as one text page.
 uses: bininfo
 how: bininfo calls this file after it reads the koly trailer.
+The parts rung lists one partition.
 This file does not read dmg bytes.
 ---
 */
@@ -10,8 +11,9 @@ This file does not read dmg bytes.
 //! One page for one UDIF disk image.
 //! Each line is `key: value  # note`. This file does not read dmg bytes.
 
-use super::{checksum_name, fourcc, variant_name, Image};
+use super::{checksum_name, fourcc, variant_name, Image, Part};
 use crate::style::{self, Json};
+use std::fmt::Write;
 
 pub fn render(file: &str, image: &Image, color: bool) -> String {
     let mut out = String::new();
@@ -50,6 +52,10 @@ pub fn render(file: &str, image: &Image, color: bool) -> String {
         style::FG,
         false,
     );
+    if !image.parts.is_empty() {
+        style::blank(&mut out);
+        parts_rung(&mut out, &image.parts, color);
+    }
     out
 }
 
@@ -71,7 +77,44 @@ pub fn render_json(file: &str, image: &Image) -> String {
     out.opt("checksum", checksum_name(image.checksum));
     out.u64("checksum_id", u64::from(image.checksum));
     out.strings("names", &image.names);
+    if !image.parts.is_empty() {
+        let rows: Vec<String> = image.parts.iter().map(part_json).collect();
+        out.raw_array("parts", &rows);
+    }
     out.finish()
+}
+
+fn parts_rung(out: &mut String, parts: &[Part], color: bool) {
+    style::rung(
+        out,
+        color,
+        "parts",
+        "Enter opens one partition.",
+        style::BLUE,
+        true,
+    );
+    for part in parts {
+        let shown = style::file_text(color, &part.name);
+        let dash = style::paint(color, "-", style::LABEL, false);
+        let _ = writeln!(out, "  {dash} {shown}");
+        style::field(
+            out,
+            color,
+            4,
+            "blocks",
+            &part.chunks.len().to_string(),
+            "Block map rows for this part.",
+            style::FG,
+            false,
+        );
+    }
+}
+
+fn part_json(part: &Part) -> String {
+    let mut out = Json::new();
+    out.str("name", &part.name);
+    out.u64("blocks", part.chunks.len() as u64);
+    out.finish_inline()
 }
 
 fn type_rung(out: &mut String, image: &Image, color: bool) {

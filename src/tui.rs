@@ -6,6 +6,7 @@ how: The bininfo command calls this file when stdout is a terminal.
 This file reads keys and draws the page.
 A cert scan redraws the status line.
 Enter on a member reads that one file.
+A slow open shows a spinner and esc stops it.
 ---
 */
 
@@ -27,16 +28,35 @@ use std::time::Duration;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+enum Wait {
+    Certs(mpsc::Receiver<String>),
+    Open {
+        rx: mpsc::Receiver<Option<String>>,
+        id: usize,
+        path: Vec<String>,
+        watch: std::sync::Arc<bininfo::Watch>,
+    },
+}
+
+enum Poll {
+    Pending,
+    Drop,
+    Certs(String),
+    Open { page: Option<String>, keep: bool },
+}
+
 /// Draw the page. `load` returns the full page and runs on a thread when the user opens `certs`.
 /// `step` reads one member when the user opens that row.
 pub(crate) fn run(
     page: &str,
     load: impl FnOnce() -> String + Send + 'static,
-    step: impl Fn(&[String]) -> Option<String> + 'static,
+    step: impl Fn(&[String], &bininfo::Watch) -> Option<String> + Send + Sync + 'static,
 ) -> io::Result<()> {
     let mut load = Some(load);
+    let step: std::sync::Arc<dyn Fn(&[String], &bininfo::Watch) -> Option<String> + Send + Sync> =
+        std::sync::Arc::new(step);
     let mut opened: Vec<Vec<String>> = Vec::new();
-    let mut pending: Option<mpsc::Receiver<String>> = None;
+    let mut wait: Option<Wait> = None;
     let mut tick = 0usize;
     let mut g_pending = false;
     let mut note: Option<String> = None;
@@ -55,35 +75,38 @@ pub(crate) fn run(
             dirty = true;
             size = (cols, rows);
         }
-        let busy = pending.is_some().then(|| SPINNER[tick % SPINNER.len()]);
-        // The page is unchanged while the scan runs. A full clear blanks the screen.
+        let busy = wait.is_some().then(|| SPINNER[tick % SPINNER.len()]);
+        let opening = match &wait {
+            Some(Wait::Open { watch, .. }) => Some(watch.done()),
+            _ => None,
+        };
+        // The page is unchanged while a job runs. A full clear blanks the screen.
         paint(
             &mut stdout,
             &view,
             search.then_some(typed.as_str()),
             busy,
+            opening,
             note.as_deref(),
             cols,
             rows,
-            !dirty && pending.is_some(),
+            !dirty && wait.is_some(),
         )?;
         dirty = false;
-        if let Some(rx) = &pending {
-            match rx.try_recv() {
-                Ok(full) => {
-                    view = View::spine(&full);
-                    restore_steps(&mut view, &opened, &step);
-                    view.focus("certs");
-                    pending = None;
+        if let Some(job) = &wait {
+            match poll_wait(job) {
+                Poll::Pending => {
+                    tick += 1;
+                    if !event::poll(Duration::from_millis(80))? {
+                        continue;
+                    }
+                }
+                polled => {
+                    let job = wait.take();
+                    apply_wait(&mut view, &mut opened, step.as_ref(), job, polled);
                     dirty = true;
                     continue;
                 }
-                Err(mpsc::TryRecvError::Disconnected) => pending = None,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            tick += 1;
-            if !event::poll(Duration::from_millis(80))? {
-                continue;
             }
         }
         if let Event::Key(key) = event::read()? {
@@ -146,20 +169,30 @@ pub(crate) fn run(
                 KeyCode::PageUp => view.jump(-page * 2),
                 KeyCode::Char('n') if ctrl => view.down(),
                 KeyCode::Char('p') if ctrl => view.up(),
-                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('q') => break,
+                KeyCode::Esc => {
+                    if let Some(Wait::Open { watch, .. }) = &wait {
+                        watch.stop();
+                        wait = None;
+                        continue;
+                    }
+                    break;
+                }
                 KeyCode::Char('j') | KeyCode::Down => view.down(),
                 KeyCode::Char('k') | KeyCode::Up => view.up(),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                    if view.cursor_key() == "certs" {
+                    if view.cursor_key() == "certs" && wait.is_none() {
                         if let Some(job) = load.take() {
                             let (tx, rx) = mpsc::channel();
                             std::thread::spawn(move || {
                                 let _ = tx.send(job());
                             });
-                            pending = Some(rx);
+                            wait = Some(Wait::Certs(rx));
                         }
                     }
-                    open_member(&mut view, &mut opened, &step);
+                    if wait.is_none() {
+                        start_open(&view, &opened, &step, &mut wait);
+                    }
                     view.open();
                 }
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => view.close(),
@@ -181,12 +214,13 @@ fn paint(
     view: &View,
     query: Option<&str>,
     busy: Option<char>,
+    opening: Option<u64>,
     note: Option<&str>,
     cols: u16,
     rows: u16,
     status_only: bool,
 ) -> io::Result<()> {
-    let status = status_line(view, query, busy, note);
+    let status = status_line(view, query, busy, opening, note);
     if status_only {
         return write_status(out, &status, cols, rows);
     }
@@ -222,8 +256,19 @@ fn paint(
     write_status(out, &status, cols, rows)
 }
 
-fn status_line(view: &View, query: Option<&str>, busy: Option<char>, note: Option<&str>) -> String {
+fn opening_status(spin: char, bytes: u64) -> String {
+    format!("{spin} opening · {}    esc cancel", bininfo::human(bytes))
+}
+
+fn status_line(
+    view: &View,
+    query: Option<&str>,
+    busy: Option<char>,
+    opening: Option<u64>,
+    note: Option<&str>,
+) -> String {
     match query {
+        None if opening.is_some() => opening_status(busy.unwrap_or(' '), opening.unwrap_or(0)),
         None if busy.is_some() => format!(
             "{} scanning certs and fetching bad lists...    q quit",
             busy.unwrap_or(' ')
@@ -256,10 +301,11 @@ fn write_status(out: &mut impl Write, status: &str, cols: u16, rows: u16) -> io:
     out.flush()
 }
 
-fn open_member(
-    view: &mut View,
-    opened: &mut Vec<Vec<String>>,
-    step: &impl Fn(&[String]) -> Option<String>,
+fn start_open(
+    view: &View,
+    opened: &[Vec<String>],
+    step: &std::sync::Arc<dyn Fn(&[String], &bininfo::Watch) -> Option<String> + Send + Sync>,
+    wait: &mut Option<Wait>,
 ) {
     let Some((id, path)) = view.step_target() else {
         return;
@@ -267,19 +313,74 @@ fn open_member(
     if opened.iter().any(|row| row == &path) {
         return;
     }
-    opened.push(path.clone());
-    if let Some(child) = step(&path) {
-        view.graft(id, &child);
+    let watch = std::sync::Arc::new(bininfo::Watch::new());
+    let (tx, rx) = mpsc::channel();
+    let step_job = std::sync::Arc::clone(step);
+    let watch_job = std::sync::Arc::clone(&watch);
+    let path_job = path.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(step_job(&path_job, &watch_job));
+    });
+    *wait = Some(Wait::Open {
+        rx,
+        id,
+        path,
+        watch,
+    });
+}
+
+fn poll_wait(job: &Wait) -> Poll {
+    match job {
+        Wait::Certs(rx) => match rx.try_recv() {
+            Ok(full) => Poll::Certs(full),
+            Err(mpsc::TryRecvError::Empty) => Poll::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => Poll::Drop,
+        },
+        Wait::Open { rx, watch, .. } => match rx.try_recv() {
+            Ok(page) => Poll::Open {
+                page,
+                keep: !watch.stopped(),
+            },
+            Err(mpsc::TryRecvError::Empty) => Poll::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => Poll::Drop,
+        },
+    }
+}
+
+fn apply_wait(
+    view: &mut View,
+    opened: &mut Vec<Vec<String>>,
+    step: &(dyn Fn(&[String], &bininfo::Watch) -> Option<String> + Send + Sync),
+    job: Option<Wait>,
+    polled: Poll,
+) {
+    match (job, polled) {
+        (Some(Wait::Certs(_)), Poll::Certs(full)) => {
+            *view = View::spine(&full);
+            restore_steps(view, opened, step);
+            view.focus("certs");
+        }
+        (
+            Some(Wait::Open { id, path, .. }),
+            Poll::Open {
+                page: Some(page),
+                keep: true,
+            },
+        ) => {
+            view.graft(id, &page);
+            opened.push(path);
+        }
+        _ => {}
     }
 }
 
 fn restore_steps(
     view: &mut View,
     opened: &[Vec<String>],
-    step: &impl Fn(&[String]) -> Option<String>,
+    step: &(dyn Fn(&[String], &bininfo::Watch) -> Option<String> + Send + Sync),
 ) {
     for path in opened {
-        let Some(child) = step(path) else {
+        let Some(child) = step(path, &bininfo::Watch::new()) else {
             continue;
         };
         let Some(id) = view.find_member(path) else {
@@ -355,7 +456,7 @@ mod tests {
     fn a_cert_scan_tick_does_not_redraw_the_page() {
         let view = page();
         let mut out = Vec::new();
-        paint(&mut out, &view, None, Some('⠋'), None, 80, 24, true).unwrap();
+        paint(&mut out, &view, None, Some('⠋'), None, None, 80, 24, true).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("\u{1b}[2J"), "{text:?}");
         assert!(text.contains("scanning certs"), "{text:?}");
@@ -366,10 +467,19 @@ mod tests {
     fn a_frame_does_not_erase_the_whole_screen() {
         let view = page();
         let mut out = Vec::new();
-        paint(&mut out, &view, None, None, None, 40, 10, false).unwrap();
+        paint(&mut out, &view, None, None, None, None, 40, 10, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("\u{1b}[2J"), "{text:?}");
         assert!(!text.contains("\u{1b}[3J"), "{text:?}");
         assert!(text.contains("format:"), "{text:?}");
+    }
+
+    #[test]
+    fn an_open_shows_the_byte_count_and_cancel() {
+        let line = opening_status('⠋', 1024);
+        assert!(line.contains('⠋'), "{line}");
+        assert!(line.contains("opening"), "{line}");
+        assert!(line.contains("1.0 KiB"), "{line}");
+        assert!(line.contains("esc cancel"), "{line}");
     }
 }

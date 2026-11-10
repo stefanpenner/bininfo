@@ -1,18 +1,21 @@
 /*
 ---
-why: This file reads one named member of a zip or an OCI image.
+why: This file reads one named member inside another file.
 uses: bininfo
 how: bininfo calls step when the user opens one member.
-step reads that file and does not read the next file.
+step sniffs that member and stops when asked.
+The next name opens one file inside that member.
 An inflate stops at 1 MiB.
+A watch stops that read.
 ---
 */
 
 //! One step reads one named member.
-//! A top-level tar does not open its members.
-//! A tar inside a zip or an OCI image does.
+//! The next name opens one file inside that member.
+//! A 7z archive and an MPQ archive do not open a member.
 
 use super::File;
+use crate::Watch;
 use std::borrow::Cow;
 
 const INFLATE_CAP: usize = 1 << 20;
@@ -25,37 +28,56 @@ enum Take<'a> {
 }
 
 /// Read the one file named by `path`.
-/// Each name is one zip member, one layer digest, one side file, or one tar member inside those.
+/// Each name is one member of the file named before it.
 /// The page lists the next names and does not read them.
-pub fn step(bytes: &[u8], path: &[&str], rows: bool, color: bool) -> Option<String> {
-    if path.is_empty() || path.len() > CHAIN_CAP {
+pub fn step(bytes: &[u8], path: &[&str], rows: bool, color: bool, watch: &Watch) -> Option<String> {
+    if watch.stopped() || path.is_empty() || path.len() > CHAIN_CAP {
         return None;
     }
     let file = super::sniff(bytes)?.ok()?;
-    if matches!(file, File::Tar(_)) {
-        return None;
-    }
-    follow(bytes, &file, path, rows, color)
+    follow(bytes, &file, path, rows, color, watch)
 }
 
-fn follow(bytes: &[u8], file: &File, path: &[&str], rows: bool, color: bool) -> Option<String> {
+fn follow(
+    bytes: &[u8],
+    file: &File,
+    path: &[&str],
+    rows: bool,
+    color: bool,
+    watch: &Watch,
+) -> Option<String> {
+    if watch.stopped() {
+        return None;
+    }
+    if let File::Dmg(image) = file {
+        return open_dmg(bytes, image, path, rows, color, watch);
+    }
     let (name, rest) = path.split_first()?;
     match one(bytes, file, name)? {
         Take::Cap => Some(cap_page(name)),
         Take::Body(body) if rest.is_empty() => page_of(&body, name, rows, color),
-        Take::Body(body) => next_file(&body, rest, rows, color),
+        Take::Body(body) => next_file(&body, rest, rows, color, watch),
     }
 }
 
-fn next_file(bytes: &[u8], path: &[&str], rows: bool, color: bool) -> Option<String> {
+fn next_file(
+    bytes: &[u8],
+    path: &[&str],
+    rows: bool,
+    color: bool,
+    watch: &Watch,
+) -> Option<String> {
     if crate::elf::header::is_elf(bytes)
         || crate::macho::header::is_macho(bytes)
         || crate::pe::header::is_pe(bytes)
     {
         return None;
     }
+    if watch.stopped() {
+        return None;
+    }
     let file = super::sniff(bytes)?.ok()?;
-    follow(bytes, &file, path, rows, color)
+    follow(bytes, &file, path, rows, color, watch)
 }
 
 fn page_of(bytes: &[u8], name: &str, rows: bool, color: bool) -> Option<String> {
@@ -70,6 +92,68 @@ fn page_of(bytes: &[u8], name: &str, rows: bool, color: bool) -> Option<String> 
     Some(super::render(name, &file, false, color))
 }
 
+fn open_dmg(
+    bytes: &[u8],
+    image: &super::dmg::Image,
+    path: &[&str],
+    rows: bool,
+    color: bool,
+    watch: &Watch,
+) -> Option<String> {
+    let (name, rest) = path.split_first()?;
+    let part = image.parts.iter().find(|part| part.name == *name)?;
+    if rest.is_empty() {
+        return step_of(
+            super::dmg::view_part(bytes, part, color, watch),
+            name,
+            &[],
+            rows,
+            color,
+            watch,
+        );
+    }
+    let (file_name, deeper) = rest.split_first()?;
+    match super::dmg::view_file(bytes, part, file_name, watch) {
+        super::dmg::Step::Stop => None,
+        super::dmg::Step::Body(body) => step_of(
+            super::dmg::Step::Body(body),
+            file_name,
+            deeper,
+            rows,
+            color,
+            watch,
+        ),
+        super::dmg::Step::Cap => {
+            step_of(super::dmg::Step::Cap, file_name, deeper, rows, color, watch)
+        }
+        super::dmg::Step::Miss | super::dmg::Step::Page(_) => step_of(
+            super::dmg::view_part(bytes, part, color, watch),
+            name,
+            rest,
+            rows,
+            color,
+            watch,
+        ),
+    }
+}
+
+fn step_of(
+    step: super::dmg::Step,
+    name: &str,
+    rest: &[&str],
+    rows: bool,
+    color: bool,
+    watch: &Watch,
+) -> Option<String> {
+    match step {
+        super::dmg::Step::Page(text) if rest.is_empty() => Some(text),
+        super::dmg::Step::Cap => Some(cap_page(name)),
+        super::dmg::Step::Body(body) if rest.is_empty() => page_of(&body, name, rows, color),
+        super::dmg::Step::Body(body) => next_file(&body, rest, rows, color, watch),
+        _ => None,
+    }
+}
+
 fn one<'a>(bytes: &'a [u8], file: &File, name: &str) -> Option<Take<'a>> {
     match file {
         File::Zip(archive) => {
@@ -79,10 +163,22 @@ fn one<'a>(bytes: &'a [u8], file: &File, name: &str) -> Option<Take<'a>> {
         File::Tar(archive) => {
             let member = archive.members.iter().find(|member| member.name == name)?;
             let body = super::tar::body(bytes, member)?;
-            if body.is_empty() {
-                return None;
-            }
-            Some(Take::Body(Cow::Borrowed(body)))
+            borrowed(body)
+        }
+        File::Ar(archive) => {
+            let member = archive.members.iter().find(|member| member.name == name)?;
+            let body = slice_at(bytes, member.offset, member.size)?;
+            borrowed(body)
+        }
+        File::Cpio(archive) => {
+            let member = archive.members.iter().find(|member| member.name == name)?;
+            let body = slice_at(bytes, member.offset, member.size)?;
+            borrowed(body)
+        }
+        File::Icns(image) => {
+            let icon = image.icons.iter().find(|icon| icon.kind == name)?;
+            let body = slice_at(bytes, icon.offset, icon.size)?;
+            borrowed(body)
         }
         File::Oci(image) => {
             if let Some(layer) = image
@@ -126,6 +222,13 @@ fn layer_body<'a>(bytes: &'a [u8], layer: &super::oci::Layer) -> Option<Take<'a>
         }
         return crate::certs::inflate_gzip(body, INFLATE_CAP)
             .map(|out| Take::Body(Cow::Owned(out)));
+    }
+    Some(Take::Body(Cow::Borrowed(body)))
+}
+
+fn borrowed(body: &[u8]) -> Option<Take<'_>> {
+    if body.is_empty() {
+        return None;
     }
     Some(Take::Body(Cow::Borrowed(body)))
 }

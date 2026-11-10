@@ -3,14 +3,14 @@
 why: This file reads one Unix ar member list.
 uses: bininfo
 how: bininfo calls this file when the first bytes are the ar magic.
-This file reads member headers only.
-This file does not open a member.
+This file reads member headers and the body offset.
+This file does not copy a member body.
 ---
 */
 
 //! One Unix ar archive.
-//! This module reads member headers.
-//! This module does not open a member.
+//! This module reads member headers and the body offset.
+//! This module does not copy a member body.
 
 pub mod page;
 
@@ -28,6 +28,8 @@ pub struct Member {
     pub name: String,
     pub size: u64,
     pub mode: String,
+    /// First payload byte. A BSD name sits before this byte.
+    pub offset: u64,
 }
 
 /// One ar archive.
@@ -44,7 +46,7 @@ pub fn is_ar(bytes: &[u8]) -> bool {
 }
 
 /// Read each member header.
-/// This function does not open a member.
+/// This function records each body offset. It does not copy a member.
 pub fn parse(bytes: &[u8]) -> Result<Archive, String> {
     if !is_ar(bytes) {
         return Err("not an ar archive".into());
@@ -64,11 +66,16 @@ pub fn parse(bytes: &[u8]) -> Result<Archive, String> {
         let raw = text(trim_end(&header[0..16]));
         let body_at = at + HEADER_LEN;
         let body_end = end_at(body_at, stored, bytes.len())?;
-        let (name, size) = member_name(bytes, &raw, body_at, stored, long_names)?;
+        let (name, size, payload) = member_name(bytes, &raw, body_at, stored, long_names)?;
         if raw == "//" {
             long_names = Some((body_at, body_end));
         }
-        members.push(Member { name, size, mode });
+        members.push(Member {
+            name,
+            size,
+            mode,
+            offset: payload as u64,
+        });
         at = next_at(bytes, body_end);
     }
     Ok(Archive { members, more })
@@ -111,17 +118,18 @@ fn member_name(
     body_at: usize,
     stored: u64,
     long_names: Option<(usize, usize)>,
-) -> Result<(String, u64), String> {
+) -> Result<(String, u64, usize), String> {
     if let Some(len) = bsd_len(raw)? {
         return bsd_name(bytes, body_at, stored, len);
     }
     if raw == "/" || raw == "//" {
-        return Ok((raw.to_string(), stored));
+        return Ok((raw.to_string(), stored, body_at));
     }
     if let Some(offset) = sysv_at(raw)? {
-        return sysv_name(bytes, raw, offset, stored, long_names);
+        let (name, size) = sysv_name(bytes, raw, offset, stored, long_names)?;
+        return Ok((name, size, body_at));
     }
-    Ok((trim_slash(raw), stored))
+    Ok((trim_slash(raw), stored, body_at))
 }
 
 fn bsd_len(raw: &str) -> Result<Option<u64>, String> {
@@ -135,7 +143,12 @@ fn bsd_len(raw: &str) -> Result<Option<u64>, String> {
     Ok(Some(len))
 }
 
-fn bsd_name(bytes: &[u8], body_at: usize, stored: u64, len: u64) -> Result<(String, u64), String> {
+fn bsd_name(
+    bytes: &[u8],
+    body_at: usize,
+    stored: u64,
+    len: u64,
+) -> Result<(String, u64, usize), String> {
     if len > stored {
         return Err(OUTSIDE.into());
     }
@@ -143,7 +156,7 @@ fn bsd_name(bytes: &[u8], body_at: usize, stored: u64, len: u64) -> Result<(Stri
     let name_end = body_at.checked_add(name_len).ok_or(OUTSIDE)?;
     let raw = bytes.get(body_at..name_end).ok_or(OUTSIDE)?;
     let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
-    Ok((text(&raw[..end]), stored - len))
+    Ok((text(&raw[..end]), stored - len, name_end))
 }
 
 fn sysv_at(raw: &str) -> Result<Option<u64>, String> {
@@ -336,6 +349,34 @@ mod tests {
     fn a_size_past_the_buffer_returns_an_error() {
         let bytes = one_member("libneed.o/", "100644", 100, b"abcd");
         assert!(parse(&bytes).is_err());
+    }
+
+    fn jpeg() -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 8, 0, 2, 0, 3, 3];
+        out.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 0xff, 0xd9]);
+        out
+    }
+
+    #[test]
+    fn a_step_reads_the_detected_member() {
+        let photo = jpeg();
+        let bytes = one_member("photo.jpg/", "100644", photo.len() as u64, &photo);
+        let file = crate::open(&bytes, false).unwrap();
+        let page = crate::render("lib.a", &file, false, false);
+        assert!(page.contains("format: ar"), "{page}");
+        assert!(!page.contains("format: jpeg"), "{page}");
+        let one = crate::step(&bytes, &["photo.jpg"], false, false).unwrap();
+        assert!(one.contains("format: jpeg"), "{one}");
+        assert!(one.contains("width: 3"), "{one}");
+        assert!(crate::step(&bytes, &["missing.o"], false, false).is_none());
+        let mut body = b"longname\0".to_vec();
+        body.extend_from_slice(&photo);
+        let long = one_member("#1/9", "100644", body.len() as u64, &body);
+        let named = crate::step(&long, &["longname"], false, false).unwrap();
+        assert!(named.contains("format: jpeg"), "{named}");
+        let mut short = bytes.clone();
+        short.truncate(20);
+        assert!(crate::step(&short, &["photo.jpg"], false, false).is_none());
     }
 
     #[test]

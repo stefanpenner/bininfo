@@ -400,6 +400,31 @@ mod tests {
         field[digits] = 0;
     }
 
+    fn jpeg() -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 8, 0, 2, 0, 3, 3];
+        out.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 0xff, 0xd9]);
+        out
+    }
+
+    #[test]
+    fn a_step_reads_one_tar_member() {
+        let photo = jpeg();
+        let mut bytes = header("photo.jpg", "", 0o644, photo.len() as u64, 0).to_vec();
+        bytes.extend_from_slice(&photo);
+        let rem = photo.len() % 512;
+        if rem != 0 {
+            bytes.resize(bytes.len() + (512 - rem), 0);
+        }
+        let file = crate::open(&bytes, false).unwrap();
+        let page = crate::render("a.tar", &file, false, false);
+        assert!(page.contains("format: tar"), "{page}");
+        assert!(!page.contains("format: jpeg"), "{page}");
+        let one = crate::step(&bytes, &["photo.jpg"], false, false).unwrap();
+        assert!(one.contains("format: jpeg"), "{one}");
+        assert!(one.contains("width: 3"), "{one}");
+        assert!(crate::step(&bytes, &["missing.jpg"], false, false).is_none());
+    }
+
     fn push_member(out: &mut Vec<u8>, name: &str, prefix: &str, mode: u64, flag: u8, body: &[u8]) {
         let size = u64::try_from(body.len()).unwrap();
         out.extend_from_slice(&header(name, prefix, mode, size, flag));

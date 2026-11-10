@@ -621,6 +621,9 @@ impl View {
             if let Some(pid) = item.parent.as_mut() {
                 *pid += base;
             }
+            for child in &mut item.children {
+                *child += base;
+            }
             item.indent += shift;
             item.raw.insert_str(0, &pad);
         }
@@ -650,7 +653,10 @@ impl View {
         let Some(pid) = item.parent else {
             return false;
         };
-        matches!(self.items[pid].key.as_str(), "members" | "layers" | "files")
+        matches!(
+            self.items[pid].key.as_str(),
+            "members" | "layers" | "files" | "parts" | "icons"
+        )
     }
 
     fn is_under(&self, id: usize, ancestor: Option<usize>) -> bool {
@@ -1172,6 +1178,51 @@ members:
     }
 
     #[test]
+    fn graft_keeps_a_nested_row_with_its_parent() {
+        let page = "\
+format: dmg
+
+parts:
+  - \"disk (Apple_HFS : 4)\"
+    blocks: 1
+";
+        let mut view = View::spine(page);
+        let part = view
+            .items
+            .iter()
+            .position(|item| item.dash && dash_name(&item.raw).contains("Apple_HFS"))
+            .unwrap();
+        view.cursor = part;
+        view.graft(
+            part,
+            "\
+file: disk (Apple_HFS : 4)
+format: hfs
+
+files:
+  more: true
+  - readme.txt
+    size: 4
+",
+        );
+        let nested = view
+            .items
+            .iter()
+            .position(|item| item.key == "size")
+            .unwrap();
+        let parent = view.items[nested].parent.expect("size has a parent");
+        assert!(
+            view.items[parent].children.contains(&nested),
+            "parent {} children {:?}",
+            view.items[parent].key,
+            view.items[parent].children
+        );
+        let block = view.cursor_block();
+        assert!(block.contains("size: 4"), "{block}");
+        assert!(block.contains("format: hfs"), "{block}");
+    }
+
+    #[test]
     fn a_quoted_digest_is_the_step_name() {
         let page = "\
 layers:
@@ -1183,5 +1234,33 @@ layers:
         view.cursor = id;
         let (_, path) = view.step_target().unwrap();
         assert_eq!(path, vec!["sha256:abc".to_string()]);
+    }
+
+    #[test]
+    fn a_part_dash_is_a_step() {
+        let page = "\
+parts:
+  - \"disk (Apple_HFS : 4)\"
+    blocks: 1
+";
+        let mut view = View::spine(page);
+        let id = view.items.iter().position(|item| item.dash).unwrap();
+        view.cursor = id;
+        let (_, path) = view.step_target().unwrap();
+        assert_eq!(path, vec!["disk (Apple_HFS : 4)".to_string()]);
+    }
+
+    #[test]
+    fn an_icon_dash_is_a_step() {
+        let page = "\
+icons:
+  - ic08
+    size: 8
+";
+        let mut view = View::spine(page);
+        let id = view.items.iter().position(|item| item.dash).unwrap();
+        view.cursor = id;
+        let (_, path) = view.step_target().unwrap();
+        assert_eq!(path, vec!["ic08".to_string()]);
     }
 }

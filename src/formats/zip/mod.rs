@@ -548,6 +548,35 @@ mod tests {
         assert_eq!(one.matches("format:").count(), 1, "{one}");
     }
 
+    fn ar_of(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut header = [b' '; 60];
+        let label = format!("{name}/");
+        header[..label.len()].copy_from_slice(label.as_bytes());
+        header[40..46].copy_from_slice(b"100644");
+        let size = body.len().to_string();
+        header[48..48 + size.len()].copy_from_slice(size.as_bytes());
+        header[58] = b'`';
+        header[59] = b'\n';
+        let mut out = b"!<arch>\n".to_vec();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn a_file_inside_an_archive_opens_on_the_next_step() {
+        let photo = jpeg();
+        let archive = ar_of("photo.jpg", &photo);
+        let bytes = store_zip(&[("lib.a", &archive)]);
+        let outer = crate::step(&bytes, &["lib.a"], false, false).unwrap();
+        assert!(outer.contains("format: ar"), "{outer}");
+        assert!(!outer.contains("format: jpeg"), "{outer}");
+        let inner = crate::step(&bytes, &["lib.a", "photo.jpg"], false, false).unwrap();
+        assert!(inner.contains("format: jpeg"), "{inner}");
+        assert!(inner.contains("width: 3"), "{inner}");
+        assert!(!inner.contains("format: ar"), "{inner}");
+    }
+
     #[test]
     fn each_step_opens_one_zip() {
         let mut bytes = jpeg();

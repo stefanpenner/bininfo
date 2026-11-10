@@ -4,23 +4,25 @@ why: This file routes each extra file type.
 uses: bininfo
 how: bininfo calls open after the start-file checks.
 Each type folder adds one arm here.
-step reads one named member and does not read the next file.
+step reads one named member. The next call reads one file inside it.
 ---
 */
 
 //! Extra file types. ELF, Mach-O, and PE stay outside this folder.
 //! Each type adds one arm in `open`. A type here has no start claim.
-//! `step` reads one named member. It does not read the next file.
+//! `step` reads one named member. The next call reads one file inside it.
 
 pub mod ar;
 pub mod chrome;
 pub mod cpio;
 pub mod dmg;
 pub mod hit;
+pub mod icns;
 pub mod isobmff;
 pub mod jpeg;
 pub mod mpq;
 pub mod oci;
+pub mod png;
 pub mod sevenz;
 pub mod tar;
 pub mod tiff;
@@ -33,10 +35,12 @@ pub enum File {
     Ar(ar::Archive),
     Cpio(cpio::Archive),
     Dmg(dmg::Image),
+    Icns(icns::Image),
     Isobmff(isobmff::Movie),
     Jpeg(jpeg::Image),
     Mpq(mpq::Archive),
     Oci(oci::Image),
+    Png(png::Image),
     Sevenz(sevenz::Archive),
     Tar(tar::Archive),
     Tiff(tiff::Image),
@@ -71,6 +75,12 @@ pub(crate) fn sniff(bytes: &[u8]) -> Option<Result<File, String>> {
     }
     if cpio::is_cpio(bytes) {
         return Some(cpio::parse(bytes).map(File::Cpio));
+    }
+    if icns::is_icns(bytes) {
+        return Some(icns::parse(bytes).map(File::Icns));
+    }
+    if png::is_png(bytes) {
+        return Some(png::parse(bytes).map(File::Png));
     }
     if jpeg::is_jpeg(bytes) {
         return Some(jpeg::parse(bytes).map(File::Jpeg));
@@ -120,6 +130,13 @@ pub fn render(path: &str, file: &File, json: bool, color: bool) -> String {
                 dmg::page::render(path, image, color)
             }
         }
+        File::Icns(image) => {
+            if json {
+                icns::page::render_json(path, image)
+            } else {
+                icns::page::render(path, image, color)
+            }
+        }
         File::Isobmff(movie) => {
             if json {
                 isobmff::page::render_json(path, movie)
@@ -146,6 +163,13 @@ pub fn render(path: &str, file: &File, json: bool, color: bool) -> String {
                 oci::page::render_json(path, image, false, &[], &[])
             } else {
                 oci::page::render(path, image, color, false, &[], &[])
+            }
+        }
+        File::Png(image) => {
+            if json {
+                png::page::render_json(path, image)
+            } else {
+                png::page::render(path, image, color)
             }
         }
         File::Sevenz(archive) => {

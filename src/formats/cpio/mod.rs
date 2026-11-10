@@ -3,12 +3,13 @@
 why: This file reads the headers of one cpio archive.
 uses: bininfo
 how: bininfo calls this file for a cpio magic in the first six bytes.
-This file skips each member body.
+This file records each member body offset.
+This file does not copy a member body.
 ---
 */
 
 //! One cpio archive. The headers name each member.
-//! This module does not read a member body.
+//! This module records each body offset. It does not copy a member body.
 
 pub mod page;
 
@@ -24,6 +25,8 @@ pub struct Member {
     pub name: String,
     pub size: u64,
     pub mode: String,
+    /// First payload byte.
+    pub offset: u64,
 }
 
 /// One archive. The more field is true at the member cap.
@@ -39,6 +42,7 @@ struct Header {
     size: u64,
     mode: String,
     next: usize,
+    offset: u64,
     trailer: bool,
 }
 
@@ -47,7 +51,7 @@ pub fn is_cpio(bytes: &[u8]) -> bool {
     profile_of(bytes).is_some()
 }
 
-/// This function reads each header. This function does not read a member body.
+/// This function reads each header and records the body offset.
 pub fn parse(bytes: &[u8]) -> Result<Archive, String> {
     let profile = profile_of(bytes).ok_or_else(|| "not a cpio file".to_string())?;
     let mut members = Vec::new();
@@ -67,6 +71,7 @@ pub fn parse(bytes: &[u8]) -> Result<Archive, String> {
             name: header.name,
             size: header.size,
             mode: header.mode,
+            offset: header.offset,
         });
     }
     Ok(Archive {
@@ -106,8 +111,9 @@ fn read_hex(bytes: &[u8], at: usize, magic: &[u8]) -> Result<Header, String> {
     let namesize = field_num(bytes, at + 94, 8, 16)?;
     let _check = field_num(bytes, at + 102, 8, 16)?;
     let (name, name_end) = take_name(bytes, at + NEWC_HEADER, namesize)?;
+    let data_at = align4(name_end)?;
     let next = skip_body(bytes, name_end, size, true)?;
-    Ok(make_header(name, size, mode, next))
+    Ok(make_header(name, size, mode, next, data_at))
 }
 
 // The odc header is 76 bytes.
@@ -121,16 +127,17 @@ fn read_odc(bytes: &[u8], at: usize) -> Result<Header, String> {
     let size = field_num(bytes, at + 65, 11, 8)?;
     let (name, name_end) = take_name(bytes, at + ODC_HEADER, namesize)?;
     let next = skip_body(bytes, name_end, size, false)?;
-    Ok(make_header(name, size, mode, next))
+    Ok(make_header(name, size, mode, next, name_end))
 }
 
-fn make_header(name: String, size: u64, mode: String, next: usize) -> Header {
+fn make_header(name: String, size: u64, mode: String, next: usize, offset: usize) -> Header {
     let trailer = name == TRAILER;
     Header {
         name,
         size,
         mode,
         next,
+        offset: offset as u64,
         trailer,
     }
 }
@@ -324,6 +331,26 @@ mod tests {
     fn pad4(out: &mut Vec<u8>) {
         let pad = (4 - (out.len() % 4)) % 4;
         out.resize(out.len() + pad, 0);
+    }
+
+    fn jpeg() -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 8, 0, 2, 0, 3, 3];
+        out.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 0xff, 0xd9]);
+        out
+    }
+
+    #[test]
+    fn a_step_reads_the_detected_member() {
+        let photo = jpeg();
+        let bytes = archive("070701", &[("photo.jpg", photo.as_slice())]);
+        let file = crate::open(&bytes, false).unwrap();
+        let page = crate::render("a.cpio", &file, false, false);
+        assert!(page.contains("format: cpio"), "{page}");
+        assert!(!page.contains("format: jpeg"), "{page}");
+        let one = crate::step(&bytes, &["photo.jpg"], false, false).unwrap();
+        assert!(one.contains("format: jpeg"), "{one}");
+        assert!(one.contains("width: 3"), "{one}");
+        assert!(crate::step(&bytes, &["missing.jpg"], false, false).is_none());
     }
 
     #[test]
