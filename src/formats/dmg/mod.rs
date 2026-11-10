@@ -353,7 +353,8 @@ impl<'a> Disk<'a> {
                     filled += take;
                 }
                 0x8000_0005 => {
-                    let plain = self.inflate(index)?;
+                    self.fill(index)?;
+                    let plain = self.cache[index].as_deref().ok_or(hfs::Fault::Miss)?;
                     let room = plain.len().saturating_sub(into);
                     if room == 0 {
                         return Err(hfs::Fault::Miss);
@@ -369,12 +370,12 @@ impl<'a> Disk<'a> {
         Ok(out)
     }
 
-    fn inflate(&mut self, index: usize) -> Result<Vec<u8>, hfs::Fault> {
+    fn fill(&mut self, index: usize) -> Result<(), hfs::Fault> {
         if self.watch.stopped() {
             return Err(hfs::Fault::Stop);
         }
-        if let Some(hit) = &self.cache[index] {
-            return Ok(hit.clone());
+        if self.cache[index].is_some() {
+            return Ok(());
         }
         let offset = self.chunks[index].offset;
         let length = self.chunks[index].length;
@@ -389,8 +390,8 @@ impl<'a> Disk<'a> {
         let raw = slice_file(self.bytes, offset, length)?;
         let plain = crate::certs::inflate_zlib(raw, plain_len).ok_or(hfs::Fault::Miss)?;
         self.watch.add(plain.len() as u64);
-        self.cache[index] = Some(plain.clone());
-        Ok(plain)
+        self.cache[index] = Some(plain);
+        Ok(())
     }
 }
 
@@ -1012,6 +1013,38 @@ mod tests {
         let one = crate::step(&bytes, &["photo part"], false, false).unwrap();
         assert!(one.contains("format: jpeg"), "{one}");
         assert!(one.contains("width: 3"), "{one}");
+    }
+
+    #[test]
+    fn a_second_read_copies_the_cached_slice() {
+        let mut plain = vec![0u8; 1024];
+        plain[0] = 0x11;
+        plain[512] = 0x22;
+        plain[600] = 0x33;
+        let stored = zlib_store(&plain);
+        let chunks = [Chunk {
+            kind: 0x8000_0005,
+            sector: 0,
+            count: 2,
+            offset: 0,
+            length: stored.len() as u64,
+        }];
+        let watch = crate::Watch::new();
+        let mut disk = Disk::new(&stored, &chunks, &watch);
+        let first = match disk.read(0, 512) {
+            Ok(bytes) => bytes,
+            Err(_) => panic!("first read"),
+        };
+        let once = watch.done();
+        let second = match disk.read(512, 128) {
+            Ok(bytes) => bytes,
+            Err(_) => panic!("second read"),
+        };
+        assert_eq!(first[0], 0x11);
+        assert_eq!(second[0], 0x22);
+        assert_eq!(second[88], 0x33);
+        assert_eq!(once, plain.len() as u64);
+        assert_eq!(watch.done(), once);
     }
 
     #[test]
